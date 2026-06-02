@@ -52,6 +52,19 @@ class TestParseVtt(unittest.TestCase):
         self.assertEqual(text, "hello world second line")  # dup collapsed
         self.assertEqual([s["start"] for s in segs], [1, 5])
 
+    def test_rolling_caption_dedup(self):
+        # Mimic YouTube rolling captions: each cue repeats the tail + adds words.
+        segs = [
+            {"start": 0, "text": "brand entity SEO in"},
+            {"start": 2, "text": "brand entity SEO in 2026 for high"},
+            {"start": 4, "text": "for high net worth individuals now"},
+        ]
+        out = fetch_transcripts.dedup_rolling(segs)
+        text = " ".join(s["text"] for s in out)
+        self.assertEqual(text, "brand entity SEO in 2026 for high net worth individuals now")
+        # the late phrase keeps a later timestamp
+        self.assertTrue(any(s["start"] == 4 for s in out))
+
     def test_downsample(self):
         segs = [{"start": s, "text": f"t{s}"} for s in (0, 10, 20, 30, 40)]
         out = analyze_transcripts.downsample_segments(segs, window=25)

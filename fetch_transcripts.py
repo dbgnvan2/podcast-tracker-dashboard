@@ -73,7 +73,7 @@ def parse_vtt(vtt_path):
             if "-->" in line:
                 # flush previous cue
                 if cur_start is not None and cur_lines:
-                    segments.append((cur_start, " ".join(cur_lines)))
+                    segments.append({"start": cur_start, "text": " ".join(cur_lines)})
                 cur_start = _ts_to_sec(line.split("-->")[0].strip().split(" ")[0])
                 cur_lines = []
             elif not line.strip() or line.startswith("WEBVTT") or line.startswith(("Kind:", "Language:", "NOTE")):
@@ -83,17 +83,34 @@ def parse_vtt(vtt_path):
                 if txt:
                     cur_lines.append(txt)
     if cur_start is not None and cur_lines:
-        segments.append((cur_start, " ".join(cur_lines)))
+        segments.append({"start": cur_start, "text": " ".join(cur_lines)})
 
-    # De-duplicate consecutive identical lines (YouTube rolling captions repeat).
-    deduped = []
-    seen_text = []
-    for start, text in segments:
-        if not seen_text or seen_text[-1] != text:
-            deduped.append({"start": start, "text": text})
-            seen_text.append(text)
+    deduped = dedup_rolling(segments)
     clean_text = " ".join(s["text"] for s in deduped)
     return clean_text, deduped
+
+
+def dedup_rolling(segments):
+    """Collapse YouTube rolling captions, where each cue repeats the tail of the
+    previous one plus a few new words. For each cue we keep only the words that
+    aren't already the running tail, preserving the timestamp of the new words."""
+    out = []
+    acc = []  # accumulated word list
+    for seg in segments:
+        words = seg["text"].split()
+        if not words:
+            continue
+        max_k = min(len(acc), len(words))
+        k = 0
+        for cand in range(max_k, 0, -1):
+            if acc[-cand:] == words[:cand]:
+                k = cand
+                break
+        new_words = words[k:]
+        if new_words:
+            out.append({"start": seg["start"], "text": " ".join(new_words)})
+            acc.extend(new_words)
+    return out
 
 
 def _run_ytdlp(vid, url):
