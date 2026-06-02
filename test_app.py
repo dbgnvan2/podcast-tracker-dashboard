@@ -18,6 +18,7 @@ import analyze_transcripts
 import generate_digest
 import dashboard_server
 import podcast_scraper
+import profiles
 
 
 SCHEMA = """
@@ -198,6 +199,43 @@ class TestEmergingDiscovery(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+
+
+class TestProfiles(unittest.TestCase):
+    def setUp(self):
+        # Redirect all profile storage to a temp area (never touch ~/.hermes).
+        self.tmp = Path(tempfile.mkdtemp())
+        profiles.PROFILES_DIR = self.tmp / "profiles"
+        profiles.DB_DIR = self.tmp / "db"
+        profiles.DIGESTS_DIR = self.tmp / "digests"
+        profiles.ACTIVE_FILE = profiles.PROFILES_DIR / "_active"
+        profiles.LEGACY_DB = self.tmp / "podcast_tracker.db"
+
+    def test_seed_and_active(self):
+        names = [p["name"] for p in profiles.list_profiles()]
+        self.assertIn("seo-geo", names)
+        self.assertEqual(profiles.active_name(), "seo-geo")
+
+    def test_create_switch_isolation(self):
+        profiles.create("zone2-training", label="Zone 2",
+                        search_queries=["zone 2 training"], analysis_focus="aerobic base")
+        # isolation: different DB file than the default
+        self.assertNotEqual(profiles.db_path_for("zone2-training"),
+                            profiles.db_path_for("seo-geo"))
+        # default keeps the legacy DB path
+        self.assertEqual(profiles.db_path_for("seo-geo"), str(profiles.LEGACY_DB))
+        # switch + load reflects the new profile
+        profiles.set_active("zone2-training")
+        self.assertEqual(profiles.active_name(), "zone2-training")
+        p = profiles.load()
+        self.assertEqual(p["analysis_focus"], "aerobic base")
+        self.assertIn("zone 2 training", p["search_queries"])
+
+    def test_load_fills_defaults(self):
+        profiles.create("bare", label="Bare")
+        p = profiles.load("bare")
+        self.assertEqual(p["min_views"], profiles.DEFAULTS["min_views"])
+        self.assertTrue(p["db_path"].endswith("podcast_bare.db"))
 
 
 if __name__ == "__main__":

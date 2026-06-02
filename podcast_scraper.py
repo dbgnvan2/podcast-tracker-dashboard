@@ -15,8 +15,44 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
-DB_PATH = Path.home() / ".hermes" / "podcast_tracker.db"
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+import profiles
+
+# All topic-specific criteria come from the active investigation profile.
+# apply_profile() (called below + on --profile) populates these module globals.
+DB_PATH = None
+SEARCH_QUERIES = CURATED_CHANNELS = CHANNEL_BONUS = KEYWORDS = None
+MIN_VIEWS = MIN_DURATION_SEC = MAX_DURATION_SEC = MIN_DAYS_OLD = None
+MAX_VIDEOS_PER_QUERY = MAX_VIDEOS_PER_CHANNEL = MAX_RESULTS_TO_RETURN = None
+ANALYSIS_FOCUS = DIGEST_TITLE = ACTIVE_PROFILE = None
+
+
+def apply_profile(name=None):
+    """Load an investigation profile into the module globals used throughout."""
+    global DB_PATH, SEARCH_QUERIES, CURATED_CHANNELS, CHANNEL_BONUS, KEYWORDS
+    global MIN_VIEWS, MIN_DURATION_SEC, MAX_DURATION_SEC, MIN_DAYS_OLD
+    global MAX_VIDEOS_PER_QUERY, MAX_VIDEOS_PER_CHANNEL, MAX_RESULTS_TO_RETURN
+    global ANALYSIS_FOCUS, DIGEST_TITLE, ACTIVE_PROFILE
+    p = profiles.load(name)
+    ACTIVE_PROFILE = p
+    DB_PATH = Path(p["db_path"])
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SEARCH_QUERIES = p["search_queries"]
+    CURATED_CHANNELS = p["curated_channels"]
+    CHANNEL_BONUS = p.get("channel_bonus", {})
+    KEYWORDS = p["keywords"]
+    MIN_VIEWS = p["min_views"]
+    MIN_DURATION_SEC = p["min_duration_sec"]
+    MAX_DURATION_SEC = p["max_duration_sec"]
+    MIN_DAYS_OLD = p["min_days_old"]
+    MAX_VIDEOS_PER_QUERY = p["max_videos_per_query"]
+    MAX_VIDEOS_PER_CHANNEL = p["max_videos_per_channel"]
+    MAX_RESULTS_TO_RETURN = 20
+    ANALYSIS_FOCUS = p["analysis_focus"]
+    DIGEST_TITLE = p["digest_title"]
+    return p
+
+
+apply_profile()
 
 YT_DLP = None
 for p in [
@@ -36,62 +72,8 @@ if not YT_DLP:
         print("ERROR: yt-dlp not found")
         sys.exit(1)
 
-# Content-focused queries reflecting the real goal: getting people to a site /
-# video / podcast via SEO + AI GEO. NOTE: do NOT hard-code "podcast" — it filters
-# out the best educational creators (e.g. Neil Patel) and pulls in off-topic
-# literal podcasts. Channel monitoring (below) is the reliable path for authorities.
-SEARCH_QUERIES = [
-    "how to rank in AI Overviews 2026",
-    "get recommended by ChatGPT SEO",
-    "generative engine optimization GEO 2026",
-    "answer engine optimization AEO",
-    "Google AI Mode SEO strategy 2026",
-    "brand entity SEO knowledge graph",
-    "how to get cited by AI search",
-    "SEO to drive website traffic 2026",
-    "AI search visibility for brands",
-]
-
-# Authority channels to monitor directly (handle -> display name). Their recent
-# uploads are pulled regardless of keyword match, and bypass the view/age gates.
-# This is what guarantees creators like Neil Patel are captured.
-CURATED_CHANNELS = {
-    "neilpatel": "Neil Patel",
-    "AhrefsCom": "Ahrefs",
-    "surferseo": "Surfer SEO",
-    "HubSpotMarketing": "HubSpot Marketing",
-    "GoogleSearchCentral": "Google Search Central",
-    "Semrush": "Semrush",
-    "searchenginejournal": "Search Engine Journal",
-    "searchengineland": "Search Engine Land",
-    "LevelingUpOfficial": "Leveling Up with Eric Siu",
-}
-
-MAX_VIDEOS_PER_QUERY = 20
-MAX_VIDEOS_PER_CHANNEL = 10
-MIN_VIEWS = 2000
-MIN_DURATION_SEC = 300   # 5 minutes (concise SEO/GEO tips count too)
-MAX_DURATION_SEC = 5400  # 90 minutes
-MIN_DAYS_OLD = 7  # let views accumulate (skipped for curated channels)
-MAX_RESULTS_TO_RETURN = 20
-
-# ── Known high-quality channels (bonus) ────────────────────────────────────
-CHANNEL_BONUS = {
-    "neilpatel": 1.5,
-    "SearchOffTheRecord": 1.5,
-    "GoogleSearchCentral": 1.5,
-    "SEOFOMO": 1.2,
-    "Niche Pursuits": 1.2,
-    "Experts on the Wire": 1.1,
-    "Semantic Mastery": 1.1,
-    "Marketing Oops": 1.0,
-    "RustyBrick GEO": 1.2,
-    "Cyrus Shepard": 1.3,
-    "Aleyda Solis": 1.3,
-    "Lily Ray": 1.3,
-    "Mordy Oberstein": 1.1,
-    "Kevin Indig": 1.1,
-}
+# All search criteria (SEARCH_QUERIES, CURATED_CHANNELS, CHANNEL_BONUS, KEYWORDS,
+# filters) now come from the active investigation profile — see apply_profile().
 
 
 # ── DB setup ────────────────────────────────────────────────────────────────
@@ -262,20 +244,7 @@ except Exception:
 
 def calculate_keyword_density(transcript_text, video_title, channel_name=""):
     """Score a video for AI/GEO/SEO relevance based on transcript + title + channel."""
-    keywords = [
-        "generative engine optimization", "GEO", "AI overviews",
-        "AI mode", "search generative experience", "SGE",
-        "brand entity", "entity SEO", "knowledge graph",
-        "AI search", "AI SEO", "ChatGPT search", "Perplexity", "Google AI",
-        "large language model", "LLM", "RAG",
-        "zero-click", "zero click search",
-        "answer engine", "answer engine optimization", "AEO",
-        "featured snippet", "get cited", "cited by AI", "AI citations",
-        "E-E-A-T", "EEAT", "topical authority",
-        "AI-generated content", "AIO", "AI optimization", "AI visibility",
-        "organic traffic", "website traffic", "drive traffic",
-        "rank on Google", "search rankings", "llms.txt",
-    ]
+    keywords = KEYWORDS or []
     search_text = (transcript_text + " " + video_title + " " + channel_name).lower()
     words = len(search_text.split())
     if words == 0:
@@ -443,11 +412,12 @@ def suggest_search_terms(conn, limit=40):
 
     existing = set(q.lower() for q in SEARCH_QUERIES)
     prompt = (
-        "These are titles of the best-performing SEO / AI / GEO videos we've found:\n\n"
+        f"These are titles of the best-performing videos we've found about "
+        f"{ANALYSIS_FOCUS}:\n\n"
         + "\n".join(f"- {t}" for t in titles)
         + "\n\nPropose 6-10 NEW YouTube search queries (3-6 words each) that would surface "
-        "more high-quality content on SEO, AI search/GEO, answer-engine optimization, and "
-        "driving website/video traffic. Favor emerging terminology. Avoid the word 'podcast'. "
+        f"more high-quality content on {ANALYSIS_FOCUS}. Favor emerging terminology. "
+        "Avoid the word 'podcast'. "
         'Return ONLY JSON: {"terms": ["...", "..."]}'
     )
     try:
@@ -471,6 +441,39 @@ def suggest_search_terms(conn, limit=40):
                 pass
     conn.commit()
     return added
+
+
+def dry_run():
+    """Test a profile's reach WITHOUT writing anything: run the searches +
+    channel fetches (flat metadata only) and report what would be discovered.
+    Returns a summary dict (also printed as JSON when called via --test --json)."""
+    seen = {}
+    channels = {}
+    for q in SEARCH_QUERIES:
+        for v in search_youtube(q, MAX_VIDEOS_PER_QUERY):
+            vid = v.get("id")
+            if vid and vid not in seen:
+                seen[vid] = v.get("title", "")
+                ch = v.get("channel") or v.get("uploader") or "?"
+                channels[ch] = channels.get(ch, 0) + 1
+        time.sleep(0.5)
+    for handle, name in CURATED_CHANNELS.items():
+        vids = fetch_channel_videos(handle, MAX_VIDEOS_PER_CHANNEL)
+        for v in vids:
+            vid = v.get("id")
+            if vid and vid not in seen:
+                seen[vid] = v.get("title", "")
+                channels[name] = channels.get(name, 0) + 1
+        time.sleep(0.5)
+    top_channels = sorted(channels.items(), key=lambda x: -x[1])[:15]
+    return {
+        "profile": ACTIVE_PROFILE["name"],
+        "label": ACTIVE_PROFILE["label"],
+        "unique_videos": len(seen),
+        "unique_channels": len(channels),
+        "top_channels": [{"name": n, "count": c} for n, c in top_channels],
+        "sample_titles": list(seen.values())[:15],
+    }
 
 
 def main():
@@ -724,7 +727,28 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--suggest-terms" in sys.argv:
+    # --profile NAME selects an investigation profile for this run.
+    prof_name = None
+    for a in sys.argv[1:]:
+        if a.startswith("--profile="):
+            prof_name = a.split("=", 1)[1]
+    if "--profile" in sys.argv:
+        i = sys.argv.index("--profile")
+        if i + 1 < len(sys.argv):
+            prof_name = sys.argv[i + 1]
+    if prof_name:
+        apply_profile(prof_name)
+
+    if "--test" in sys.argv:
+        summary = dry_run()
+        if "--json" in sys.argv:
+            print(json.dumps(summary))
+        else:
+            print(f"[{summary['label']}] would discover {summary['unique_videos']} videos "
+                  f"from {summary['unique_channels']} channels")
+            for c in summary["top_channels"]:
+                print(f"  {c['count']:>3}  {c['name']}")
+    elif "--suggest-terms" in sys.argv:
         c = init_db()
         added = suggest_search_terms(c)
         c.close()

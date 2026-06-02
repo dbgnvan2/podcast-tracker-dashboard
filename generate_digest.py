@@ -16,9 +16,12 @@ from pathlib import Path
 from datetime import datetime
 from collections import Counter
 
-DB_PATH = Path.home() / ".hermes" / "podcast_tracker.db"
-DIGEST_DIR = Path.home() / ".hermes" / "digests"
+import profiles
+_PROFILE = profiles.load()  # active investigation profile
+DB_PATH = Path(_PROFILE["db_path"])
+DIGEST_DIR = Path(_PROFILE["digest_dir"])
 DIGEST_DIR.mkdir(parents=True, exist_ok=True)
+DIGEST_TITLE = _PROFILE.get("digest_title", "Weekly Digest")
 
 
 def fmt_ts(sec):
@@ -48,14 +51,14 @@ def build_digest(days=None, limit=10):
 
     today = datetime.now().strftime("%Y-%m-%d")
     if not rows:
-        md = (f"# Weekly GEO/AI Search Podcast Digest — {today}\n\n"
+        md = (f"# {DIGEST_TITLE} — {today}\n\n"
               "_No analyzed videos yet. Transcribe and analyze some candidates "
               "to populate the digest._\n")
         conn.close()
         return md, today
 
     ent_counter, geo_counter = Counter(), Counter()
-    lines = [f"# Weekly GEO/AI Search Podcast Digest — {today}", ""]
+    lines = [f"# {DIGEST_TITLE} — {today}", ""]
     lines.append(f"**{len(rows)} verified, analyzed picks**, ranked by quality score.\n")
 
     for i, r in enumerate(rows, 1):

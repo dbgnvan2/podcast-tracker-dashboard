@@ -24,7 +24,10 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-DB_PATH = Path.home() / ".hermes" / "podcast_tracker.db"
+import profiles
+_PROFILE = profiles.load()  # active investigation profile
+DB_PATH = Path(_PROFILE["db_path"])
+ANALYSIS_FOCUS = _PROFILE.get("analysis_focus", "this topic")
 TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"
 ENV_FILE = Path.home() / ".hermes" / ".env"
 
@@ -69,18 +72,19 @@ def downsample_segments(segments, window=25):
     return "\n".join(lines)
 
 
-PROMPT = """You are an analyst building a weekly "best of" digest of SEO / AI / GEO
-(generative engine optimization) podcasts. You are given a VERIFIED transcript of
-one video, with [seconds] timestamp markers.
+PROMPT = """You are an analyst building a "best of" digest about {focus}. You are
+given a VERIFIED transcript of one video, with [seconds] timestamp markers.
 
 Extract, using ONLY what the transcript actually says (never invent):
 - key_points: 4-8 of the most important, specific, actionable insights. Each has:
     - timestamp_sec: integer seconds, taken from the nearest [seconds] marker where the point is made
     - point_text: one clear sentence
     - category: one of insight | strategy | tactic | tool | stat | prediction
-- seo_entities: distinct brands, tools, people, and products mentioned (array of strings)
-- geo_signals: concrete GEO / AI-search signals discussed — e.g. AI Overviews, entity SEO,
-    knowledge graph, zero-click, citations, llms.txt (array of strings)
+- seo_entities: distinct named entities mentioned — people, brands, tools, products,
+    studies (array of strings). (Field name is historical; treat it as "entities".)
+- geo_signals: the concrete domain-specific topics/themes/signals discussed that are
+    most relevant to {focus} (array of strings). (Field name is historical; treat it
+    as "key topics".)
 - best_quote: the single most quotable, high-signal sentence, verbatim from the transcript
 
 Return ONLY a JSON object with keys: key_points, seo_entities, geo_signals, best_quote.
@@ -128,6 +132,7 @@ def analyze_video(conn, row, key, base, model):
         print(f"  Skip {vid}: no usable transcript on disk.")
         return False
     prompt = PROMPT.format(
+        focus=ANALYSIS_FOCUS,
         title=row["video_title"] or "", channel=row["channel_name"] or "",
         transcript=transcript,
     )

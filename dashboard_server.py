@@ -8,20 +8,48 @@ import sys
 import argparse
 import subprocess
 
-DB_PATH = os.path.expanduser("~/.hermes/podcast_tracker.db")
+import profiles
+
+# DB_PATH is refreshed from the active investigation profile at the start of
+# every request (the server is single-threaded, so this is safe). This is what
+# makes profile-switching show a different dataset without restarting.
+DB_PATH = profiles.load()["db_path"]
 TRANSCRIPTS_DIR = os.path.expanduser("~/.hermes/transcripts")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
 ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
 DIGEST_SCRIPT = os.path.join(SCRIPT_DIR, "generate_digest.py")
 SCRAPER_SCRIPT = os.path.join(SCRIPT_DIR, "podcast_scraper.py")
-DIGEST_LATEST = os.path.expanduser("~/.hermes/digests/latest.md")
 
-def migrate():
-    print(f"Running migration on {DB_PATH}...")
-    conn = sqlite3.connect(DB_PATH)
+
+def refresh_active_db():
+    """Point DB_PATH at the active profile's database for this request."""
+    global DB_PATH
+    DB_PATH = profiles.load()["db_path"]
+    return DB_PATH
+
+
+def migrate(db=None):
+    target = db or DB_PATH
+    print(f"Running migration on {target}...")
+    conn = sqlite3.connect(target)
     cursor = conn.cursor()
-    
+
+    # Ensure the base videos table exists (fresh profile DBs start empty).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS videos (
+            id TEXT PRIMARY KEY, channel_name TEXT, channel_url TEXT, video_title TEXT,
+            url TEXT, publish_date TEXT, duration_seconds INTEGER, views INTEGER,
+            likes INTEGER, comments INTEGER, first_seen_date TEXT, last_updated_date TEXT,
+            prev_views INTEGER, view_change INTEGER, view_change_pct REAL,
+            transcript_keywords_score REAL, quality_score REAL, selected INTEGER DEFAULT 0,
+            transcript_summary TEXT, transcript_status TEXT DEFAULT 'not_requested',
+            transcribed_date TEXT, channel_id TEXT, is_new_channel INTEGER DEFAULT 0,
+            discovered_via TEXT DEFAULT 'search', views_per_day REAL DEFAULT 0
+        )
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, run_date TEXT, videos_found INTEGER, videos_new INTEGER, errors TEXT)")
+
     # Ensure transcript_status exists
     cursor.execute("PRAGMA table_info(videos)")
     columns = [row[1] for row in cursor.fetchall()]
@@ -269,7 +297,13 @@ HTML = """
     <div class="container">
         <header>
             <h1>Podcast Tracker</h1>
-            <div id="last-updated" style="font-size: 0.8rem; color: var(--text-dim);"></div>
+            <div style="display:flex; gap:10px; align-items:center;">
+                <span style="color:var(--text-dim);font-size:0.85rem">Investigation:</span>
+                <select id="profile-select" onchange="switchProfile(this.value)"
+                        style="background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:0.9rem;"></select>
+                <button class="btn btn-primary" onclick="openNewProfile()">+ New</button>
+                <div id="last-updated" style="font-size: 0.8rem; color: var(--text-dim); margin-left:10px;"></div>
+            </div>
         </header>
         
         <div class="tabs">
@@ -363,6 +397,37 @@ HTML = """
             <div class="chart-section">
                 <h3>Top Channels by Video Count</h3>
                 <div class="bar-container" id="channel-chart"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="profile-modal" onclick="if(event.target===this)closeProfileModal()">
+        <div class="modal" style="max-width:680px">
+            <div class="modal-header">
+                <div><h3 class="modal-title">New investigation profile</h3>
+                <div class="modal-sub">Define a search package for a different topic (e.g. Zone 2 training, stock trading).</div></div>
+                <button class="modal-close" onclick="closeProfileModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                    <label>Name (id)<input id="np-name" class="search-box" placeholder="zone2-training"></label>
+                    <label>Label<input id="np-label" class="search-box" placeholder="Zone 2 Training"></label>
+                </div>
+                <label>Search queries (one per line)
+                    <textarea id="np-queries" class="search-box" rows="5" placeholder="zone 2 training explained&#10;aerobic base building&#10;lactate threshold training"></textarea></label>
+                <label>Curated channels — <span style="color:var(--text-dim);font-size:0.8rem">one per line, <code>handle = Name</code></span>
+                    <textarea id="np-channels" class="search-box" rows="3" placeholder="PeterAttiaMD = Peter Attia&#10;flotrack = FloTrack"></textarea></label>
+                <label>Scoring keywords (comma-separated)
+                    <textarea id="np-keywords" class="search-box" rows="2" placeholder="zone 2, aerobic base, lactate, VO2 max, mitochondria, heart rate"></textarea></label>
+                <label>Analysis focus (for AI extraction + digest framing)
+                    <input id="np-focus" class="search-box" placeholder="Zone 2 / aerobic base endurance training"></label>
+                <label>Digest title<input id="np-digest" class="search-box" placeholder="Best of Zone 2 Training"></label>
+                <div style="display:flex;gap:10px;margin-top:14px;align-items:center">
+                    <button class="btn btn-view" onclick="testNewProfile()">Test (preview reach)</button>
+                    <button class="btn btn-primary" onclick="createProfile()">Create &amp; switch</button>
+                    <span id="np-status" style="color:var(--text-dim);font-size:0.85rem"></span>
+                </div>
+                <div id="np-test-result" style="margin-top:12px"></div>
             </div>
         </div>
     </div>
@@ -719,6 +784,71 @@ HTML = """
         }
         loadDigest();
 
+        async function loadProfiles() {
+            try {
+                const res = await fetch('/api/profiles');
+                const d = await res.json();
+                const sel = document.getElementById('profile-select');
+                sel.innerHTML = (d.profiles || []).map(p =>
+                    `<option value="${p.name}" ${p.active?'selected':''}>${p.label} (${p.queries}q/${p.channels}ch)</option>`
+                ).join('');
+            } catch (err) { console.error('profiles', err); }
+        }
+
+        async function switchProfile(name) {
+            await fetch('/api/set_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+            fetchData(); loadDigest();
+        }
+
+        function openNewProfile() { document.getElementById('profile-modal').classList.add('active'); }
+        function closeProfileModal() { document.getElementById('profile-modal').classList.remove('active'); }
+
+        function collectProfile() {
+            const lines = id => document.getElementById(id).value.split('\\n').map(s=>s.trim()).filter(Boolean);
+            const channels = {};
+            lines('np-channels').forEach(l => { const [h,...n] = l.split('='); if(h&&n.length) channels[h.trim()] = n.join('=').trim(); });
+            return {
+                name: document.getElementById('np-name').value.trim(),
+                label: document.getElementById('np-label').value.trim(),
+                search_queries: lines('np-queries'),
+                curated_channels: channels,
+                keywords: document.getElementById('np-keywords').value.split(',').map(s=>s.trim()).filter(Boolean),
+                analysis_focus: document.getElementById('np-focus').value.trim(),
+                digest_title: document.getElementById('np-digest').value.trim(),
+            };
+        }
+
+        async function createProfile() {
+            const s = document.getElementById('np-status');
+            const prof = collectProfile();
+            if (!prof.name) { s.innerText = 'Name is required.'; return; }
+            s.innerText = 'Creating…';
+            const res = await fetch('/api/create_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(prof)});
+            const d = await res.json();
+            if (d.ok) { await switchProfile(d.name); await loadProfiles(); closeProfileModal(); }
+            else s.innerText = 'Failed: ' + (d.error||'unknown');
+        }
+
+        async function testNewProfile() {
+            const s = document.getElementById('np-status');
+            const prof = collectProfile();
+            if (!prof.name) { s.innerText = 'Name is required to test.'; return; }
+            s.innerText = 'Saving + testing (≈1-2 min, hits YouTube)…';
+            // Persist first (so --profile can load it), without switching the active view.
+            await fetch('/api/create_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(prof)});
+            await loadProfiles();
+            const res = await fetch('/api/test_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: prof.name})});
+            const d = await res.json();
+            if (!d.ok) { s.innerText = 'Test failed: ' + (d.error||''); return; }
+            s.innerText = 'Test complete.';
+            const r = d.summary;
+            document.getElementById('np-test-result').innerHTML =
+                `<div class="intel-card"><b>${r.unique_videos}</b> videos from <b>${r.unique_channels}</b> channels.<br>
+                 <span style="color:var(--text-dim)">Top channels:</span> ${(r.top_channels||[]).map(c=>c.name+' ('+c.count+')').join(', ')}<br>
+                 <span style="color:var(--text-dim)">Sample:</span> ${(r.sample_titles||[]).slice(0,6).join(' · ')}</div>`;
+        }
+
+        loadProfiles();
         fetchData();
     </script>
 </body>
@@ -727,6 +857,7 @@ HTML = """
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        refresh_active_db()
         p = urllib.parse.urlparse(self.path).path
         if p == "/":
             self.send_response(200)
@@ -767,16 +898,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(self.get_discovery())
         elif p == "/api/digest":
             md = ""
-            if os.path.isfile(DIGEST_LATEST):
-                with open(DIGEST_LATEST, encoding="utf-8") as fh:
+            latest = os.path.join(profiles.load()["digest_dir"], "latest.md")
+            if os.path.isfile(latest):
+                with open(latest, encoding="utf-8") as fh:
                     md = fh.read()
             self.json({"markdown": md})
+        elif p == "/api/profiles":
+            self.json({"active": profiles.active_name(), "profiles": profiles.list_profiles()})
         else:
             self.send_error(404)
 
     def do_POST(self):
+        refresh_active_db()
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
+
+        # Profile management (create / switch / test investigation packages)
+        if self.path == "/api/profiles" or self.path == "/api/set_profile":
+            name = body.get("name")
+            try:
+                profiles.set_active(name)
+                migrate(profiles.db_path_for(name))  # ensure the target DB exists/migrated
+                self.json({"ok": True, "active": profiles.active_name()})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e)})
+            return
+        if self.path == "/api/create_profile":
+            try:
+                nm = profiles.create(
+                    body.get("name", "new-investigation"),
+                    label=body.get("label"),
+                    search_queries=body.get("search_queries") or [],
+                    curated_channels=body.get("curated_channels") or {},
+                    keywords=body.get("keywords") or [],
+                    analysis_focus=body.get("analysis_focus"),
+                    digest_title=body.get("digest_title"),
+                    min_views=body.get("min_views"),
+                    min_duration_sec=body.get("min_duration_sec"),
+                    max_duration_sec=body.get("max_duration_sec"),
+                    min_days_old=body.get("min_days_old"),
+                )
+                migrate(profiles.db_path_for(nm))
+                self.json({"ok": True, "name": nm})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e)})
+            return
+        if self.path == "/api/test_profile":
+            name = body.get("name")
+            try:
+                out = subprocess.run(
+                    [sys.executable, SCRAPER_SCRIPT, "--test", "--json", "--profile", name],
+                    capture_output=True, text=True, timeout=150)
+                line = (out.stdout or "").strip().splitlines()[-1] if out.stdout.strip() else "{}"
+                self.json({"ok": True, "summary": json.loads(line)})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e), "raw": (out.stdout if 'out' in dir() else '')[:500]})
+            return
 
         # These take no id — launch a background script.
         if self.path == "/api/process_queue":

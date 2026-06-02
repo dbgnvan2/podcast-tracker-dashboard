@@ -184,3 +184,15 @@ Fixes "we only find strangers / Neil Patel never appears" **and** "channel monit
 - **Dashboard "Discovery" tab** — emerging videos, suggested channels (+ Monitor button), suggested terms (Accept/Dismiss + Generate). Endpoints: `/api/discovery`, `/api/promote_channel`, `/api/accept_term`, `/api/reject_term`, `/api/suggest_terms`.
 - **Schema** — new `channels` + `suggested_terms` tables; new `videos` columns (`channel_id`, `is_new_channel`, `discovered_via`, `views_per_day`). All additive in `migrate()` and in the scraper's `init_db()`.
 - **Tests** — 9 total (added velocity monotonicity, suggested/auto-curate, days_since). All pass.
+
+---
+
+## 12. v1.3 status — investigation profiles (shipped 2026-06-02)
+
+The tool is now **topic-agnostic**. All search criteria are externalized into swappable "investigation profiles," so the same tooling runs separate investigations (SEO/GEO, Zone 2 training, stock trading, …) with full data isolation.
+
+- **`profiles.py`** — single source of truth. Profiles are JSON under `~/.hermes/profiles/<name>.json`, bundling `search_queries`, `curated_channels`, `channel_bonus`, `keywords`, filters, `analysis_focus`, `digest_title`. Active pointer in `~/.hermes/profiles/_active`. Seeds the built-in `seo-geo` profile from the former hardcoded values.
+- **One DB per profile** — `db_path_for()` maps `seo-geo` → legacy `~/.hermes/podcast_tracker.db` (data preserved) and others → `~/.hermes/db/podcast_<name>.db`. Switching profiles swaps the dataset (verified: 0 vs 104 videos across a switch, then back).
+- **All scripts refactored** — `podcast_scraper.py` (criteria + `--profile` + `--test` dry-run), `fetch_transcripts.py`, `analyze_transcripts.py` (prompt framed by `analysis_focus`), `generate_digest.py` (per-profile dir + title) read the active profile. The dashboard refreshes `DB_PATH` per request, so switching is live without a restart.
+- **Dashboard** — header profile dropdown (live switch), "+ New" investigation modal (queries/channels/keywords/focus + **Test** preview + **Create & switch**). Endpoints: `/api/profiles`, `/api/set_profile`, `/api/create_profile`, `/api/test_profile`. `migrate(db)` self-creates a fresh profile's schema.
+- **Tests** — 12 total (added seed/active, create-switch-isolation, defaults). All pass.

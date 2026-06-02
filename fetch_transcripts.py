@@ -18,8 +18,9 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path.home() / ".hermes" / "podcast_tracker.db"
-TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"
+import profiles
+DB_PATH = Path(profiles.load()["db_path"])  # active investigation profile's DB
+TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"  # shared (id-keyed)
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # yt-dlp: prefer a modern brew/standalone build; fall back to PATH.

@@ -9,8 +9,11 @@
 A small toolchain that discovers SEO/AI/GEO podcasts on YouTube, scores them by quality, queues the good ones for transcription, fetches transcripts, and surfaces everything in a local web dashboard. All state lives in one SQLite database.
 
 - **GitHub:** https://github.com/dbgnvan2/podcast-tracker-dashboard
-- **Data store:** SQLite at `~/.hermes/podcast_tracker.db` (single source of truth for all four scripts)
-- **Transcripts:** plain-text files in `~/.hermes/transcripts/`
+- **Data store:** SQLite — **one DB per investigation profile**. The default `seo-geo` profile uses `~/.hermes/podcast_tracker.db`; others use `~/.hermes/db/podcast_<name>.db`. The active profile is resolved via `profiles.py`.
+- **Transcripts:** plain-text files in `~/.hermes/transcripts/` (shared across profiles; keyed by YouTube id)
+
+### Investigation profiles (load-bearing)
+All topic-specific criteria are externalized into **profiles** (`~/.hermes/profiles/<name>.json`), so the tool works for any topic (SEO/GEO, Zone 2 training, stock trading…). A profile bundles `search_queries`, `curated_channels`, `channel_bonus`, `keywords`, filters (`min_views`/`min_duration_sec`/`max_duration_sec`/`min_days_old`), `analysis_focus` (frames the LLM analysis + term suggestions), and `digest_title`. **Switching the active profile swaps the underlying DB**, so investigations are fully isolated. `profiles.py` is the single source of truth (active pointer in `~/.hermes/profiles/_active`); every script resolves `DB_PATH` from it. The dashboard refreshes the active DB per request, so switching is live. Each script accepts the active profile by default; `podcast_scraper.py --profile NAME` overrides, and `--test` previews a profile's reach without writing.
 
 > **Origin & status:** This codebase was prototyped by an agent ("Hermes") under `~/.hermes/scripts/`, then handed off to a real coding agent (this repo) because the prototype stalled — file writes failed, the server wouldn't launch, and at one point the prototype manually edited the DB instead of fixing code (a mistake the user was emphatic about never repeating — see Working Rules). The scripts here run, but the **AI-analysis stage is unbuilt** and the **live DB is in a partly-inconsistent state** from the aborted prototype runs. See "Product Vision & Roadmap" below.
 
@@ -34,6 +37,7 @@ There is **no virtualenv, no `requirements.txt`, no `package.json`**. The only e
 
 ```
 podcast-tracker-dashboard/
+├── profiles.py                 # Investigation profiles: swappable search packages (queries/channels/keywords/filters/focus) — one DB per profile
 ├── podcast_scraper.py          # Search YouTube → score → upsert into videos table
 ├── fetch_transcripts.py        # Drain 'requested' queue → yt-dlp subs → transcripts (+segments)
 ├── analyze_transcripts.py      # AI Intelligence: transcript → key_points + ai_analysis (LLM)
@@ -196,6 +200,10 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | POST | `/api/suggest_terms` | Background-launch `podcast_scraper.py --suggest-terms` (LLM query freshening) |
 | POST | `/api/promote_channel` | `{channel_id}` → mark a suggested channel `curated` (start monitoring it) |
 | POST | `/api/accept_term` / `/api/reject_term` | `{term}` → accept (use in future scrapes) or dismiss a suggested term |
+| GET | `/api/profiles` | List investigation profiles + which is active |
+| POST | `/api/set_profile` | `{name}` → switch active profile (migrates its DB) |
+| POST | `/api/create_profile` | Create a profile from a JSON body (queries/channels/keywords/focus/filters) |
+| POST | `/api/test_profile` | `{name}` → dry-run a profile's reach (counts + top channels + sample titles), no writes |
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
 
