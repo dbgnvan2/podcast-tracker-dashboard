@@ -138,3 +138,19 @@ There is **no "Intelligence" tab** and no AI-analysis trigger in the UI.
 4. **Intelligence tab** — surface entities / best quote / key points.
 5. **Weekly "best-of" digest** generator.
 6. **Housekeeping** — resolve the duplicate scanner file; reconcile the stale `obtained` rows; eventually drop the dead `transcribed`/`transcribe_requested` columns.
+
+---
+
+## 9. v1 status (shipped 2026-06-01)
+
+v1 closes the non-LLM gaps, turning the scripts into one GUI-first app:
+
+- **`POST /api/process_queue`** + a **"⚙ Process Queue"** button on the Requested tab — launches `fetch_transcripts.py` in the background (logs to `~/.hermes/logs/fetch_transcripts.log`) and polls so rows leave the queue as they finish. (Gap #2 ✅)
+- **`GET /api/transcript/{id}`** + a **"View"** button + modal on the Transcribed tab to read the verified text. (Gap #3 ✅)
+- **`--reconcile`** CLI: resets fake `obtained` rows (no backing transcript) to `requested` and deletes stub transcript files. Ran once — fixed 4 fake rows + removed 3 stub files. (Gap #6 partial ✅)
+- **Removed** the duplicate `youtube_podcast_scanner.py`. (Gap #6 ✅)
+- **`fetch_transcripts.py` hardened**: distinguishes captions *gated/blocked* (PO token / SABR / rate limit → retryable `error`) from captions *genuinely absent* (`not_available`), so good videos are no longer silently killed.
+
+**Still v1.1+:** the AI "Intelligence" stage (Gap #1, needs an LLM key), the weekly digest (Gap #5), dropping dead columns.
+
+**Live blocker:** transcription can't complete until `yt-dlp` is upgraded (current build is on deprecated Python 3.9 and can't satisfy YouTube's PO-token gate). After `pip install -U yt-dlp`, the queue should drain to real transcripts. Current statuses: 14 `not_requested`, 7 `error` (the Brand Entity SEO series + 2 others, all retryable).

@@ -130,6 +130,9 @@ discover (cron) → score → mark for transcription → fetch transcript
 # One-time / after schema edits: create or migrate the DB
 python3 dashboard_server.py --migrate
 
+# Make transcript_status honest (reset fake 'obtained', drop stub transcript files)
+python3 dashboard_server.py --reconcile
+
 # Discover + score new videos (writes to the videos table)
 python3 podcast_scraper.py
 
@@ -154,7 +157,12 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | GET | `/api/requested` | Top 50 `requested` by `quality_score` |
 | GET | `/api/transcribed` | `obtained` rows joined with `transcripts` + key-point count |
 | GET | `/api/stats` | Totals, per-status counts, top channels |
+| GET | `/api/transcript/{id}` | Verified `full_text` + word count for the Transcribed-tab "View" modal |
 | POST | `/api/request_transcribe` | `{id}` → set status `requested` |
 | POST | `/api/unrequest` | `{id}` → set status `not_requested` |
+| POST | `/api/process_queue` | Launches `fetch_transcripts.py` as a background subprocess to drain the `requested` queue; returns `{started, queued, message}` |
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
+
+### Known environment blocker (transcription)
+`yt-dlp` on this machine is **outdated** (at `~/.hermes/Library/Python/3.9/bin/yt-dlp`, deprecated Python 3.9). YouTube now gates auto-captions behind a **PO token**, so this yt-dlp returns "no captions" even when captions exist. `fetch_transcripts.py` now classifies those gated/blocked responses as retryable `error` (not `not_available`). **To actually produce transcripts, upgrade yt-dlp** (`pip install -U yt-dlp`, ideally on Python 3.10+) and re-run the queue. This is the only thing blocking the end-to-end pipeline.

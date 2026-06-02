@@ -6,8 +6,12 @@ import os
 import urllib.parse
 import sys
 import argparse
+import subprocess
 
 DB_PATH = os.path.expanduser("~/.hermes/podcast_tracker.db")
+TRANSCRIPTS_DIR = os.path.expanduser("~/.hermes/transcripts")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
 
 def migrate():
     print(f"Running migration on {DB_PATH}...")
@@ -57,6 +61,45 @@ def migrate():
     conn.commit()
     conn.close()
     print("Migration complete.")
+
+def reconcile():
+    """Make transcript_status honest: a video is only 'obtained' if a real
+    transcript row backs it. Resets fakes and removes stub transcript files.
+    Code-driven only — never hand-edit rows to paper over this."""
+    print(f"Reconciling {DB_PATH}...")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # 1. 'obtained' videos with no transcripts row are not really transcribed.
+    #    Send them back to 'requested' so Process Queue fetches them for real.
+    orphan_obtained = conn.execute("""
+        SELECT v.id FROM videos v
+        LEFT JOIN transcripts t ON t.video_id = v.id
+        WHERE v.transcript_status = 'obtained' AND t.video_id IS NULL
+    """).fetchall()
+    for row in orphan_obtained:
+        conn.execute(
+            "UPDATE videos SET transcript_status = 'requested', transcribed_date = NULL WHERE id = ?",
+            (row["id"],),
+        )
+    print(f"  Reset {len(orphan_obtained)} fake 'obtained' video(s) -> 'requested'.")
+
+    # 2. Remove transcript files that have no backing transcripts row (stubs).
+    backed = {r["video_id"] for r in conn.execute("SELECT video_id FROM transcripts")}
+    removed = 0
+    if os.path.isdir(TRANSCRIPTS_DIR):
+        for fname in os.listdir(TRANSCRIPTS_DIR):
+            if not fname.endswith(".txt"):
+                continue
+            vid = fname[:-4]
+            if vid not in backed:
+                os.remove(os.path.join(TRANSCRIPTS_DIR, fname))
+                removed += 1
+    print(f"  Removed {removed} unbacked transcript file(s).")
+
+    conn.commit()
+    conn.close()
+    print("Reconcile complete.")
 
 HTML = """
 <!DOCTYPE html>
@@ -123,8 +166,25 @@ HTML = """
         }
         .btn-mark { background: var(--success); color: white; }
         .btn-unreq { background: var(--error); color: white; }
+        .btn-primary { background: var(--accent); color: var(--bg-color); padding: 8px 16px; font-size: 0.9rem; }
+        .btn-view { background: var(--border); color: var(--text-main); }
         .btn:hover { opacity: 0.8; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .modal-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+            z-index: 100; align-items: center; justify-content: center; padding: 20px;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+            max-width: 800px; width: 100%; max-height: 85vh; display: flex; flex-direction: column;
+        }
+        .modal-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 15px; padding: 20px; border-bottom: 1px solid var(--border); }
+        .modal-title { font-size: 1.1rem; font-weight: 600; margin: 0; }
+        .modal-sub { color: var(--text-dim); font-size: 0.85rem; margin-top: 4px; }
+        .modal-close { background: none; border: none; color: var(--text-dim); font-size: 1.5rem; cursor: pointer; line-height: 1; }
+        .modal-body { padding: 20px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; color: var(--text-main); }
 
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .stat-card { background: var(--card-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border); }
@@ -167,6 +227,10 @@ HTML = """
         </div>
 
         <div id="requested" class="tab-content">
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
+                <button class="btn btn-primary" onclick="processQueue()">⚙ Process Queue</button>
+                <span id="queue-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
+            </div>
             <div class="search-container"><input type="text" class="search-box" placeholder="Search requested..." oninput="filterTable('requested')"></div>
             <table id="table-requested">
                 <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Date</th><th width="100">Action</th></tr></thead>
@@ -188,6 +252,19 @@ HTML = """
                 <h3>Top Channels by Video Count</h3>
                 <div class="bar-container" id="channel-chart"></div>
             </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="transcript-modal" onclick="if(event.target===this)closeModal()">
+        <div class="modal">
+            <div class="modal-header">
+                <div>
+                    <h3 class="modal-title" id="modal-title">Transcript</h3>
+                    <div class="modal-sub" id="modal-sub"></div>
+                </div>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">Loading…</div>
         </div>
     </div>
 
@@ -237,7 +314,7 @@ HTML = """
                 } else if (type === 'requested') {
                     actionHtml = `<td><button class="btn btn-unreq" onclick="postAction('/api/unrequest', '${v.id}')">Remove</button></td>`;
                 } else if (type === 'transcribed') {
-                    actionHtml = `<td class="bar-count" style="text-align:center">${v.key_point_count || 0}</td>`;
+                    actionHtml = `<td style="text-align:center; white-space:nowrap">${v.key_point_count || 0} &nbsp;<button class="btn btn-view" onclick="viewTranscript('${v.id}')">View</button></td>`;
                 }
 
                 let dateCol = v.publish_date || '';
@@ -322,6 +399,55 @@ HTML = """
             }
         }
 
+        async function processQueue() {
+            const status = document.getElementById('queue-status');
+            status.innerText = 'Starting…';
+            try {
+                const res = await fetch('/api/process_queue', { method: 'POST' });
+                const data = await res.json();
+                status.innerText = data.message || '';
+                if (data.started) {
+                    // Poll for a while so rows move out of the queue as they complete.
+                    let ticks = 0;
+                    const timer = setInterval(() => {
+                        fetchData();
+                        if (++ticks >= 15) { clearInterval(timer); }
+                    }, 4000);
+                }
+            } catch (err) {
+                status.innerText = 'Failed to start: ' + err;
+            }
+        }
+
+        async function viewTranscript(id) {
+            const modal = document.getElementById('transcript-modal');
+            const body = document.getElementById('modal-body');
+            const title = document.getElementById('modal-title');
+            const sub = document.getElementById('modal-sub');
+            title.innerText = 'Transcript';
+            sub.innerText = '';
+            body.innerText = 'Loading…';
+            modal.classList.add('active');
+            try {
+                const res = await fetch('/api/transcript/' + encodeURIComponent(id));
+                const data = await res.json();
+                if (data.full_text) {
+                    title.innerText = data.video_title || 'Transcript';
+                    sub.innerText = (data.channel_name || '') + ' · ' + (data.word_count || 0).toLocaleString() + ' words';
+                    body.innerText = data.full_text;
+                } else {
+                    body.innerText = 'No transcript stored for this video yet.';
+                }
+            } catch (err) {
+                body.innerText = 'Error loading transcript: ' + err;
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('transcript-modal').classList.remove('active');
+        }
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
         fetchData();
     </script>
 </body>
@@ -353,14 +479,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(self.query(sql))
         elif p == "/api/stats":
             self.json(self.get_stats())
+        elif p.startswith("/api/transcript/"):
+            video_id = urllib.parse.unquote(p[len("/api/transcript/"):])
+            rows = self.query(
+                "SELECT t.full_text, t.word_count, v.video_title, v.channel_name "
+                "FROM transcripts t JOIN videos v ON v.id = t.video_id WHERE t.video_id = ?",
+                (video_id,),
+            )
+            if rows:
+                self.json(rows[0])
+            else:
+                self.json({"error": "no transcript", "full_text": None})
         else:
             self.send_error(404)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
+
+        # Queue processing takes no id — launch the fetcher in the background.
+        if self.path == "/api/process_queue":
+            self.process_queue()
+            return
+
         video_id = body.get("id")
-        
         if not video_id:
             self.send_error(400, "Missing ID")
             return
@@ -414,13 +556,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stats.update(status_counts)
         return stats
 
+    def process_queue(self):
+        """Launch fetch_transcripts.py in the background to drain the
+        'requested' queue. Returns immediately so the UI stays responsive."""
+        queued = self.query(
+            "SELECT COUNT(*) AS n FROM videos WHERE transcript_status = 'requested'"
+        )[0]["n"]
+
+        if queued == 0:
+            self.json({"started": False, "queued": 0, "message": "Queue is empty."})
+            return
+
+        if not os.path.isfile(FETCH_SCRIPT):
+            self.json({"started": False, "queued": queued,
+                       "message": f"Fetcher not found at {FETCH_SCRIPT}"})
+            return
+
+        log_dir = os.path.expanduser("~/.hermes/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "fetch_transcripts.log")
+        logfile = open(log_path, "a")
+        subprocess.Popen(
+            [sys.executable, FETCH_SCRIPT],
+            stdout=logfile, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self.json({"started": True, "queued": queued,
+                   "message": f"Processing {queued} video(s) in the background."})
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--migrate", action="store_true", help="Run database migrations")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="Make transcript_status honest (reset fake 'obtained', drop stub files)")
     args = parser.parse_args()
 
     if args.migrate:
         migrate()
+        sys.exit(0)
+
+    if args.reconcile:
+        reconcile()
         sys.exit(0)
 
     port = int(os.environ.get("PORT", 9091))

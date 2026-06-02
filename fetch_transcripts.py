@@ -74,8 +74,9 @@ def process_queue():
         ]
         
         try:
-            subprocess.run(cmd, capture_output=True, check=True, timeout=60)
-            
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            yt_output = (proc.stdout or "") + (proc.stderr or "")
+
             # Find the actual file (yt-dlp appends .en.vtt or similar)
             found_files = list(TRANSCRIPTS_DIR.glob(f"{vid}.*.vtt"))
             if found_files:
@@ -110,9 +111,22 @@ def process_queue():
                     print("  Warning: Transcript too short.")
                     conn.execute("UPDATE videos SET transcript_status = 'not_available' WHERE id = ?", (vid,))
             else:
-                print("  Error: No subtitle file generated.")
-                conn.execute("UPDATE videos SET transcript_status = 'not_available' WHERE id = ?", (vid,))
-        
+                # Distinguish "captions truly absent" from "captions gated/blocked".
+                # YouTube now gates auto-captions behind a PO token; an outdated
+                # yt-dlp (or SABR streaming) reports them as missing even though
+                # they exist. Treat those as retryable 'error', not 'not_available'.
+                blocked_markers = (
+                    "po token", "sabr", "missing subtitles languages",
+                    "sign in to confirm", "rate", "http error 429",
+                )
+                lowered = yt_output.lower()
+                if any(m in lowered for m in blocked_markers):
+                    print("  Blocked: captions gated (PO token / SABR / rate limit) -> error (will retry).")
+                    conn.execute("UPDATE videos SET transcript_status = 'error' WHERE id = ?", (vid,))
+                else:
+                    print("  No captions available for this video -> not_available.")
+                    conn.execute("UPDATE videos SET transcript_status = 'not_available' WHERE id = ?", (vid,))
+
         except Exception as e:
             print(f"  Failed: {e}")
             conn.execute("UPDATE videos SET transcript_status = 'error' WHERE id = ?", (vid,))
