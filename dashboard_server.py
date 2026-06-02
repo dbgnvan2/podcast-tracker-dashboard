@@ -286,6 +286,9 @@ HTML = """
 
         <div id="candidates" class="tab-content active">
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
+                <button class="btn btn-primary" onclick="runDiscovery()">🔄 Run Discovery</button>
+                <span class="discovery-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
+                <span style="flex:1"></span>
                 <span style="color:var(--text-dim);font-size:0.85rem">Sort:</span>
                 <button id="sort-quality" class="tab-btn active" onclick="setCandidateSort('quality')">Quality</button>
                 <button id="sort-trending" class="tab-btn" onclick="setCandidateSort('trending')">🔥 Trending</button>
@@ -334,6 +337,10 @@ HTML = """
         </div>
 
         <div id="discovery" class="tab-content">
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:18px;">
+                <button class="btn btn-primary" onclick="runDiscovery()">🔄 Run Discovery</button>
+                <span class="discovery-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
+            </div>
             <h3 style="margin-top:0">🆕 Emerging videos <span style="color:var(--text-dim);font-size:0.8rem;font-weight:400">— from channels we hadn't seen before</span></h3>
             <table id="table-emerging">
                 <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views/day</th><th width="110">Action</th></tr></thead>
@@ -512,6 +519,24 @@ HTML = """
             s.innerText = 'Generating…';
             await fetch('/api/suggest_terms', {method:'POST'});
             setTimeout(() => { fetchData(); s.innerText = 'Done — review below.'; }, 4000);
+        }
+
+        async function runDiscovery() {
+            const spans = document.querySelectorAll('.discovery-status');
+            spans.forEach(s => s.innerText = 'Starting…');
+            try {
+                const res = await fetch('/api/run_discovery', { method: 'POST' });
+                const d = await res.json();
+                spans.forEach(s => s.innerText = d.message || 'Running…');
+                // Discovery takes minutes; refresh periodically so results appear as they land.
+                let ticks = 0;
+                const timer = setInterval(() => {
+                    fetchData();
+                    if (++ticks >= 20) { clearInterval(timer); spans.forEach(s => s.innerText = 'Finished refreshing.'); }
+                }, 15000);
+            } catch (err) {
+                spans.forEach(s => s.innerText = 'Failed to start: ' + err);
+            }
         }
 
         function renderStats() {
@@ -770,6 +795,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             subprocess.Popen([sys.executable, DIGEST_SCRIPT, "--days=7"],
                              stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
             self.json({"started": True, "message": "Generating digest…"})
+            return
+        if self.path == "/api/run_discovery":
+            logfile = self._job_log("podcast_scraper")
+            subprocess.Popen([sys.executable, SCRAPER_SCRIPT],
+                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            self.json({"started": True,
+                       "message": "Discovery running in the background (this takes a few minutes)…"})
             return
         if self.path == "/api/suggest_terms":
             logfile = self._job_log("suggest_terms")
