@@ -754,7 +754,15 @@ if __name__ == "__main__":
         sys.exit(0)
 
     port = int(os.environ.get("PORT", 9091))
-    server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    try:
+        server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        if e.errno == 48:  # Address already in use
+            print(f"Port {port} is already in use.")
+            print(f"  • If the dashboard is already open, just visit http://localhost:{port}")
+            print(f"  • Otherwise start on another port:  PORT={port + 1} python3 dashboard_server.py")
+            sys.exit(1)
+        raise
     print(f"Podcast Tracker Dashboard running at http://localhost:{port}")
     try:
         server.serve_forever()
