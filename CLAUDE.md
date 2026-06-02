@@ -57,8 +57,12 @@ podcast-tracker-dashboard/
 - **`videos`** — one row per discovered video. PK `id` (YouTube video id). Key columns: `quality_score`, `views`, `channel_name`, `publish_date`, and `transcript_status`.
 - **`transcripts`** — `video_id` PK, `full_text`, `word_count`, `file_path`.
 - **`key_points`** — extracted points per video (`video_id`, `timestamp_sec`, `point_text`, `category`). Currently empty — target of the unbuilt AI-analysis stage.
-- **`ai_analysis`** — per-video AI extraction (`seo_entities`, `geo_signals`, `best_quote`, `analyzed_at`). Exists in the live DB but **no script creates or writes it**; fold its creation into `migrate()` when you build the analysis stage.
+- **`ai_analysis`** — per-video AI extraction (`seo_entities`, `geo_signals`, `best_quote`, `analyzed_at`). Written by `analyze_transcripts.py`.
+- **`channels`** — channel registry (`channel_id` PK, `channel_name`, `handle`, `channel_url`, `video_count`, `best_score`, `curated`, `suggested`). Drives authority monitoring + emerging detection + auto-promotion. Rebuilt each scrape by `sync_channels()`.
+- **`suggested_terms`** — LLM-proposed search queries (`term` PK, `source`, `created_at`, `status` = pending|accepted|rejected). Accepted terms are merged into the query list on the next scrape.
 - **`runs`** — scraper run log.
+
+New `videos` columns for discovery: `channel_id`, `is_new_channel` (emerging flag), `discovered_via` (`search`|`channel`), `views_per_day` (velocity).
 
 ### `transcript_status` state machine (load-bearing)
 The dashboard tabs and the fetcher queue both key off this single column. Valid values:
@@ -79,6 +83,14 @@ The end goal (user's words across the build): a publishable **weekly "best of" S
 discover (cron) → score → mark for transcription → fetch transcript
    → AI-analyze transcript → surface in dashboard → weekly "best of" digest
 ```
+
+### Discovery model (two complementary arms — keep BOTH)
+- **Keyword search** (`SEARCH_QUERIES`) — the wide net that finds *new/unknown* channels. Do **not** put "podcast" in queries (it filters out educational creators like Neil Patel and pulls in off-topic literal podcasts).
+- **Channel monitoring** (`CURATED_CHANNELS` + DB `channels` where `curated=1`) — guarantees known authorities. Curated videos bypass the view/age gates.
+- **Emerging detection** — a video from a `channel_id` never catalogued before is flagged `is_new_channel`; surfaced in the Discovery tab.
+- **Velocity** — `views_per_day` feeds a 0.10-weight term in `quality_score` and powers the Candidates "🔥 Trending" sort, so breakouts surface early.
+- **Auto-promotion** — `sync_channels()` flags a non-curated channel `suggested` once it has ≥2 videos scoring ≥0.6; the user promotes it (→ monitored) from the Discovery tab.
+- **Query freshening** — `podcast_scraper.py --suggest-terms` asks an LLM to mine top titles for new search terms; the user accepts/dismisses them in the Discovery tab; accepted terms join the next scrape.
 
 ### Built and working
 - Discovery + quality scoring (`podcast_scraper.py`)
@@ -175,11 +187,15 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | GET | `/api/transcript/{id}` | Verified `full_text` + word count for the Transcribed-tab "View" modal |
 | GET | `/api/intelligence` | Analyzed videos with `seo_entities`, `geo_signals`, `best_quote`, `key_points` |
 | GET | `/api/digest` | Latest digest markdown (`~/.hermes/digests/latest.md`) |
+| GET | `/api/discovery` | Emerging videos (new channels), suggested channels, suggested search terms |
 | POST | `/api/request_transcribe` | `{id}` → set status `requested` |
 | POST | `/api/unrequest` | `{id}` → set status `not_requested` |
 | POST | `/api/process_queue` | Background-launch `fetch_transcripts.py` (drain `requested`) |
 | POST | `/api/analyze` | Background-launch `analyze_transcripts.py` (analyze obtained transcripts) |
 | POST | `/api/generate_digest` | Background-launch `generate_digest.py` |
+| POST | `/api/suggest_terms` | Background-launch `podcast_scraper.py --suggest-terms` (LLM query freshening) |
+| POST | `/api/promote_channel` | `{channel_id}` → mark a suggested channel `curated` (start monitoring it) |
+| POST | `/api/accept_term` / `/api/reject_term` | `{term}` → accept (use in future scrapes) or dismiss a suggested term |
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
 

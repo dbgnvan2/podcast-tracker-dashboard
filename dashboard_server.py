@@ -14,6 +14,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
 ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
 DIGEST_SCRIPT = os.path.join(SCRIPT_DIR, "generate_digest.py")
+SCRAPER_SCRIPT = os.path.join(SCRIPT_DIR, "podcast_scraper.py")
 DIGEST_LATEST = os.path.expanduser("~/.hermes/digests/latest.md")
 
 def migrate():
@@ -38,7 +39,18 @@ def migrate():
     if 'transcribed_date' not in columns:
         print("Adding 'transcribed_date' column...")
         cursor.execute("ALTER TABLE videos ADD COLUMN transcribed_date TEXT")
-    
+
+    # Emerging-discovery columns (additive, idempotent)
+    for col, ddl in [
+        ("channel_id", "ALTER TABLE videos ADD COLUMN channel_id TEXT"),
+        ("is_new_channel", "ALTER TABLE videos ADD COLUMN is_new_channel INTEGER DEFAULT 0"),
+        ("discovered_via", "ALTER TABLE videos ADD COLUMN discovered_via TEXT DEFAULT 'search'"),
+        ("views_per_day", "ALTER TABLE videos ADD COLUMN views_per_day REAL DEFAULT 0"),
+    ]:
+        if col not in columns:
+            print(f"Adding '{col}' column...")
+            cursor.execute(ddl)
+
     # Tables for transcript data
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transcripts (
@@ -69,6 +81,32 @@ def migrate():
             best_quote TEXT,
             analyzed_at TEXT,
             FOREIGN KEY(video_id) REFERENCES videos(id)
+        )
+    """)
+
+    # Channel registry — drives both authority monitoring and emerging detection.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id TEXT PRIMARY KEY,
+            channel_name TEXT,
+            handle TEXT,
+            channel_url TEXT,
+            first_seen_date TEXT,
+            last_seen_date TEXT,
+            video_count INTEGER DEFAULT 0,
+            best_score REAL DEFAULT 0,
+            curated INTEGER DEFAULT 0,
+            suggested INTEGER DEFAULT 0
+        )
+    """)
+
+    # Query-freshening: LLM-proposed search terms awaiting review.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS suggested_terms (
+            term TEXT PRIMARY KEY,
+            source TEXT,
+            created_at TEXT,
+            status TEXT DEFAULT 'pending'
         )
     """)
 
@@ -240,15 +278,21 @@ HTML = """
             <button class="tab-btn" onclick="showTab('transcribed', this)">Transcribed</button>
             <button class="tab-btn" onclick="showTab('intelligence', this)">Intelligence</button>
             <button class="tab-btn" onclick="showTab('digest', this)">Digest</button>
+            <button class="tab-btn" onclick="showTab('discovery', this)">Discovery</button>
             <button class="tab-btn" onclick="showTab('stats', this)">Stats</button>
         </div>
         
         <div id="loading">Loading data...</div>
 
         <div id="candidates" class="tab-content active">
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
+                <span style="color:var(--text-dim);font-size:0.85rem">Sort:</span>
+                <button id="sort-quality" class="tab-btn active" onclick="setCandidateSort('quality')">Quality</button>
+                <button id="sort-trending" class="tab-btn" onclick="setCandidateSort('trending')">🔥 Trending</button>
+            </div>
             <div class="search-container"><input type="text" class="search-box" placeholder="Search candidates..." oninput="filterTable('candidates')"></div>
             <table id="table-candidates">
-                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Date</th><th width="100">Action</th></tr></thead>
+                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Views/day</th><th width="100">Action</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
@@ -289,6 +333,24 @@ HTML = """
             <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
         </div>
 
+        <div id="discovery" class="tab-content">
+            <h3 style="margin-top:0">🆕 Emerging videos <span style="color:var(--text-dim);font-size:0.8rem;font-weight:400">— from channels we hadn't seen before</span></h3>
+            <table id="table-emerging">
+                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views/day</th><th width="110">Action</th></tr></thead>
+                <tbody></tbody>
+            </table>
+
+            <h3 style="margin-top:28px">📡 Suggested channels to monitor <span style="color:var(--text-dim);font-size:0.8rem;font-weight:400">— strangers who keep producing winners</span></h3>
+            <div id="suggested-channels"></div>
+
+            <div style="display:flex; gap:12px; align-items:center; margin:28px 0 12px;">
+                <h3 style="margin:0">🔎 Suggested search terms</h3>
+                <button class="btn btn-primary" onclick="suggestTerms()">Generate from top content</button>
+                <span id="terms-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
+            </div>
+            <div id="suggested-terms"></div>
+        </div>
+
         <div id="stats" class="tab-content">
             <div class="stats-grid" id="stats-summary"></div>
             <div class="chart-section">
@@ -312,23 +374,26 @@ HTML = """
     </div>
 
     <script>
-        let data = { candidates: [], requested: [], transcribed: [], stats: {}, intelligence: [] };
+        let data = { candidates: [], requested: [], transcribed: [], stats: {}, intelligence: [], discovery: {} };
+        let candidateSort = 'quality';  // 'quality' | 'trending'
 
         async function fetchData() {
             document.getElementById('loading').style.display = 'block';
             try {
-                const [cRes, rRes, tRes, sRes, iRes] = await Promise.all([
+                const [cRes, rRes, tRes, sRes, iRes, dRes] = await Promise.all([
                     fetch('/api/candidates').then(r => r.json()),
                     fetch('/api/requested').then(r => r.json()),
                     fetch('/api/transcribed').then(r => r.json()),
                     fetch('/api/stats').then(r => r.json()),
-                    fetch('/api/intelligence').then(r => r.json())
+                    fetch('/api/intelligence').then(r => r.json()),
+                    fetch('/api/discovery').then(r => r.json())
                 ]);
                 data.candidates = cRes;
                 data.requested = rRes;
                 data.transcribed = tRes;
                 data.stats = sRes;
                 data.intelligence = iRes;
+                data.discovery = dRes;
                 renderAll();
             } catch (err) {
                 console.error('Fetch error:', err);
@@ -342,6 +407,7 @@ HTML = """
             renderTable('requested', data.requested);
             renderTable('transcribed', data.transcribed);
             renderIntelligence();
+            renderDiscovery();
             renderStats();
             document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
         }
@@ -349,11 +415,16 @@ HTML = """
         function renderTable(type, items) {
             const tbody = document.querySelector(`#table-${type} tbody`);
             tbody.innerHTML = '';
-            
-            items.forEach(v => {
+
+            let rows = items.slice();
+            if (type === 'candidates' && candidateSort === 'trending') {
+                rows.sort((a, b) => (b.views_per_day || 0) - (a.views_per_day || 0));
+            }
+
+            rows.forEach(v => {
                 const tr = document.createElement('tr');
                 tr.setAttribute('data-id', v.id);
-                
+
                 let actionHtml = '';
                 if (type === 'candidates') {
                     actionHtml = `<td><button class="btn btn-mark" onclick="postAction('/api/request_transcribe', '${v.id}')">Transcribe</button></td>`;
@@ -367,11 +438,14 @@ HTML = """
                 if (type === 'transcribed') {
                     dateCol = v.transcript_status || 'obtained';
                     if (v.transcribed_date) dateCol += ' - ' + v.transcribed_date;
+                } else if (v.views_per_day) {
+                    dateCol = `${(v.views_per_day).toLocaleString()}/day`;
                 }
+                const badge = v.is_new_channel ? ' <span class="chip" style="background:var(--warning);color:#000">🆕 new</span>' : '';
 
                 tr.innerHTML = `
                     <td class="score">${(v.quality_score || 0).toFixed(2)}</td>
-                    <td><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a></td>
+                    <td><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a>${badge}</td>
                     <td class="channel">${v.channel_name}</td>
                     <td class="views">${(v.views || 0).toLocaleString()}</td>
                     <td class="channel" style="font-size:0.8rem">${dateCol}</td>
@@ -379,6 +453,65 @@ HTML = """
                 `;
                 tbody.appendChild(tr);
             });
+        }
+
+        function setCandidateSort(mode) {
+            candidateSort = mode;
+            document.getElementById('sort-quality').classList.toggle('active', mode === 'quality');
+            document.getElementById('sort-trending').classList.toggle('active', mode === 'trending');
+            renderTable('candidates', data.candidates);
+        }
+
+        function renderDiscovery() {
+            const d = data.discovery || {};
+            // Emerging videos
+            const tb = document.querySelector('#table-emerging tbody');
+            tb.innerHTML = (d.emerging || []).map(v => `
+                <tr><td class="score">${(v.quality_score||0).toFixed(2)}</td>
+                <td><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a></td>
+                <td class="channel">${v.channel_name}</td>
+                <td class="views">${(v.views_per_day||0).toLocaleString()}/day</td>
+                <td><button class="btn btn-mark" onclick="postAction('/api/request_transcribe','${v.id}')">Transcribe</button></td></tr>
+            `).join('') || '<tr><td colspan="5" style="color:var(--text-dim)">No new-channel videos yet. Run discovery to populate.</td></tr>';
+
+            // Suggested channels
+            const sc = document.getElementById('suggested-channels');
+            sc.innerHTML = (d.suggested_channels || []).map(c => `
+                <div class="intel-card" style="display:flex;justify-content:space-between;align-items:center;padding:14px 20px">
+                    <div><a href="${c.channel_url||'#'}" target="_blank">${c.channel_name}</a>
+                    <span style="color:var(--text-dim);font-size:0.85rem"> — best ${(c.best_score||0).toFixed(2)}, ${c.video_count} videos</span></div>
+                    <button class="btn btn-primary" onclick="promoteChannel('${c.channel_id}')">+ Monitor</button>
+                </div>
+            `).join('') || '<div style="color:var(--text-dim)">No channel suggestions yet — they appear once a new channel lands ≥2 strong videos.</div>';
+
+            // Suggested terms
+            const st = document.getElementById('suggested-terms');
+            st.innerHTML = (d.suggested_terms || []).map(t => `
+                <div class="intel-card" style="display:flex;justify-content:space-between;align-items:center;padding:12px 20px">
+                    <div>“${t.term}”</div>
+                    <div><button class="btn btn-mark" onclick="acceptTerm('${t.term.replace(/'/g,"\\'")}')">Accept</button>
+                    &nbsp;<button class="btn btn-unreq" onclick="rejectTerm('${t.term.replace(/'/g,"\\'")}')">Dismiss</button></div>
+                </div>
+            `).join('') || '<div style="color:var(--text-dim)">No pending terms. Click “Generate from top content”.</div>';
+        }
+
+        async function promoteChannel(cid) {
+            await fetch('/api/promote_channel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel_id: cid})});
+            fetchData();
+        }
+        async function acceptTerm(term) {
+            await fetch('/api/accept_term', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({term})});
+            fetchData();
+        }
+        async function rejectTerm(term) {
+            await fetch('/api/reject_term', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({term})});
+            fetchData();
+        }
+        async function suggestTerms() {
+            const s = document.getElementById('terms-status');
+            s.innerText = 'Generating…';
+            await fetch('/api/suggest_terms', {method:'POST'});
+            setTimeout(() => { fetchData(); s.innerText = 'Done — review below.'; }, 4000);
         }
 
         function renderStats() {
@@ -605,6 +738,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json({"error": "no transcript", "full_text": None})
         elif p == "/api/intelligence":
             self.json(self.get_intelligence())
+        elif p == "/api/discovery":
+            self.json(self.get_discovery())
         elif p == "/api/digest":
             md = ""
             if os.path.isfile(DIGEST_LATEST):
@@ -635,6 +770,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             subprocess.Popen([sys.executable, DIGEST_SCRIPT, "--days=7"],
                              stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
             self.json({"started": True, "message": "Generating digest…"})
+            return
+        if self.path == "/api/suggest_terms":
+            logfile = self._job_log("suggest_terms")
+            subprocess.Popen([sys.executable, SCRAPER_SCRIPT, "--suggest-terms"],
+                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            self.json({"started": True, "message": "Generating term suggestions…"})
+            return
+        if self.path == "/api/promote_channel":
+            cid = body.get("channel_id")
+            if not cid:
+                self.send_error(400, "Missing channel_id")
+                return
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("UPDATE channels SET curated = 1, suggested = 0 WHERE channel_id = ?", (cid,))
+            conn.commit(); conn.close()
+            self.json({"ok": True})
+            return
+        if self.path in ("/api/accept_term", "/api/reject_term"):
+            term = body.get("term")
+            if not term:
+                self.send_error(400, "Missing term")
+                return
+            status = "accepted" if self.path.endswith("accept_term") else "rejected"
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("UPDATE suggested_terms SET status = ? WHERE term = ?", (status, term))
+            conn.commit(); conn.close()
+            self.json({"ok": True})
             return
 
         video_id = body.get("id")
@@ -710,6 +872,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
         self.json({"started": True, "queued": n,
                    "message": f"Processing {n} {noun} in the background."})
+
+    def get_discovery(self):
+        """Emerging signal: new-channel videos, channels worth monitoring, and
+        LLM-suggested search terms awaiting review."""
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        emerging = [dict(r) for r in conn.execute("""
+            SELECT id, video_title, channel_name, views, quality_score,
+                   views_per_day, transcript_status
+            FROM videos WHERE is_new_channel = 1
+            ORDER BY quality_score DESC LIMIT 50
+        """).fetchall()]
+        channels = [dict(r) for r in conn.execute("""
+            SELECT channel_id, channel_name, channel_url, video_count, best_score
+            FROM channels WHERE suggested = 1 AND curated = 0
+            ORDER BY best_score DESC LIMIT 50
+        """).fetchall()]
+        terms = [dict(r) for r in conn.execute("""
+            SELECT term, source, created_at FROM suggested_terms
+            WHERE status = 'pending' ORDER BY created_at DESC LIMIT 50
+        """).fetchall()]
+        conn.close()
+        return {"emerging": emerging, "suggested_channels": channels, "suggested_terms": terms}
 
     def get_intelligence(self):
         conn = sqlite3.connect(DB_PATH)

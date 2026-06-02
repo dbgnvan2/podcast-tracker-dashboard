@@ -168,3 +168,19 @@ The full intelligence pipeline is now built and tested:
 **Remaining (minor):** drop the dead `transcribed`/`transcribe_requested` columns (needs a table rebuild; left for safety).
 
 **Live blocker (transient):** YouTube returned an **IP-wide 429 cooldown** on the caption endpoint after heavy testing — captions are confirmed present (`en-orig, en` listed) but can't download until the cooldown lifts. `overnight_pipeline.py` is running to drain the queue once it clears. Current statuses: 14 `not_requested`, 7 `error` (Brand Entity SEO series + 2, all retryable).
+
+---
+
+## 11. v1.2 status — reliable discovery (shipped 2026-06-02)
+
+Fixes "we only find strangers / Neil Patel never appears" **and** "channel monitoring alone misses emerging creators." Discovery is now a two-arm system with a feedback loop:
+
+- **Channel monitoring** (`fetch_channel_videos` + `CURATED_CHANNELS`) — pulls authority uploads directly (Neil Patel, Ahrefs, Surfer, HubSpot, Google Search Central, Semrush, SEJ, Search Engine Land, Eric Siu). Curated videos bypass view/age gates. All 9 handles verified.
+- **Keyword search** kept as the net for unknowns; queries de-"podcast"ed and re-pointed at AI-GEO/traffic terms.
+- **Emerging detection** — `videos.is_new_channel` flags videos from never-before-seen channels (`channel_id`).
+- **Velocity** — `views_per_day` adds a 0.10 term to `quality_score` (verified monotonic) and powers a Candidates "🔥 Trending" sort.
+- **Auto-promotion** — `channels` registry + `sync_channels()` flag non-curated channels with ≥2 videos ≥0.6 as `suggested`; monitored channels auto-mark `curated`.
+- **Query freshening** — `--suggest-terms` LLM-mines top titles for new queries → `suggested_terms` (pending → accept/reject); accepted terms join the next scrape.
+- **Dashboard "Discovery" tab** — emerging videos, suggested channels (+ Monitor button), suggested terms (Accept/Dismiss + Generate). Endpoints: `/api/discovery`, `/api/promote_channel`, `/api/accept_term`, `/api/reject_term`, `/api/suggest_terms`.
+- **Schema** — new `channels` + `suggested_terms` tables; new `videos` columns (`channel_id`, `is_new_channel`, `discovered_via`, `views_per_day`). All additive in `migrate()` and in the scraper's `init_db()`.
+- **Tests** — 9 total (added velocity monotonicity, suggested/auto-curate, days_since). All pass.

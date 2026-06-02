@@ -117,7 +117,11 @@ def init_db():
             transcript_keywords_score REAL,
             quality_score REAL,
             selected INTEGER DEFAULT 0,
-            transcript_summary TEXT
+            transcript_summary TEXT,
+            channel_id TEXT,
+            is_new_channel INTEGER DEFAULT 0,
+            discovered_via TEXT DEFAULT 'search',
+            views_per_day REAL DEFAULT 0
         )
     """)
     conn.execute("""
@@ -127,6 +131,28 @@ def init_db():
             videos_found INTEGER,
             videos_new INTEGER,
             errors TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id TEXT PRIMARY KEY,
+            channel_name TEXT,
+            handle TEXT,
+            channel_url TEXT,
+            first_seen_date TEXT,
+            last_seen_date TEXT,
+            video_count INTEGER DEFAULT 0,
+            best_score REAL DEFAULT 0,
+            curated INTEGER DEFAULT 0,
+            suggested INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS suggested_terms (
+            term TEXT PRIMARY KEY,
+            source TEXT,
+            created_at TEXT,
+            status TEXT DEFAULT 'pending'
         )
     """)
     conn.commit()
@@ -156,16 +182,23 @@ def search_youtube(query, max_results=20):
     return videos
 
 
-def fetch_channel_videos(handle, max_results=10):
+def fetch_channel_videos(identifier, max_results=10):
     """Pull a channel's most recent uploads directly (flat playlist).
+    `identifier` is a handle (e.g. 'neilpatel') or a full channel URL.
     Returns video dicts tagged with `_curated=True` so downstream logic can
     trust them (bypass view/age gates). Fault-tolerant: returns [] on failure."""
+    if identifier.startswith("http"):
+        url = identifier.rstrip("/")
+        if not url.endswith("/videos"):
+            url += "/videos"
+    else:
+        url = f"https://www.youtube.com/@{identifier}/videos"
     cmd = [
         YT_DLP, "--flat-playlist", "--dump-json",
         "--playlist-end", str(max_results),
         "--extractor-args", "youtube:player_client=android",
         "--impersonate", "chrome", "--no-warnings",
-        f"https://www.youtube.com/@{handle}/videos",
+        url,
     ]
     videos = []
     try:
@@ -258,8 +291,10 @@ def calculate_keyword_density(transcript_text, video_title, channel_name=""):
     return round(normalized, 3)
 
 
-def calculate_quality_score(views, likes, comments, duration, kw_score, channel_id, channel_name):
-    """Composite quality score."""
+def calculate_quality_score(views, likes, comments, duration, kw_score, channel_id, channel_name, views_per_day=0):
+    """Composite quality score. `views_per_day` adds a velocity signal so that
+    a video doing 14k views in 3 days outranks 14k accumulated over months —
+    the key signal for catching breakout/emerging content early."""
     if views <= 0:
         return 0.0
 
@@ -293,12 +328,16 @@ def calculate_quality_score(views, likes, comments, duration, kw_score, channel_
             ch_bonus = bonus
             break
 
+    # velocity: views/day since publish, saturating at ~3000/day
+    velocity_score = min((views_per_day or 0) / 3000.0, 1.0)
+
     score = (
-        views_score * 0.35 +
-        likes_score * 0.20 +
+        views_score * 0.30 +
+        likes_score * 0.15 +
         comments_score * 0.10 +
         duration_score * 0.10 +
-        kw_score * 0.25
+        kw_score * 0.25 +
+        velocity_score * 0.10
     ) * ch_bonus
 
     return round(score, 3)
@@ -319,6 +358,121 @@ def parse_ymd_via_ytdlp(date_str):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+def days_since(date_str):
+    """Whole days from a YYYY-MM-DD date to now (>=1 to avoid div-by-zero)."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return max((datetime.now(timezone.utc) - d).days, 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def get_db_curated_channels(conn):
+    """Channels the user promoted in the dashboard (curated=1). Returns a list of
+    (identifier, name) where identifier is a handle or channel URL."""
+    out = []
+    try:
+        for r in conn.execute(
+            "SELECT channel_name, handle, channel_url FROM channels WHERE curated=1"
+        ).fetchall():
+            ident = r[1] or r[2]  # handle preferred, else URL
+            if ident:
+                out.append((ident, r[0] or ident))
+    except sqlite3.OperationalError:
+        pass  # table not migrated yet
+    return out
+
+
+def sync_channels(conn):
+    """Recompute the channels registry from the videos table and flag emerging
+    channels worth promoting. A non-curated channel with >=2 videos and a best
+    score >=0.6 becomes 'suggested'."""
+    cur = conn.cursor()
+    rows = cur.execute("""
+        SELECT channel_id, MAX(channel_name), MAX(channel_url), COUNT(*),
+               MAX(quality_score), MIN(first_seen_date), MAX(last_updated_date)
+        FROM videos
+        WHERE channel_id IS NOT NULL AND channel_id != ''
+        GROUP BY channel_id
+    """).fetchall()
+    for cid, name, url, cnt, best, first, last in rows:
+        cur.execute("""
+            INSERT INTO channels (channel_id, channel_name, channel_url,
+                                  first_seen_date, last_seen_date, video_count, best_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                channel_name = excluded.channel_name,
+                channel_url  = excluded.channel_url,
+                last_seen_date = excluded.last_seen_date,
+                video_count  = excluded.video_count,
+                best_score   = MAX(channels.best_score, excluded.best_score)
+        """, (cid, name, url, first, last, cnt, best or 0))
+    # Any channel we actively monitor (a video came in via channel-discovery) is
+    # curated by definition — so it never shows up as a "suggestion".
+    cur.execute("""
+        UPDATE channels SET curated = 1 WHERE channel_id IN (
+            SELECT DISTINCT channel_id FROM videos
+            WHERE discovered_via = 'channel' AND channel_id IS NOT NULL AND channel_id != ''
+        )
+    """)
+    cur.execute("""
+        UPDATE channels SET suggested = 1
+        WHERE curated = 0 AND suggested = 0 AND video_count >= 2 AND best_score >= 0.6
+    """)
+    conn.commit()
+
+
+def suggest_search_terms(conn, limit=40):
+    """Query-freshening: ask an LLM to mine recent high-scoring titles for new
+    search terms/jargon, store them as 'pending' for the user to approve.
+    Returns the list of newly proposed terms. Best-effort; needs an LLM key."""
+    try:
+        import analyze_transcripts as A
+    except ImportError:
+        return []
+    key, base, model = A.llm_config()
+    if not key:
+        print("  No LLM key — skipping term suggestions.")
+        return []
+
+    titles = [r[0] for r in conn.execute(
+        "SELECT video_title FROM videos ORDER BY quality_score DESC LIMIT ?", (limit,)
+    ).fetchall()]
+    if not titles:
+        return []
+
+    existing = set(q.lower() for q in SEARCH_QUERIES)
+    prompt = (
+        "These are titles of the best-performing SEO / AI / GEO videos we've found:\n\n"
+        + "\n".join(f"- {t}" for t in titles)
+        + "\n\nPropose 6-10 NEW YouTube search queries (3-6 words each) that would surface "
+        "more high-quality content on SEO, AI search/GEO, answer-engine optimization, and "
+        "driving website/video traffic. Favor emerging terminology. Avoid the word 'podcast'. "
+        'Return ONLY JSON: {"terms": ["...", "..."]}'
+    )
+    try:
+        result = A.call_llm(prompt, key, base, model)
+        terms = result.get("terms", []) or []
+    except Exception as e:
+        print(f"  Term suggestion failed: {e}")
+        return []
+
+    added = []
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for t in terms:
+        t = str(t).strip()
+        if t and t.lower() not in existing:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO suggested_terms (term, source, created_at, status) "
+                    "VALUES (?, 'llm', ?, 'pending')", (t, now))
+                added.append(t)
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
+    return added
+
+
 def main():
     conn = init_db()
     cursor = conn.cursor()
@@ -332,7 +486,13 @@ def main():
     print()
 
     # ── Step 1: Search ──────────────────────────────────────────────────
-    for query in SEARCH_QUERIES:
+    # Base queries + any LLM-suggested terms the user accepted in the dashboard.
+    accepted_terms = [r[0] for r in cursor.execute(
+        "SELECT term FROM suggested_terms WHERE status = 'accepted'").fetchall()]
+    queries = SEARCH_QUERIES + accepted_terms
+    if accepted_terms:
+        print(f"(+{len(accepted_terms)} accepted search terms)")
+    for query in queries:
         print(f"Searching: {query}")
         try:
             results = search_youtube(query, MAX_VIDEOS_PER_QUERY)
@@ -348,9 +508,11 @@ def main():
         time.sleep(1)  # be polite
 
     # ── Step 1b: Monitor curated authority channels directly ────────────
+    # Defaults (code) + any channels the user promoted in the dashboard (DB).
     print()
-    for handle, name in CURATED_CHANNELS.items():
-        print(f"Channel: {name} (@{handle})")
+    curated_targets = list(CURATED_CHANNELS.items()) + get_db_curated_channels(conn)
+    for handle, name in curated_targets:
+        print(f"Channel: {name} ({handle})")
         try:
             results = fetch_channel_videos(handle, MAX_VIDEOS_PER_CHANNEL)
             added = 0
@@ -419,6 +581,8 @@ def main():
             "views": views,
             "likes": likes,
             "comments": comments,
+            "views_per_day": round(views / days_since(upload_date), 1),
+            "discovered_via": "channel" if curated else "search",
         })
 
         time.sleep(0.3)
@@ -443,7 +607,7 @@ def main():
         v["quality_score"] = calculate_quality_score(
             v["views"], v["likes"], v["comments"],
             v["duration"], v["kw_score"],
-            v["channel_id"], v["channel_name"]
+            v["channel_id"], v["channel_name"], v["views_per_day"]
         )
 
     # ── Step 4: Sort by quality score ───────────────────────────────────
@@ -451,25 +615,39 @@ def main():
     top_n = enriched[:MAX_RESULTS_TO_RETURN]
 
     # ── Step 5: Update DB ────────────────────────────────────────────────
+    # Channels seen before THIS run (for emerging detection). Empty on first run.
+    known_channels = {r[0] for r in cursor.execute(
+        "SELECT channel_id FROM channels WHERE channel_id IS NOT NULL AND channel_id != ''"
+    ).fetchall()}
+
     new_count = 0
     for v in enriched:
         cursor.execute("SELECT id FROM videos WHERE id = ?", (v["id"],))
         existing = cursor.fetchone()
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+        # Emerging = search-discovered channel we haven't catalogued before.
+        is_new_channel = 1 if (
+            v.get("discovered_via") != "channel"
+            and v.get("channel_id")
+            and v["channel_id"] not in known_channels
+        ) else 0
+
         if existing:
-            # Update with new view counts
+            # Update with new view counts + velocity + channel metadata
             cursor.execute("""
                 UPDATE videos SET
                     views = ?, likes = ?, comments = ?,
                     prev_views = views,
                     view_change = ? - views,
                     last_updated_date = ?,
-                    quality_score = ?
+                    quality_score = ?,
+                    channel_id = ?, views_per_day = ?, discovered_via = ?
                 WHERE id = ?
             """, (
                 v["views"], v["likes"], v["comments"],
                 v["views"], now, v["quality_score"],
+                v["channel_id"], v["views_per_day"], v.get("discovered_via", "search"),
                 v["id"],
             ))
         else:
@@ -481,8 +659,9 @@ def main():
                     first_seen_date, last_updated_date,
                     prev_views, view_change, view_change_pct,
                     transcript_keywords_score, quality_score,
-                    transcript_summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript_summary,
+                    channel_id, is_new_channel, discovered_via, views_per_day
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 v["id"], v["channel_name"], v["channel_url"], v["title"], v["url"],
                 v["publish_date"], v["duration"], v["views"], v["likes"], v["comments"],
@@ -490,6 +669,7 @@ def main():
                 0, 0, 0.0,
                 v["kw_score"], v["quality_score"],
                 v.get("transcript_preview", ""),
+                v["channel_id"], is_new_channel, v.get("discovered_via", "search"), v["views_per_day"],
             ))
 
     # Calculate view change % for existing videos
@@ -508,6 +688,14 @@ def main():
         (run_date, len(enriched), new_count, "; ".join(errors[:5]) if errors else "")
     )
     conn.commit()
+
+    # ── Step 5b: Refresh channel registry + flag emerging channels ──────
+    sync_channels(conn)
+    emerging = conn.execute(
+        "SELECT COUNT(*) FROM videos WHERE is_new_channel = 1").fetchone()[0]
+    suggestions = conn.execute(
+        "SELECT channel_name, best_score, video_count FROM channels "
+        "WHERE suggested = 1 AND curated = 0 ORDER BY best_score DESC").fetchall()
     conn.close()
 
     # ── Step 6: Print report ────────────────────────────────────────────
@@ -526,8 +714,20 @@ def main():
         print(f"    {v['url']}")
         print()
 
+    print(f"\nEmerging videos (new channels) this run: {emerging}")
+    if suggestions:
+        print("Suggested channels to monitor (review in dashboard → Discovery):")
+        for name, best, cnt in suggestions:
+            print(f"  • {name} — best score {best:.2f}, {cnt} videos")
+
     print(f"--- Run complete ---")
 
 
 if __name__ == "__main__":
-    main()
+    if "--suggest-terms" in sys.argv:
+        c = init_db()
+        added = suggest_search_terms(c)
+        c.close()
+        print(f"Suggested {len(added)} new search term(s): {added}")
+    else:
+        main()

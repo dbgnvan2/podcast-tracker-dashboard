@@ -17,6 +17,7 @@ import fetch_transcripts
 import analyze_transcripts
 import generate_digest
 import dashboard_server
+import podcast_scraper
 
 
 SCHEMA = """
@@ -152,6 +153,51 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(real, "obtained")    # kept
         self.assertFalse(Path(self.tmp, "stub.txt").exists())
         self.assertTrue(Path(self.tmp, "real.txt").exists())
+
+
+class TestEmergingDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "t.db")
+        podcast_scraper.DB_PATH = self.db
+        self.conn = podcast_scraper.init_db()
+
+    def _add(self, vid, cid, name, score, via):
+        self.conn.execute("""INSERT INTO videos
+            (id,channel_name,channel_url,video_title,url,publish_date,duration_seconds,
+             views,likes,comments,first_seen_date,last_updated_date,prev_views,view_change,
+             view_change_pct,transcript_keywords_score,quality_score,transcript_summary,
+             channel_id,is_new_channel,discovered_via,views_per_day)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (vid,name,f"http://yt/{cid}",f"t{vid}","u","2026-05-01",600,5000,100,10,
+             "2026-05-02","2026-05-02",0,0,0,0.0,score,"",cid,
+             1 if via=="search" else 0, via, 1000))
+        self.conn.commit()
+
+    def test_velocity_monotonic(self):
+        hi = podcast_scraper.calculate_quality_score(5000,100,10,1800,0.5,"x","Unknown",views_per_day=5000)
+        lo = podcast_scraper.calculate_quality_score(5000,100,10,1800,0.5,"x","Unknown",views_per_day=10)
+        self.assertGreater(hi, lo)
+
+    def test_suggested_and_autocurate(self):
+        self._add("a1","UCnew","Newbie","0.65","search")
+        self._add("a2","UCnew","Newbie","0.62","search")   # 2 strong -> suggested
+        self._add("b1","UCmon","Monitored","0.70","channel")  # monitored -> auto-curated
+        self._add("c1","UClow","Tiny","0.30","search")     # below threshold
+        podcast_scraper.sync_channels(self.conn)
+        rows = {r[0]: (r[1], r[2]) for r in self.conn.execute(
+            "SELECT channel_name, curated, suggested FROM channels")}
+        self.assertEqual(rows["Newbie"], (0, 1))     # suggested, not curated
+        self.assertEqual(rows["Monitored"][0], 1)    # auto-curated (monitored)
+        self.assertEqual(rows["Monitored"][1], 0)    # not suggested
+        self.assertEqual(rows["Tiny"], (0, 0))       # neither
+
+    def test_days_since(self):
+        self.assertGreaterEqual(podcast_scraper.days_since("2026-05-01"), 1)
+        self.assertEqual(podcast_scraper.days_since(None), 1)  # safe default
+
+    def tearDown(self):
+        self.conn.close()
 
 
 if __name__ == "__main__":
