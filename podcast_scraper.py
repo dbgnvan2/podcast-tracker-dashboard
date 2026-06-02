@@ -36,21 +36,43 @@ if not YT_DLP:
         print("ERROR: yt-dlp not found")
         sys.exit(1)
 
+# Content-focused queries reflecting the real goal: getting people to a site /
+# video / podcast via SEO + AI GEO. NOTE: do NOT hard-code "podcast" — it filters
+# out the best educational creators (e.g. Neil Patel) and pulls in off-topic
+# literal podcasts. Channel monitoring (below) is the reliable path for authorities.
 SEARCH_QUERIES = [
-    "SEO AI GEO podcast 2026",
-    "generative engine optimization SEO podcast",
-    "AI overviews SEO strategy podcast",
-    "GEO search engine optimization podcast",
-    "Google AI mode SEO podcast",
-    "brand entity SEO podcast",
-    "SEO news 2026 podcast",
+    "how to rank in AI Overviews 2026",
+    "get recommended by ChatGPT SEO",
+    "generative engine optimization GEO 2026",
+    "answer engine optimization AEO",
+    "Google AI Mode SEO strategy 2026",
+    "brand entity SEO knowledge graph",
+    "how to get cited by AI search",
+    "SEO to drive website traffic 2026",
+    "AI search visibility for brands",
 ]
 
+# Authority channels to monitor directly (handle -> display name). Their recent
+# uploads are pulled regardless of keyword match, and bypass the view/age gates.
+# This is what guarantees creators like Neil Patel are captured.
+CURATED_CHANNELS = {
+    "neilpatel": "Neil Patel",
+    "AhrefsCom": "Ahrefs",
+    "surferseo": "Surfer SEO",
+    "HubSpotMarketing": "HubSpot Marketing",
+    "GoogleSearchCentral": "Google Search Central",
+    "Semrush": "Semrush",
+    "searchenginejournal": "Search Engine Journal",
+    "searchengineland": "Search Engine Land",
+    "LevelingUpOfficial": "Leveling Up with Eric Siu",
+}
+
 MAX_VIDEOS_PER_QUERY = 20
+MAX_VIDEOS_PER_CHANNEL = 10
 MIN_VIEWS = 2000
-MIN_DURATION_SEC = 480  # 8 minutes
+MIN_DURATION_SEC = 300   # 5 minutes (concise SEO/GEO tips count too)
 MAX_DURATION_SEC = 5400  # 90 minutes
-MIN_DAYS_OLD = 7  # let views accumulate
+MIN_DAYS_OLD = 7  # let views accumulate (skipped for curated channels)
 MAX_RESULTS_TO_RETURN = 20
 
 # ── Known high-quality channels (bonus) ────────────────────────────────────
@@ -134,6 +156,35 @@ def search_youtube(query, max_results=20):
     return videos
 
 
+def fetch_channel_videos(handle, max_results=10):
+    """Pull a channel's most recent uploads directly (flat playlist).
+    Returns video dicts tagged with `_curated=True` so downstream logic can
+    trust them (bypass view/age gates). Fault-tolerant: returns [] on failure."""
+    cmd = [
+        YT_DLP, "--flat-playlist", "--dump-json",
+        "--playlist-end", str(max_results),
+        "--extractor-args", "youtube:player_client=android",
+        "--impersonate", "chrome", "--no-warnings",
+        f"https://www.youtube.com/@{handle}/videos",
+    ]
+    videos = []
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            data["_curated"] = True
+            videos.append(data)
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return videos
+
+
 def get_video_details(video_id):
     """Fetch full metadata for a single video."""
     cmd = [
@@ -182,13 +233,15 @@ def calculate_keyword_density(transcript_text, video_title, channel_name=""):
         "generative engine optimization", "GEO", "AI overviews",
         "AI mode", "search generative experience", "SGE",
         "brand entity", "entity SEO", "knowledge graph",
-        "AI search", "ChatGPT search", "Perplexity",
+        "AI search", "AI SEO", "ChatGPT search", "Perplexity", "Google AI",
         "large language model", "LLM", "RAG",
         "zero-click", "zero click search",
-        "answer engine", "featured snippet",
-        "ETB", "E-E-A-T", "EEAT",
-        "AI-generated content", "AIO", "AI optimization",
-        "podcast", "interview",
+        "answer engine", "answer engine optimization", "AEO",
+        "featured snippet", "get cited", "cited by AI", "AI citations",
+        "E-E-A-T", "EEAT", "topical authority",
+        "AI-generated content", "AIO", "AI optimization", "AI visibility",
+        "organic traffic", "website traffic", "drive traffic",
+        "rank on Google", "search rankings", "llms.txt",
     ]
     search_text = (transcript_text + " " + video_title + " " + channel_name).lower()
     words = len(search_text.split())
@@ -294,6 +347,27 @@ def main():
             errors.append(msg)
         time.sleep(1)  # be polite
 
+    # ── Step 1b: Monitor curated authority channels directly ────────────
+    print()
+    for handle, name in CURATED_CHANNELS.items():
+        print(f"Channel: {name} (@{handle})")
+        try:
+            results = fetch_channel_videos(handle, MAX_VIDEOS_PER_CHANNEL)
+            added = 0
+            for v in results:
+                vid = v.get("id")
+                if vid and vid not in all_videos:
+                    all_videos[vid] = v
+                    added += 1
+                elif vid:
+                    all_videos[vid]["_curated"] = True  # mark even if also found via search
+            print(f"  Found {len(results)} uploads (+{added} new, total unique: {len(all_videos)})")
+        except Exception as e:
+            msg = f"Channel fetch failed for @{handle}: {e}"
+            print(f"  ERROR: {msg}")
+            errors.append(msg)
+        time.sleep(1)
+
     print(f"\nTotal unique videos found: {len(all_videos)}")
 
     # ── Step 2: Get full details for each ───────────────────────────────
@@ -322,14 +396,15 @@ def main():
         channel_id = details.get("channel_id", "")
         title = details.get("title", v.get("title", "Untitled"))
         channel_url = details.get("channel_url", "")
+        curated = bool(v.get("_curated"))
 
-        if views < MIN_VIEWS:
+        # Curated authority channels are trusted: they bypass the view-count and
+        # recency gates (we want their content even if fresh / still accruing views).
+        if not curated and views < MIN_VIEWS:
             continue
         if duration < MIN_DURATION_SEC or duration > MAX_DURATION_SEC:
             continue
-
-        # Only enrich videos old enough to have accumulated views
-        if upload_date > cutoff_date:
+        if not curated and upload_date > cutoff_date:
             continue
 
         enriched.append({
@@ -348,7 +423,8 @@ def main():
 
         time.sleep(0.3)
 
-    print(f"After filtering (views>={MIN_VIEWS}, duration 8-90min, 7+ days old): {len(enriched)}")
+    print(f"After filtering (curated bypass view/age; others views>={MIN_VIEWS}, "
+          f"{MIN_DURATION_SEC//60}-{MAX_DURATION_SEC//60}min, {MIN_DAYS_OLD}+ days old): {len(enriched)}")
 
     # ── Step 3: Fetch transcripts & score (best-effort, skip if slow) ──
     for v in enriched:
