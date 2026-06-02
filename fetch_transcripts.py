@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
+"""Transcription engine — drains the 'requested' queue into verified transcripts.
+
+Data-first: a video only becomes 'obtained' when a real caption file is fetched
+and saved. Captions are obtained programmatically via yt-dlp only — never from a
+browser snapshot or a model's recollection (see CLAUDE.md Working Rule 0).
+
+For each video it saves:
+  ~/.hermes/transcripts/{id}.txt            clean full text
+  ~/.hermes/transcripts/{id}.segments.json  [{start, text}] for timestamped analysis
+"""
 import os
+import re
 import json
+import time
 import sqlite3
 import subprocess
 from pathlib import Path
 from datetime import datetime
 
-# Config
 DB_PATH = Path.home() / ".hermes" / "podcast_tracker.db"
 TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Find yt-dlp (using your existing logic)
+# yt-dlp: prefer a modern brew/standalone build; fall back to PATH.
 YT_DLP = None
 for p in [
     "/opt/homebrew/bin/yt-dlp",
@@ -25,20 +36,97 @@ if not YT_DLP:
     res = subprocess.run(["which", "yt-dlp"], capture_output=True, text=True)
     YT_DLP = res.stdout.strip()
 
-def clean_vtt(vtt_path):
-    """Simple parser to turn VTT into clean text."""
-    lines = []
+# YouTube now gates auto-captions behind PO tokens for some clients and
+# rate-limits the timedtext endpoint. The android client exposes the captions;
+# browser impersonation (curl_cffi) reduces 429s. These are tried in order.
+# android exposes the captions; web is a fallback. Keep per-video backoff short —
+# an outer overnight loop handles the long IP-wide 429 cooldown.
+PLAYER_CLIENTS = ["android", "web"]
+MAX_429_RETRIES = 2
+BACKOFF_BASE_SEC = 30  # 30, 60
+
+# Markers meaning "captions exist but were blocked" -> retryable 'error',
+# as opposed to "genuinely no captions" -> 'not_available'.
+BLOCKED_MARKERS = (
+    "429", "too many requests", "po token", "sabr",
+    "missing subtitles languages", "sign in to confirm", "rate",
+)
+
+
+def _ts_to_sec(ts):
+    """'00:01:23.456' -> 83 (int seconds)."""
+    h, m, s = ts.split(":")
+    return int(float(h) * 3600 + float(m) * 60 + float(s))
+
+
+def parse_vtt(vtt_path):
+    """Return (clean_text, segments) where segments=[{'start':int,'text':str}]."""
     if not os.path.exists(vtt_path):
-        return ""
-    with open(vtt_path, 'r') as f:
-        for line in f:
-            if '-->' in line or line.startswith('WEBVTT') or not line.strip():
+        return "", []
+    segments = []
+    cur_start = None
+    cur_lines = []
+    tag_re = re.compile(r"<[^>]+>")
+    with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if "-->" in line:
+                # flush previous cue
+                if cur_start is not None and cur_lines:
+                    segments.append((cur_start, " ".join(cur_lines)))
+                cur_start = _ts_to_sec(line.split("-->")[0].strip().split(" ")[0])
+                cur_lines = []
+            elif not line.strip() or line.startswith("WEBVTT") or line.startswith(("Kind:", "Language:", "NOTE")):
                 continue
-            # Remove simple HTML tags and duplicates
-            clean = line.strip()
-            if clean and (not lines or lines[-1] != clean):
-                lines.append(clean)
-    return " ".join(lines)
+            else:
+                txt = tag_re.sub("", line).strip()
+                if txt:
+                    cur_lines.append(txt)
+    if cur_start is not None and cur_lines:
+        segments.append((cur_start, " ".join(cur_lines)))
+
+    # De-duplicate consecutive identical lines (YouTube rolling captions repeat).
+    deduped = []
+    seen_text = []
+    for start, text in segments:
+        if not seen_text or seen_text[-1] != text:
+            deduped.append({"start": start, "text": text})
+            seen_text.append(text)
+    clean_text = " ".join(s["text"] for s in deduped)
+    return clean_text, deduped
+
+
+def _run_ytdlp(vid, url):
+    """Try player clients; return (returncode, combined_output). Retries on 429."""
+    last_output = ""
+    for client in PLAYER_CLIENTS:
+        for attempt in range(MAX_429_RETRIES):
+            cmd = [
+                YT_DLP, "--skip-download", "--write-auto-subs", "--write-subs",
+                "--sub-langs", "en.*", "--sub-format", "vtt",
+                "--extractor-args", f"youtube:player_client={client}",
+                "--impersonate", "chrome", "--no-warnings",
+                "--sleep-requests", "2",
+                "--output", str(TRANSCRIPTS_DIR / vid), url,
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                last_output = "timeout"
+                continue
+            out = (proc.stdout or "") + (proc.stderr or "")
+            last_output = out
+            files = list(TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"))
+            if files:
+                return 0, out
+            if "429" in out or "too many requests" in out.lower():
+                wait = BACKOFF_BASE_SEC * (2 ** attempt)
+                print(f"    429 on client={client}, backoff {wait}s (attempt {attempt+1})")
+                time.sleep(wait)
+                continue
+            break  # non-429 failure for this client; try next client
+    return 1, last_output
+
 
 def process_queue():
     if not YT_DLP:
@@ -47,93 +135,64 @@ def process_queue():
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    videos = conn.execute("SELECT id, url, video_title FROM videos WHERE transcript_status = 'requested'").fetchall()
-    
+    videos = conn.execute(
+        "SELECT id, url, video_title FROM videos WHERE transcript_status = 'requested'"
+    ).fetchall()
+
     if not videos:
         print("No videos in requested queue.")
+        conn.close()
         return
 
     print(f"Processing {len(videos)} videos...")
-
     for v in videos:
-        vid = v['id']
-        url = v['url']
+        vid, url = v["id"], v["url"]
         print(f"Fetching: {v['video_title']} ({vid})")
-        
-        # Temp vtt path
-        vtt_out = TRANSCRIPTS_DIR / f"{vid}.en"
-        
-        # yt-dlp command to get auto-subs as vtt
-        cmd = [
-            YT_DLP,
-            "--skip-download",
-            "--write-auto-subs",
-            "--sub-langs", "en.*",
-            "--output", str(TRANSCRIPTS_DIR / vid),
-            url
-        ]
-        
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
-            yt_output = (proc.stdout or "") + (proc.stderr or "")
 
-            # Find the actual file (yt-dlp appends .en.vtt or similar)
-            found_files = list(TRANSCRIPTS_DIR.glob(f"{vid}.*.vtt"))
-            if found_files:
-                vtt_file = found_files[0]
-                text = clean_vtt(vtt_file)
-                
-                if len(text) > 100:
-                    txt_path = TRANSCRIPTS_DIR / f"{vid}.txt"
-                    with open(txt_path, 'w') as f:
-                        f.write(text)
-                    
-                    word_count = len(text.split())
-                    
-                    # Update DB
-                    conn.execute("""
-                        UPDATE videos 
-                        SET transcript_status = 'obtained', 
-                            transcribed_date = ? 
-                        WHERE id = ?
-                    """, (datetime.now().strftime("%Y-%m-%d"), vid))
-                    
-                    # Add to transcripts table
-                    conn.execute("""
-                        INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count)
-                        VALUES (?, ?, ?, ?)
-                    """, (vid, str(txt_path), text, word_count))
-                    
-                    print(f"  Success: {word_count} words.")
-                    # Cleanup VTT
-                    for f in found_files: os.remove(f)
-                else:
-                    print("  Warning: Transcript too short.")
-                    conn.execute("UPDATE videos SET transcript_status = 'not_available' WHERE id = ?", (vid,))
-            else:
-                # Distinguish "captions truly absent" from "captions gated/blocked".
-                # YouTube now gates auto-captions behind a PO token; an outdated
-                # yt-dlp (or SABR streaming) reports them as missing even though
-                # they exist. Treat those as retryable 'error', not 'not_available'.
-                blocked_markers = (
-                    "po token", "sabr", "missing subtitles languages",
-                    "sign in to confirm", "rate", "http error 429",
+        # Clear any stale vtt for this id
+        for stale in TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"):
+            stale.unlink()
+
+        rc, output = _run_ytdlp(vid, url)
+        found = sorted(TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"))
+
+        if found:
+            text, segments = parse_vtt(found[0])
+            if len(text) > 100:
+                txt_path = TRANSCRIPTS_DIR / f"{vid}.txt"
+                txt_path.write_text(text, encoding="utf-8")
+                (TRANSCRIPTS_DIR / f"{vid}.segments.json").write_text(
+                    json.dumps(segments), encoding="utf-8"
                 )
-                lowered = yt_output.lower()
-                if any(m in lowered for m in blocked_markers):
-                    print("  Blocked: captions gated (PO token / SABR / rate limit) -> error (will retry).")
-                    conn.execute("UPDATE videos SET transcript_status = 'error' WHERE id = ?", (vid,))
-                else:
-                    print("  No captions available for this video -> not_available.")
-                    conn.execute("UPDATE videos SET transcript_status = 'not_available' WHERE id = ?", (vid,))
+                conn.execute(
+                    "UPDATE videos SET transcript_status='obtained', transcribed_date=? WHERE id=?",
+                    (datetime.now().strftime("%Y-%m-%d"), vid),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
+                    (vid, str(txt_path), text, len(text.split())),
+                )
+                print(f"  Success: {len(text.split())} words, {len(segments)} segments.")
+                for f in found:
+                    f.unlink()
+            else:
+                print("  Captions too short -> not_available.")
+                conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
+                for f in found:
+                    f.unlink()
+        else:
+            lowered = output.lower()
+            if any(m in lowered for m in BLOCKED_MARKERS):
+                print("  Blocked (PO token / SABR / rate limit) -> error (will retry).")
+                conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
+            else:
+                print("  No captions available -> not_available.")
+                conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
 
-        except Exception as e:
-            print(f"  Failed: {e}")
-            conn.execute("UPDATE videos SET transcript_status = 'error' WHERE id = ?", (vid,))
-        
         conn.commit()
 
     conn.close()
+
 
 if __name__ == "__main__":
     process_queue()

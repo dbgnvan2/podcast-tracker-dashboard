@@ -151,6 +151,20 @@ v1 closes the non-LLM gaps, turning the scripts into one GUI-first app:
 - **Removed** the duplicate `youtube_podcast_scanner.py`. (Gap #6 ✅)
 - **`fetch_transcripts.py` hardened**: distinguishes captions *gated/blocked* (PO token / SABR / rate limit → retryable `error`) from captions *genuinely absent* (`not_available`), so good videos are no longer silently killed.
 
-**Still v1.1+:** the AI "Intelligence" stage (Gap #1, needs an LLM key), the weekly digest (Gap #5), dropping dead columns.
+---
 
-**Live blocker:** transcription can't complete until `yt-dlp` is upgraded (current build is on deprecated Python 3.9 and can't satisfy YouTube's PO-token gate). After `pip install -U yt-dlp`, the queue should drain to real transcripts. Current statuses: 14 `not_requested`, 7 `error` (the Brand Entity SEO series + 2 others, all retryable).
+## 10. v1.1 status (shipped 2026-06-01, overnight)
+
+The full intelligence pipeline is now built and tested:
+
+- **`analyze_transcripts.py`** — AI Intelligence stage. Reads each obtained video's verified transcript + timestamped segments, calls an LLM (OpenAI `gpt-4o-mini` by default, key from `~/.hermes/.env`), and writes `key_points` (with timestamps) + `ai_analysis` (seo_entities, geo_signals, best_quote). Reads only on-disk transcripts (Working Rule 0). (Gap #1 ✅)
+- **`generate_digest.py`** — weekly "best of" markdown from analyzed videos: ranked picks with best quote + timestamped key points (deep-linked to YouTube), plus aggregated trending entities/GEO signals. Writes `~/.hermes/digests/`. (Gap #5 ✅)
+- **Dashboard Intelligence + Digest tabs** — `GET /api/intelligence`, `GET /api/digest`, `POST /api/analyze`, `POST /api/generate_digest`, with "🧠 Analyze Transcripts" and "📰 Generate Weekly Digest" buttons. `migrate()` now creates `ai_analysis`.
+- **`overnight_pipeline.py`** — patient runner that loops fetch → analyze → digest, promoting retryable `error`→`requested` each round and sleeping 20 min to ride out the 429 cooldown.
+- **`run.sh`** — GUI-first launcher (migrate + serve + open browser).
+- **`test_app.py`** — 5 tests (temp DBs, mocked LLM): VTT parse/dedup, downsample, analyze inserts, digest build, reconcile. All pass.
+- **yt-dlp hardened** — brew build 2026.x at `/opt/homebrew/bin/yt-dlp` + `curl_cffi==0.10.0` impersonation; `android` client + 429 backoff; saves `{id}.segments.json` for timestamps.
+
+**Remaining (minor):** drop the dead `transcribed`/`transcribe_requested` columns (needs a table rebuild; left for safety).
+
+**Live blocker (transient):** YouTube returned an **IP-wide 429 cooldown** on the caption endpoint after heavy testing — captions are confirmed present (`en-orig, en` listed) but can't download until the cooldown lifts. `overnight_pipeline.py` is running to drain the queue once it clears. Current statuses: 14 `not_requested`, 7 `error` (Brand Entity SEO series + 2, all retryable).

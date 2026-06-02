@@ -35,14 +35,20 @@ There is **no virtualenv, no `requirements.txt`, no `package.json`**. The only e
 ```
 podcast-tracker-dashboard/
 ├── podcast_scraper.py          # Search YouTube → score → upsert into videos table
-├── youtube_podcast_scanner.py  # ⚠️ BYTE-IDENTICAL DUPLICATE of podcast_scraper.py
-├── fetch_transcripts.py        # Drain 'requested' queue → yt-dlp subs → transcripts table
-└── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + DB migration
+├── fetch_transcripts.py        # Drain 'requested' queue → yt-dlp subs → transcripts (+segments)
+├── analyze_transcripts.py      # AI Intelligence: transcript → key_points + ai_analysis (LLM)
+├── generate_digest.py          # Weekly "best of" markdown digest from analyzed videos
+├── overnight_pipeline.py       # Patient runner: fetch → analyze → digest, loops past 429 cooldown
+├── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + --migrate/--reconcile
+├── run.sh                      # Launch dashboard + open browser (GUI-first entry point)
+└── test_app.py                 # Test suite (temp DBs, mocked LLM) — run: python3 test_app.py
 ```
 
 ### Data locations (outside the repo, NOT committed)
 - `~/.hermes/podcast_tracker.db` — the SQLite database
-- `~/.hermes/transcripts/` — fetched `.txt` transcripts (VTT intermediates are deleted)
+- `~/.hermes/transcripts/` — `{id}.txt` (clean text) + `{id}.segments.json` (timestamped segments for analysis); VTT intermediates are deleted
+- `~/.hermes/digests/` — generated `digest_<date>.md` + `latest.md`
+- `~/.hermes/logs/` — background-job logs (`fetch_transcripts.log`, `analyze_transcripts.log`, etc.)
 
 ---
 
@@ -139,9 +145,18 @@ python3 podcast_scraper.py
 # Fetch transcripts for everything marked 'requested'
 python3 fetch_transcripts.py
 
-# Dashboard (defaults to PORT 9091)
-python3 dashboard_server.py
-# → http://localhost:9091
+# AI-analyze obtained transcripts → key_points + ai_analysis
+python3 analyze_transcripts.py            # add --force to re-analyze, --id=VIDEO for one
+
+# Build the weekly "best of" digest
+python3 generate_digest.py --days=7
+
+# Patient overnight runner: fetch → analyze → digest, looping past 429 cooldown
+python3 overnight_pipeline.py
+
+# Dashboard (GUI-first launcher: migrates, starts server, opens browser)
+./run.sh
+# or: python3 dashboard_server.py   → http://localhost:9091
 ```
 
 Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts probe).
@@ -158,11 +173,18 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | GET | `/api/transcribed` | `obtained` rows joined with `transcripts` + key-point count |
 | GET | `/api/stats` | Totals, per-status counts, top channels |
 | GET | `/api/transcript/{id}` | Verified `full_text` + word count for the Transcribed-tab "View" modal |
+| GET | `/api/intelligence` | Analyzed videos with `seo_entities`, `geo_signals`, `best_quote`, `key_points` |
+| GET | `/api/digest` | Latest digest markdown (`~/.hermes/digests/latest.md`) |
 | POST | `/api/request_transcribe` | `{id}` → set status `requested` |
 | POST | `/api/unrequest` | `{id}` → set status `not_requested` |
-| POST | `/api/process_queue` | Launches `fetch_transcripts.py` as a background subprocess to drain the `requested` queue; returns `{started, queued, message}` |
+| POST | `/api/process_queue` | Background-launch `fetch_transcripts.py` (drain `requested`) |
+| POST | `/api/analyze` | Background-launch `analyze_transcripts.py` (analyze obtained transcripts) |
+| POST | `/api/generate_digest` | Background-launch `generate_digest.py` |
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
 
-### Known environment blocker (transcription)
-`yt-dlp` on this machine is **outdated** (at `~/.hermes/Library/Python/3.9/bin/yt-dlp`, deprecated Python 3.9). YouTube now gates auto-captions behind a **PO token**, so this yt-dlp returns "no captions" even when captions exist. `fetch_transcripts.py` now classifies those gated/blocked responses as retryable `error` (not `not_available`). **To actually produce transcripts, upgrade yt-dlp** (`pip install -U yt-dlp`, ideally on Python 3.10+) and re-run the queue. This is the only thing blocking the end-to-end pipeline.
+### AI Intelligence stage (`analyze_transcripts.py`)
+LLM via OpenAI-compatible chat completions (stdlib `urllib`). Key/model from env or `~/.hermes/.env`: `PODCAST_LLM_KEY` (falls back to `OPENAI_API_KEY`), `PODCAST_LLM_BASE` (default OpenAI), `PODCAST_LLM_MODEL` (default `gpt-4o-mini`). **Reads only the on-disk transcript** (Working Rule 0). Timestamps come from `{id}.segments.json`.
+
+### yt-dlp / transcription notes
+yt-dlp is now the brew build at `/opt/homebrew/bin/yt-dlp` (2026.x) with `curl_cffi==0.10.0` for browser impersonation. YouTube gates captions behind PO tokens and rate-limits the timedtext endpoint (HTTP 429). `fetch_transcripts.py` handles this with the `android` player client, Chrome impersonation, and 429 backoff; truly-absent captions → `not_available`, blocked/gated → retryable `error`. A heavy testing session can trigger an **IP-wide 429 cooldown** (minutes–hours); `overnight_pipeline.py` rides it out by retrying rounds with a 20-min sleep.

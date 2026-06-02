@@ -12,6 +12,9 @@ DB_PATH = os.path.expanduser("~/.hermes/podcast_tracker.db")
 TRANSCRIPTS_DIR = os.path.expanduser("~/.hermes/transcripts")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
+ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
+DIGEST_SCRIPT = os.path.join(SCRIPT_DIR, "generate_digest.py")
+DIGEST_LATEST = os.path.expanduser("~/.hermes/digests/latest.md")
 
 def migrate():
     print(f"Running migration on {DB_PATH}...")
@@ -57,7 +60,18 @@ def migrate():
             FOREIGN KEY(video_id) REFERENCES videos(id)
         )
     """)
-    
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ai_analysis (
+            video_id TEXT PRIMARY KEY,
+            seo_entities TEXT,
+            geo_signals TEXT,
+            best_quote TEXT,
+            analyzed_at TEXT,
+            FOREIGN KEY(video_id) REFERENCES videos(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
     print("Migration complete.")
@@ -186,6 +200,17 @@ HTML = """
         .modal-close { background: none; border: none; color: var(--text-dim); font-size: 1.5rem; cursor: pointer; line-height: 1; }
         .modal-body { padding: 20px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; color: var(--text-main); }
 
+        .intel-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+        .intel-card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+        .intel-meta { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 12px; }
+        .intel-quote { border-left: 3px solid var(--accent); padding: 6px 14px; margin: 10px 0; color: var(--text-main); font-style: italic; }
+        .chip { display: inline-block; background: #2d3748; color: var(--accent-hover); border-radius: 12px; padding: 3px 10px; margin: 3px 4px 3px 0; font-size: 0.78rem; }
+        .chip-geo { color: var(--success); }
+        .kp-list { list-style: none; padding: 0; margin: 10px 0 0; }
+        .kp-list li { padding: 5px 0; border-top: 1px solid var(--border); font-size: 0.9rem; }
+        .kp-time { font-family: monospace; color: var(--accent); margin-right: 8px; }
+        .kp-cat { color: var(--text-dim); font-size: 0.78rem; }
+
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .stat-card { background: var(--card-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border); }
         .stat-label { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 5px; }
@@ -213,6 +238,8 @@ HTML = """
             <button class="tab-btn active" onclick="showTab('candidates', this)">Candidates</button>
             <button class="tab-btn" onclick="showTab('requested', this)">Requested</button>
             <button class="tab-btn" onclick="showTab('transcribed', this)">Transcribed</button>
+            <button class="tab-btn" onclick="showTab('intelligence', this)">Intelligence</button>
+            <button class="tab-btn" onclick="showTab('digest', this)">Digest</button>
             <button class="tab-btn" onclick="showTab('stats', this)">Stats</button>
         </div>
         
@@ -246,6 +273,22 @@ HTML = """
             </table>
         </div>
 
+        <div id="intelligence" class="tab-content">
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
+                <button class="btn btn-primary" onclick="runAnalyze()">🧠 Analyze Transcripts</button>
+                <span id="analyze-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
+            </div>
+            <div id="intel-list"></div>
+        </div>
+
+        <div id="digest" class="tab-content">
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
+                <button class="btn btn-primary" onclick="generateDigest()">📰 Generate Weekly Digest</button>
+                <span id="digest-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
+            </div>
+            <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
+        </div>
+
         <div id="stats" class="tab-content">
             <div class="stats-grid" id="stats-summary"></div>
             <div class="chart-section">
@@ -269,21 +312,23 @@ HTML = """
     </div>
 
     <script>
-        let data = { candidates: [], requested: [], transcribed: [], stats: {} };
+        let data = { candidates: [], requested: [], transcribed: [], stats: {}, intelligence: [] };
 
         async function fetchData() {
             document.getElementById('loading').style.display = 'block';
             try {
-                const [cRes, rRes, tRes, sRes] = await Promise.all([
+                const [cRes, rRes, tRes, sRes, iRes] = await Promise.all([
                     fetch('/api/candidates').then(r => r.json()),
                     fetch('/api/requested').then(r => r.json()),
                     fetch('/api/transcribed').then(r => r.json()),
-                    fetch('/api/stats').then(r => r.json())
+                    fetch('/api/stats').then(r => r.json()),
+                    fetch('/api/intelligence').then(r => r.json())
                 ]);
                 data.candidates = cRes;
                 data.requested = rRes;
                 data.transcribed = tRes;
                 data.stats = sRes;
+                data.intelligence = iRes;
                 renderAll();
             } catch (err) {
                 console.error('Fetch error:', err);
@@ -296,6 +341,7 @@ HTML = """
             renderTable('candidates', data.candidates);
             renderTable('requested', data.requested);
             renderTable('transcribed', data.transcribed);
+            renderIntelligence();
             renderStats();
             document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
         }
@@ -448,6 +494,73 @@ HTML = """
         }
         document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
+        function fmtTime(sec) {
+            sec = parseInt(sec || 0);
+            const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+            const mm = (h ? String(m).padStart(2,'0') : m);
+            return (h ? h+':' : '') + mm + ':' + String(s).padStart(2,'0');
+        }
+
+        function renderIntelligence() {
+            const el = document.getElementById('intel-list');
+            const items = data.intelligence || [];
+            if (!items.length) {
+                el.innerHTML = '<div class="intel-card" style="color:var(--text-dim)">No analyzed videos yet. Transcribe some candidates, then click “Analyze Transcripts”.</div>';
+                return;
+            }
+            el.innerHTML = items.map(v => {
+                const ents = (v.seo_entities||[]).map(e => `<span class="chip">${e}</span>`).join('');
+                const geos = (v.geo_signals||[]).map(g => `<span class="chip chip-geo">${g}</span>`).join('');
+                const kps = (v.key_points||[]).map(k => {
+                    const url = `https://youtube.com/watch?v=${v.id}&t=${parseInt(k.timestamp_sec||0)}s`;
+                    const cat = k.category ? ` <span class="kp-cat">(${k.category})</span>` : '';
+                    return `<li><a class="kp-time" href="${url}" target="_blank">${fmtTime(k.timestamp_sec)}</a>${k.point_text}${cat}</li>`;
+                }).join('');
+                return `<div class="intel-card">
+                    <h3><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a></h3>
+                    <div class="intel-meta">${v.channel_name} · ${(v.views||0).toLocaleString()} views · score ${(v.quality_score||0).toFixed(2)}</div>
+                    ${v.best_quote ? `<div class="intel-quote">“${v.best_quote}”</div>` : ''}
+                    <div>${ents}${geos}</div>
+                    ${kps ? `<ul class="kp-list">${kps}</ul>` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        async function runAnalyze() {
+            const s = document.getElementById('analyze-status');
+            s.innerText = 'Starting…';
+            try {
+                const res = await fetch('/api/analyze', { method: 'POST' });
+                const d = await res.json();
+                s.innerText = d.message || '';
+                if (d.started) {
+                    let t = 0;
+                    const timer = setInterval(() => { fetchData(); if (++t >= 20) clearInterval(timer); }, 5000);
+                }
+            } catch (err) { s.innerText = 'Failed: ' + err; }
+        }
+
+        async function generateDigest() {
+            const s = document.getElementById('digest-status');
+            s.innerText = 'Generating…';
+            try {
+                await fetch('/api/generate_digest', { method: 'POST' });
+                setTimeout(loadDigest, 2500);
+                s.innerText = 'Done.';
+            } catch (err) { s.innerText = 'Failed: ' + err; }
+        }
+
+        async function loadDigest() {
+            try {
+                const res = await fetch('/api/digest');
+                const d = await res.json();
+                document.getElementById('digest-content').innerText = d.markdown || 'No digest yet. Click “Generate Weekly Digest”.';
+            } catch (err) {
+                document.getElementById('digest-content').innerText = 'Error loading digest: ' + err;
+            }
+        }
+        loadDigest();
+
         fetchData();
     </script>
 </body>
@@ -490,6 +603,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(rows[0])
             else:
                 self.json({"error": "no transcript", "full_text": None})
+        elif p == "/api/intelligence":
+            self.json(self.get_intelligence())
+        elif p == "/api/digest":
+            md = ""
+            if os.path.isfile(DIGEST_LATEST):
+                with open(DIGEST_LATEST, encoding="utf-8") as fh:
+                    md = fh.read()
+            self.json({"markdown": md})
         else:
             self.send_error(404)
 
@@ -497,9 +618,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
 
-        # Queue processing takes no id — launch the fetcher in the background.
+        # These take no id — launch a background script.
         if self.path == "/api/process_queue":
-            self.process_queue()
+            self.spawn_job(FETCH_SCRIPT,
+                           "SELECT COUNT(*) AS n FROM videos WHERE transcript_status='requested'",
+                           "fetch_transcripts", "video(s) to transcribe")
+            return
+        if self.path == "/api/analyze":
+            self.spawn_job(ANALYZE_SCRIPT,
+                           "SELECT COUNT(*) AS n FROM videos WHERE transcript_status='obtained' "
+                           "AND id NOT IN (SELECT video_id FROM ai_analysis)",
+                           "analyze_transcripts", "transcript(s) to analyze")
+            return
+        if self.path == "/api/generate_digest":
+            logfile = self._job_log("generate_digest")
+            subprocess.Popen([sys.executable, DIGEST_SCRIPT, "--days=7"],
+                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            self.json({"started": True, "message": "Generating digest…"})
             return
 
         video_id = body.get("id")
@@ -556,33 +691,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stats.update(status_counts)
         return stats
 
-    def process_queue(self):
-        """Launch fetch_transcripts.py in the background to drain the
-        'requested' queue. Returns immediately so the UI stays responsive."""
-        queued = self.query(
-            "SELECT COUNT(*) AS n FROM videos WHERE transcript_status = 'requested'"
-        )[0]["n"]
-
-        if queued == 0:
-            self.json({"started": False, "queued": 0, "message": "Queue is empty."})
-            return
-
-        if not os.path.isfile(FETCH_SCRIPT):
-            self.json({"started": False, "queued": queued,
-                       "message": f"Fetcher not found at {FETCH_SCRIPT}"})
-            return
-
+    def _job_log(self, name):
         log_dir = os.path.expanduser("~/.hermes/logs")
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "fetch_transcripts.log")
-        logfile = open(log_path, "a")
-        subprocess.Popen(
-            [sys.executable, FETCH_SCRIPT],
-            stdout=logfile, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        self.json({"started": True, "queued": queued,
-                   "message": f"Processing {queued} video(s) in the background."})
+        return open(os.path.join(log_dir, f"{name}.log"), "a")
+
+    def spawn_job(self, script, count_sql, name, noun):
+        """Launch a background script if there's pending work. Non-blocking."""
+        n = self.query(count_sql)[0]["n"]
+        if n == 0:
+            self.json({"started": False, "queued": 0, "message": "Nothing pending."})
+            return
+        if not os.path.isfile(script):
+            self.json({"started": False, "queued": n, "message": f"Missing {script}"})
+            return
+        logfile = self._job_log(name)
+        subprocess.Popen([sys.executable, script],
+                         stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+        self.json({"started": True, "queued": n,
+                   "message": f"Processing {n} {noun} in the background."})
+
+    def get_intelligence(self):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT v.id, v.video_title, v.channel_name, v.views, v.quality_score,
+                   a.seo_entities, a.geo_signals, a.best_quote, a.analyzed_at
+            FROM videos v JOIN ai_analysis a ON a.video_id = v.id
+            ORDER BY v.quality_score DESC LIMIT 100
+        """).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["seo_entities"] = json.loads(d["seo_entities"] or "[]")
+            except Exception:
+                d["seo_entities"] = []
+            try:
+                d["geo_signals"] = json.loads(d["geo_signals"] or "[]")
+            except Exception:
+                d["geo_signals"] = []
+            d["key_points"] = [dict(k) for k in conn.execute(
+                "SELECT timestamp_sec, point_text, category FROM key_points "
+                "WHERE video_id=? ORDER BY timestamp_sec", (r["id"],)).fetchall()]
+            out.append(d)
+        conn.close()
+        return out
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
