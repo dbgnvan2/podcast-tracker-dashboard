@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+import http.server
+import json
+import sqlite3
+import os
+import urllib.parse
+import sys
+import argparse
+
+DB_PATH = os.path.expanduser("~/.hermes/podcast_tracker.db")
+
+def migrate():
+    print(f"Running migration on {DB_PATH}...")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Ensure transcript_status exists
+    cursor.execute("PRAGMA table_info(videos)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    if 'transcript_status' not in columns:
+        print("Adding 'transcript_status' column...")
+        cursor.execute("ALTER TABLE videos ADD COLUMN transcript_status TEXT DEFAULT 'not_requested'")
+        
+        # Initial migration from old booleans if they exist
+        if 'transcribed' in columns:
+            cursor.execute("UPDATE videos SET transcript_status = 'obtained' WHERE transcribed = 1")
+        if 'transcribe_requested' in columns:
+            cursor.execute("UPDATE videos SET transcript_status = 'requested' WHERE transcribe_requested = 1 AND transcript_status != 'obtained'")
+            
+    if 'transcribed_date' not in columns:
+        print("Adding 'transcribed_date' column...")
+        cursor.execute("ALTER TABLE videos ADD COLUMN transcribed_date TEXT")
+    
+    # Tables for transcript data
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transcripts (
+            video_id TEXT PRIMARY KEY,
+            file_path TEXT,
+            full_text TEXT,
+            word_count INTEGER,
+            FOREIGN KEY(video_id) REFERENCES videos(id)
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS key_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT,
+            timestamp_sec INTEGER,
+            point_text TEXT,
+            category TEXT,
+            FOREIGN KEY(video_id) REFERENCES videos(id)
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+    print("Migration complete.")
+
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Podcast Tracker Dashboard</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-dim: #94a3b8;
+            --accent: #38bdf8;
+            --accent-hover: #7dd3fc;
+            --border: #334155;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0; padding: 20px; line-height: 1.5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        h1 { margin: 0; font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+        
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+        .tab-btn {
+            background: none; border: none; color: var(--text-dim); padding: 8px 16px; cursor: pointer;
+            font-size: 1rem; border-radius: 6px; transition: all 0.2s;
+        }
+        .tab-btn:hover { background: var(--card-bg); color: var(--text-main); }
+        .tab-btn.active { background: var(--accent); color: var(--bg-color); font-weight: 600; }
+        
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .search-container { margin-bottom: 20px; }
+        .search-box {
+            width: 100%; padding: 10px 15px; border-radius: 8px; border: 1px solid var(--border);
+            background: var(--card-bg); color: var(--text-main); font-size: 1rem;
+        }
+        
+        table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; }
+        th { text-align: left; padding: 12px 15px; background: #2d3748; color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        td { padding: 12px 15px; border-bottom: 1px solid var(--border); }
+        tr:hover td { background: #2d3748; }
+        
+        .score { font-weight: bold; color: var(--accent); }
+        .channel { color: var(--text-dim); font-size: 0.9rem; }
+        .views { font-family: monospace; font-size: 0.9rem; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        
+        .btn {
+            padding: 6px 12px; border-radius: 4px; border: none; cursor: pointer; font-size: 0.85rem; font-weight: 600;
+            transition: opacity 0.2s;
+        }
+        .btn-mark { background: var(--success); color: white; }
+        .btn-unreq { background: var(--error); color: white; }
+        .btn:hover { opacity: 0.8; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: var(--card-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border); }
+        .stat-label { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 5px; }
+        .stat-value { font-size: 1.8rem; font-weight: 700; color: var(--accent); }
+        
+        .chart-section { background: var(--card-bg); padding: 25px; border-radius: 12px; border: 1px solid var(--border); }
+        .bar-container { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
+        .bar-row { display: flex; align-items: center; gap: 15px; }
+        .bar-label { width: 180px; text-align: right; font-size: 0.85rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .bar-wrapper { flex-grow: 1; background: var(--border); height: 12px; border-radius: 6px; overflow: hidden; }
+        .bar-fill { height: 100%; background: var(--accent); }
+        .bar-count { width: 50px; font-size: 0.85rem; font-family: monospace; }
+        
+        #loading { text-align: center; padding: 50px; color: var(--text-dim); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Podcast Tracker</h1>
+            <div id="last-updated" style="font-size: 0.8rem; color: var(--text-dim);"></div>
+        </header>
+        
+        <div class="tabs">
+            <button class="tab-btn active" onclick="showTab('candidates', this)">Candidates</button>
+            <button class="tab-btn" onclick="showTab('requested', this)">Requested</button>
+            <button class="tab-btn" onclick="showTab('transcribed', this)">Transcribed</button>
+            <button class="tab-btn" onclick="showTab('stats', this)">Stats</button>
+        </div>
+        
+        <div id="loading">Loading data...</div>
+
+        <div id="candidates" class="tab-content active">
+            <div class="search-container"><input type="text" class="search-box" placeholder="Search candidates..." oninput="filterTable('candidates')"></div>
+            <table id="table-candidates">
+                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Date</th><th width="100">Action</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div id="requested" class="tab-content">
+            <div class="search-container"><input type="text" class="search-box" placeholder="Search requested..." oninput="filterTable('requested')"></div>
+            <table id="table-requested">
+                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Date</th><th width="100">Action</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div id="transcribed" class="tab-content">
+            <div class="search-container"><input type="text" class="search-box" placeholder="Search transcribed..." oninput="filterTable('transcribed')"></div>
+            <table id="table-transcribed">
+                <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Transcribed</th><th title="Key Points Count">KP</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div id="stats" class="tab-content">
+            <div class="stats-grid" id="stats-summary"></div>
+            <div class="chart-section">
+                <h3>Top Channels by Video Count</h3>
+                <div class="bar-container" id="channel-chart"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let data = { candidates: [], requested: [], transcribed: [], stats: {} };
+
+        async function fetchData() {
+            document.getElementById('loading').style.display = 'block';
+            try {
+                const [cRes, rRes, tRes, sRes] = await Promise.all([
+                    fetch('/api/candidates').then(r => r.json()),
+                    fetch('/api/requested').then(r => r.json()),
+                    fetch('/api/transcribed').then(r => r.json()),
+                    fetch('/api/stats').then(r => r.json())
+                ]);
+                data.candidates = cRes;
+                data.requested = rRes;
+                data.transcribed = tRes;
+                data.stats = sRes;
+                renderAll();
+            } catch (err) {
+                console.error('Fetch error:', err);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function renderAll() {
+            renderTable('candidates', data.candidates);
+            renderTable('requested', data.requested);
+            renderTable('transcribed', data.transcribed);
+            renderStats();
+            document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
+        }
+
+        function renderTable(type, items) {
+            const tbody = document.querySelector(`#table-${type} tbody`);
+            tbody.innerHTML = '';
+            
+            items.forEach(v => {
+                const tr = document.createElement('tr');
+                tr.setAttribute('data-id', v.id);
+                
+                let actionHtml = '';
+                if (type === 'candidates') {
+                    actionHtml = `<td><button class="btn btn-mark" onclick="postAction('/api/request_transcribe', '${v.id}')">Transcribe</button></td>`;
+                } else if (type === 'requested') {
+                    actionHtml = `<td><button class="btn btn-unreq" onclick="postAction('/api/unrequest', '${v.id}')">Remove</button></td>`;
+                } else if (type === 'transcribed') {
+                    actionHtml = `<td class="bar-count" style="text-align:center">${v.key_point_count || 0}</td>`;
+                }
+
+                let dateCol = v.publish_date || '';
+                if (type === 'transcribed') {
+                    dateCol = v.transcript_status || 'obtained';
+                    if (v.transcribed_date) dateCol += ' - ' + v.transcribed_date;
+                }
+
+                tr.innerHTML = `
+                    <td class="score">${(v.quality_score || 0).toFixed(2)}</td>
+                    <td><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a></td>
+                    <td class="channel">${v.channel_name}</td>
+                    <td class="views">${(v.views || 0).toLocaleString()}</td>
+                    <td class="channel" style="font-size:0.8rem">${dateCol}</td>
+                    ${actionHtml}
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function renderStats() {
+            const s = data.stats;
+            const container = document.getElementById('stats-summary');
+            const statuses = [
+                { key: 'total', label: 'Total', color: 'var(--text-main)' },
+                { key: 'not_requested', label: 'Candidates', color: 'var(--accent)' },
+                { key: 'requested', label: 'Requested', color: 'var(--warning)' },
+                { key: 'obtained', label: 'Obtained', color: 'var(--success)' },
+                { key: 'not_available', label: 'N/A', color: 'var(--text-dim)' },
+                { key: 'error', label: 'Error', color: 'var(--error)' }
+            ];
+            container.innerHTML = statuses.map(st => `
+                <div class="stat-card">
+                    <div class="stat-label">${st.label}</div>
+                    <div class="stat-value" style="color: ${st.color}">${s[st.key] || 0}</div>
+                </div>
+            `).join('');
+
+            const chart = document.getElementById('channel-chart');
+            chart.innerHTML = '';
+            if (s.channels && s.channels.length > 0) {
+                const max = Math.max(...s.channels.map(c => c.count));
+                s.channels.forEach(c => {
+                    const pct = (c.count / max) * 100;
+                    const row = document.createElement('div');
+                    row.className = 'bar-row';
+                    row.innerHTML = `
+                        <div class="bar-label" title="${c.name}">${c.name}</div>
+                        <div class="bar-wrapper"><div class="bar-fill" style="width: ${pct}%"></div></div>
+                        <div class="bar-count">${c.count}</div>
+                    `;
+                    chart.appendChild(row);
+                });
+            }
+        }
+
+        function showTab(tabId, btn) {
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            if (btn) btn.classList.add('active');
+        }
+
+        function filterTable(type) {
+            const query = document.querySelector(`#${type} .search-box`).value.toLowerCase();
+            const rows = document.querySelectorAll(`#table-${type} tbody tr`);
+            rows.forEach(row => {
+                row.style.display = row.innerText.toLowerCase().includes(query) ? '' : 'none';
+            });
+        }
+
+        async function postAction(url, id) {
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                if (res.ok) fetchData();
+            } catch (err) {
+                console.error('Action error:', err);
+            }
+        }
+
+        fetchData();
+    </script>
+</body>
+</html>
+"""
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path).path
+        if p == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+        elif p == "/api/candidates":
+            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'not_requested' ORDER BY quality_score DESC LIMIT 50"))
+        elif p == "/api/requested":
+            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'requested' ORDER BY quality_score DESC LIMIT 50"))
+        elif p == "/api/transcribed":
+            sql = """
+                SELECT v.*, t.word_count, 
+                       (SELECT COUNT(*) FROM key_points k WHERE k.video_id = v.id) as key_point_count
+                FROM videos v
+                LEFT JOIN transcripts t ON v.id = t.video_id
+                WHERE v.transcript_status = 'obtained'
+                ORDER BY v.transcribed_date DESC
+                LIMIT 50
+            """
+            self.json(self.query(sql))
+        elif p == "/api/stats":
+            self.json(self.get_stats())
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        video_id = body.get("id")
+        
+        if not video_id:
+            self.send_error(400, "Missing ID")
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        if self.path == "/api/request_transcribe":
+            conn.execute("UPDATE videos SET transcript_status = 'requested' WHERE id = ?", (video_id,))
+            conn.commit()
+            self.json({"ok": True})
+        elif self.path == "/api/unrequest":
+            conn.execute("UPDATE videos SET transcript_status = 'not_requested' WHERE id = ?", (video_id,))
+            conn.commit()
+            self.json({"ok": True})
+        else:
+            self.send_error(404)
+        conn.close()
+
+    def json(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def query(self, sql, params=()):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(sql, params)
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def get_stats(self):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        total = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        
+        status_counts = {"not_requested": 0, "requested": 0, "obtained": 0, "not_available": 0, "error": 0}
+        rows = conn.execute("SELECT transcript_status, COUNT(*) as count FROM videos GROUP BY transcript_status").fetchall()
+        for r in rows:
+            if r['transcript_status'] in status_counts:
+                status_counts[r['transcript_status']] = r['count']
+            
+        channels = conn.execute("""
+            SELECT COALESCE(NULLIF(channel_name, ''), 'Unknown') as name, COUNT(*) as count 
+            FROM videos GROUP BY name ORDER BY count DESC LIMIT 15
+        """).fetchall()
+        conn.close()
+        
+        stats = {"total": total, "channels": [dict(r) for r in channels]}
+        stats.update(status_counts)
+        return stats
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--migrate", action="store_true", help="Run database migrations")
+    args = parser.parse_args()
+
+    if args.migrate:
+        migrate()
+        sys.exit(0)
+
+    port = int(os.environ.get("PORT", 9091))
+    server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    print(f"Podcast Tracker Dashboard running at http://localhost:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        sys.exit(0)
