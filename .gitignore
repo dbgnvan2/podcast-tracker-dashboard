@@ -1,0 +1,23 @@
+# Local data store (lives in ~/.hermes, never in-repo — but ignore any local copies)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+transcripts/
+*.vtt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+
+# Claude local settings (machine-specific permissions)
+.claude/settings.local.json
