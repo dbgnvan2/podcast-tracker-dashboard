@@ -204,7 +204,7 @@ The tool is now **topic-agnostic**. All search criteria are externalized into sw
 A new cross-transcript deliverable: a factual, educational **advisor report** synthesized from the last N transcripts, led by an **Executive Key Ideas** section where every idea is cited to its originating source.
 
 - **`generate_report.py`** — selects the last N analyzed transcripts, feeds the LLM each source's extracted key points (timestamped), best quote, and a transcript excerpt — all already grounded in real transcripts (Working Rule 0). The model must attribute every idea/paragraph to a supplied source number; `render()` validates those numbers against the real source list and drops any out-of-range citation, so citations can never point at something invented. Deep-links each citation to the source video at a representative timestamp. Writes to `~/.hermes/reports/<profile>/`.
-- **Report structure** — overview → Executive Key Ideas (each cited) → thematic sections (each paragraph cited) → Sources list.
+- **Report structure (two layers)** — overview → **Executive Key Ideas** (the summary: title + one-line each, cited) → **Detailed Analysis** that expands every key idea with **Why it matters**, **How to implement** (concrete steps), and **Details**, each cited → Sources list.
 - **Dashboard "Report" tab** — N selector + "Generate Advisor Report" button; rendered as HTML (clickable citations) via a small markdown renderer that also upgraded the Digest tab. Endpoints `/api/report`, `/api/generate_report`.
 - **Profile-aware** — framed by `analysis_focus`, per-profile reports dir.
 - **Validated on real data** — produced a 5-source SEO report with 8 cited Executive Key Ideas, all citations resolving to the real James Dooley videos.

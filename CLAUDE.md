@@ -6,7 +6,7 @@
 
 ## Project Overview
 
-A small toolchain that discovers SEO/AI/GEO podcasts on YouTube, scores them by quality, queues the good ones for transcription, fetches transcripts, and surfaces everything in a local web dashboard. All state lives in one SQLite database.
+A small toolchain that discovers topic-relevant YouTube videos/podcasts, scores them by quality, queues the good ones for transcription, fetches **verified** transcripts, AI-analyzes them into cited insights, and surfaces everything in a local web dashboard (with weekly digests and advisor reports). The topic is set by the active **investigation profile** (default: SEO/AI/GEO; ship-with example: Zone 2 training). State lives in one SQLite DB **per profile**.
 
 - **GitHub:** https://github.com/dbgnvan2/podcast-tracker-dashboard
 - **Data store:** SQLite — **one DB per investigation profile**. The default `seo-geo` profile uses `~/.hermes/podcast_tracker.db`; others use `~/.hermes/db/podcast_<name>.db`. The active profile is resolved via `profiles.py`.
@@ -15,7 +15,7 @@ A small toolchain that discovers SEO/AI/GEO podcasts on YouTube, scores them by 
 ### Investigation profiles (load-bearing)
 All topic-specific criteria are externalized into **profiles** (`~/.hermes/profiles/<name>.json`), so the tool works for any topic (SEO/GEO, Zone 2 training, stock trading…). A profile bundles `search_queries`, `curated_channels`, `channel_bonus`, `keywords`, filters (`min_views`/`min_duration_sec`/`max_duration_sec`/`min_days_old`), `analysis_focus` (frames the LLM analysis + term suggestions), and `digest_title`. **Switching the active profile swaps the underlying DB**, so investigations are fully isolated. `profiles.py` is the single source of truth (active pointer in `~/.hermes/profiles/_active`); every script resolves `DB_PATH` from it. The dashboard refreshes the active DB per request, so switching is live. Each script accepts the active profile by default; `podcast_scraper.py --profile NAME` overrides, and `--test` previews a profile's reach without writing.
 
-> **Origin & status:** This codebase was prototyped by an agent ("Hermes") under `~/.hermes/scripts/`, then handed off to a real coding agent (this repo) because the prototype stalled — file writes failed, the server wouldn't launch, and at one point the prototype manually edited the DB instead of fixing code (a mistake the user was emphatic about never repeating — see Working Rules). The scripts here run, but the **AI-analysis stage is unbuilt** and the **live DB is in a partly-inconsistent state** from the aborted prototype runs. See "Product Vision & Roadmap" below.
+> **History & status:** Prototyped by an agent ("Hermes"), handed to this repo, and built out end-to-end: discovery → verified transcripts → AI analysis → digest → advisor report → swappable multi-topic profiles. Version-by-version detail lives in `SPEC.md` (this file stays lean: rules, constraints, paths). The Working Rules below are load-bearing lessons from the prototype's failures — read them.
 
 ---
 
@@ -23,13 +23,14 @@ All topic-specific criteria are externalized into **profiles** (`~/.hermes/profi
 
 | Layer | Technology |
 |---|---|
-| Language | Python 3 (stdlib-only; no third-party packages) |
+| Language | Python 3 — **our own code is stdlib-only** (no framework, no ORM, no build step) |
 | Web server | `http.server` (stdlib) — no framework |
 | Frontend | Single inline HTML/CSS/JS string in `dashboard_server.py` (no build step) |
 | Data store | SQLite (`sqlite3` stdlib) |
-| YouTube access | `yt-dlp` invoked as a subprocess |
+| YouTube access | `yt-dlp` binary as a subprocess (+ `curl_cffi` in its env for browser impersonation) |
+| AI analysis | OpenAI-compatible chat completions via stdlib `urllib` (key from `~/.hermes/.env`) |
 
-There is **no virtualenv, no `requirements.txt`, no `package.json`**. The only external dependency is the `yt-dlp` binary on `PATH` (or one of the hardcoded Homebrew/pip paths).
+There is **no virtualenv, no `requirements.txt`, no `package.json`**. External runtime deps (outside our Python code): the `yt-dlp` binary on `PATH`/a probed Homebrew path, `curl_cffi` installed into yt-dlp's environment, and an OpenAI-compatible **LLM API key** for the analyze/digest/report stages. `youtube-transcript-api` is an optional best-effort helper in the scraper.
 
 ---
 
@@ -46,14 +47,16 @@ podcast-tracker-dashboard/
 ├── overnight_pipeline.py       # Patient runner: fetch → analyze → digest, loops past 429 cooldown
 ├── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + --migrate/--reconcile
 ├── run.sh                      # Launch dashboard + open browser (GUI-first entry point)
-└── test_app.py                 # Test suite (temp DBs, mocked LLM) — run: python3 test_app.py
+├── test_app.py                 # Test suite (temp DBs, mocked LLM) — run: python3 test_app.py
+└── profile_examples/           # Version-controlled example profiles (seo-geo, zone2-training) + README
 ```
 
 ### Data locations (outside the repo, NOT committed)
-- `~/.hermes/podcast_tracker.db` — the SQLite database
-- `~/.hermes/transcripts/` — `{id}.txt` (clean text) + `{id}.segments.json` (timestamped segments for analysis); VTT intermediates are deleted
-- `~/.hermes/digests/` — generated `digest_<date>.md` + `latest.md`
-- `~/.hermes/logs/` — background-job logs (`fetch_transcripts.log`, `analyze_transcripts.log`, etc.)
+- `~/.hermes/profiles/<name>.json` — investigation profiles; `_active` names the active one
+- `~/.hermes/podcast_tracker.db` (default `seo-geo`) and `~/.hermes/db/podcast_<name>.db` (others) — the per-profile SQLite databases
+- `~/.hermes/transcripts/` — `{id}.txt` (clean text) + `{id}.segments.json` (timestamped segments for analysis); VTT intermediates are deleted. Shared across profiles (keyed by YouTube id)
+- `~/.hermes/digests/<profile>/` and `~/.hermes/reports/<profile>/` — generated `*.md` + `latest.md`, per profile
+- `~/.hermes/logs/` — background-job logs (`fetch_transcripts.log`, `analyze_transcripts.log`, `podcast_scraper.log`, `generate_report.log`, etc.)
 
 ---
 
@@ -61,7 +64,7 @@ podcast-tracker-dashboard/
 
 - **`videos`** — one row per discovered video. PK `id` (YouTube video id). Key columns: `quality_score`, `views`, `channel_name`, `publish_date`, and `transcript_status`.
 - **`transcripts`** — `video_id` PK, `full_text`, `word_count`, `file_path`.
-- **`key_points`** — extracted points per video (`video_id`, `timestamp_sec`, `point_text`, `category`). Currently empty — target of the unbuilt AI-analysis stage.
+- **`key_points`** — extracted points per video (`video_id`, `timestamp_sec`, `point_text`, `category`). Populated by `analyze_transcripts.py`; the dashboard's "KP" column counts these.
 - **`ai_analysis`** — per-video AI extraction (`seo_entities`, `geo_signals`, `best_quote`, `analyzed_at`). Written by `analyze_transcripts.py`.
 - **`channels`** — channel registry (`channel_id` PK, `channel_name`, `handle`, `channel_url`, `video_count`, `best_score`, `curated`, `suggested`). Drives authority monitoring + emerging detection + auto-promotion. Rebuilt each scrape by `sync_channels()`.
 - **`suggested_terms`** — LLM-proposed search queries (`term` PK, `source`, `created_at`, `status` = pending|accepted|rejected). Accepted terms are merged into the query list on the next scrape.
@@ -80,14 +83,27 @@ The dashboard tabs and the fetcher queue both key off this single column. Valid 
 
 ---
 
-## Product Vision & Roadmap
+## Pipeline & Status
 
-The end goal (user's words across the build): a publishable **weekly "best of" SEO/AI/GEO podcast digest with key insights**. The intended end-to-end pipeline:
+End-to-end pipeline (all built except cron automation):
 
 ```
-discover (cron) → score → mark for transcription → fetch transcript
-   → AI-analyze transcript → surface in dashboard → weekly "best of" digest
+discover (scrape) → score → mark for transcription → fetch verified transcript
+   → AI-analyze (key points + entities + quote) → dashboard
+   → weekly "best of" digest  ·  cited advisor report
 ```
+
+### Built and working
+- **Discovery + scoring** (`podcast_scraper.py`) — keyword search + channel monitoring + velocity + emerging-channel detection + auto-promotion + LLM query-freshening.
+- **Verified transcript fetching** (`fetch_transcripts.py`) — android client + impersonation + 429 backoff; saves clean text + timestamped segments.
+- **AI Intelligence** (`analyze_transcripts.py`) — key points (timestamped) + entities + GEO/topic signals + best quote, from on-disk transcripts only.
+- **Weekly digest** (`generate_digest.py`) and **cited advisor report** (`generate_report.py`).
+- **Dashboard** — Candidates / Requested / Transcribed / Intelligence / Digest / Report / Discovery / Stats tabs; every action is a button (Run Discovery, Process Queue, Analyze, Generate Digest/Report, promote channel, accept term). Profile selector + create/test in the header.
+- **Investigation profiles** — swappable topic packages, one DB each (`profiles.py`).
+
+### Not yet built
+- **Cron/launchd automation** — a scheduled weekly run (discover → fetch → analyze → digest/report). Currently triggered manually or via the dashboard buttons.
+- **Export** — a "Download .md" / print-friendly / PDF export of the digest and advisor report.
 
 ### Discovery model (two complementary arms — keep BOTH)
 - **Keyword search** (`SEARCH_QUERIES`) — the wide net that finds *new/unknown* channels. Do **not** put "podcast" in queries (it filters out educational creators like Neil Patel and pulls in off-topic literal podcasts).
@@ -97,32 +113,17 @@ discover (cron) → score → mark for transcription → fetch transcript
 - **Auto-promotion** — `sync_channels()` flags a non-curated channel `suggested` once it has ≥2 videos scoring ≥0.6; the user promotes it (→ monitored) from the Discovery tab.
 - **Query freshening** — `podcast_scraper.py --suggest-terms` asks an LLM to mine top titles for new search terms; the user accepts/dismisses them in the Discovery tab; accepted terms join the next scrape.
 
-### Built and working
-- Discovery + quality scoring (`podcast_scraper.py`)
-- Transcript fetching for the `requested` queue (`fetch_transcripts.py`)
-- Dashboard with Candidates / Requested / Transcribed / Stats tabs + mark-for-transcribe actions
-
-### Designed but NOT built (the stall point)
-1. **AI-analysis stage.** The DB already has the target tables, but nothing populates them:
-   - `ai_analysis(video_id, seo_entities, geo_signals, best_quote, analyzed_at)` — created out-of-band, **not in any script**, 0 rows.
-   - `key_points(video_id, timestamp_sec, point_text, category)` — 0 rows; the dashboard's "KP" column counts these.
-   - `videos.transcript_summary` — unused.
-   The intent: run each **already-fetched, on-disk** transcript through an LLM to extract **key points with timestamps**, SEO entities, GEO signals, and a best quote, then store them so the dashboard and the weekly digest can use them. **Hard requirement:** this stage reads the saved transcript file as its only input — it must never analyze a video from its title/metadata or a browser snapshot (see Working Rule 0; this is exactly the failure that wrecked the prototype).
-2. **Dashboard-triggered processing.** The user chose "option A": a dashboard button should be able to **fire a backend action** that fetches → analyzes → saves, so they never touch a terminal. Currently the dashboard only flips `transcript_status`; `fetch_transcripts.py` must be run manually.
-3. **Cron-driven daily channel monitoring + weekly "best of" output.** A run is meant to also emit a top-10 transcribe-candidates list. (A `runs` table logs scraper runs; the digest generator does not exist yet.)
-
-### Known data inconsistencies in the live DB (from aborted prototype runs)
-- 4 videos are `transcript_status='obtained'` but the `transcripts` table is **empty**, and the 3 `.txt` files in `~/.hermes/transcripts/` **don't match** those video IDs. Treat current "obtained" rows as suspect; a reconciliation pass may be needed before trusting transcript state. Do **not** paper over this by editing rows by hand — fix the code path that caused it.
+> **AI-analysis grounding (hard requirement):** the analysis/digest/report stages read the **saved transcript file** (and its `key_points`/`ai_analysis` derived from it) as their only input — never a video's title/metadata, a browser snapshot, or the model's own recollection. Report/digest citations are validated against the real source list. This is the exact failure that wrecked the prototype (see Working Rule 0).
 
 ---
 
 ## Hard Constraints (read before changing anything)
 
-1. **Stdlib only.** Do not add third-party Python dependencies, a web framework, or a frontend build step. If a change seems to need one, stop and ask first.
-2. **The two scraper files are duplicates.** `podcast_scraper.py` and `youtube_podcast_scanner.py` are byte-identical. Any change to scoring/search logic must be applied to BOTH, or the duplication must be resolved first (ask before deleting one — a cron/launchd job may reference either name).
-3. **Schema changes go through `dashboard_server.py:migrate()`.** It is additive and idempotent (`ALTER TABLE ... ADD COLUMN`, `CREATE TABLE IF NOT EXISTS`). Never write a destructive migration against `~/.hermes/podcast_tracker.db` — it holds real, non-reproducible scrape history. Run via `python3 dashboard_server.py --migrate`.
-4. **Never delete or overwrite the database or the transcripts directory.** They live in `~/.hermes/` and are the only copy.
-5. **`transcript_status` is the contract** between all four scripts (see state machine above).
+1. **Stdlib-only Python.** Our own code uses only the Python stdlib — no web framework, no ORM, no frontend build step. External *tools* (the `yt-dlp` binary, `curl_cffi` in its env) and an LLM API are fine; adding a new **Python package** dependency to our code is not — stop and ask first.
+2. **One DB per profile — never hardcode the path.** All search criteria and the DB path come from the active investigation profile. Resolve the DB via `profiles.load()["db_path"]` (the dashboard refreshes it per request). The default `seo-geo` profile maps to the legacy `~/.hermes/podcast_tracker.db`; others to `~/.hermes/db/podcast_<name>.db`.
+3. **Schema changes go through `dashboard_server.py:migrate()`.** It is additive and idempotent (`ALTER TABLE ... ADD COLUMN`, `CREATE TABLE IF NOT EXISTS`) and accepts a target DB (`migrate(db)`), so it self-creates a fresh profile's schema. Never write a destructive migration — DBs hold real, non-reproducible scrape history. Run via `python3 dashboard_server.py --migrate`. The scraper's `init_db()` mirrors the schema so it's self-sufficient.
+4. **Never delete or overwrite a database or the transcripts directory.** They live in `~/.hermes/` and are the only copy.
+5. **`transcript_status` is the contract** between the scripts (see state machine above).
 6. **SQL safety:** all user/POST-driven queries use parameterized statements (`?`). Keep it that way — never string-format video ids into SQL.
 
 ---
@@ -140,7 +141,7 @@ discover (cron) → score → mark for transcription → fetch transcript
 
 ## Coding Standards
 
-- Match the existing terse, single-file style. No premature abstraction — this is a 4-file utility, not a framework.
+- Match the existing terse, single-file-per-stage style. No premature abstraction — this is a small utility, not a framework.
 - Subprocess calls to `yt-dlp` must keep a `timeout=` and handle `CalledProcessError` / `JSONDecodeError` gracefully (the scraper already does — follow that pattern).
 - DB access: open a connection, do the work, `commit()` if writing, `close()`. Use `conn.row_factory = sqlite3.Row` when reading rows that become JSON.
 - The dashboard frontend is plain `fetch()` + DOM building inside the HTML string in `dashboard_server.py`. No framework, no bundler.
@@ -150,7 +151,12 @@ discover (cron) → score → mark for transcription → fetch transcript
 ## Running Locally
 
 ```bash
-# One-time / after schema edits: create or migrate the DB
+# Investigation profiles (topic packages — one DB each)
+python3 profiles.py list                      # list profiles, * = active
+python3 profiles.py use zone2-training        # switch the active profile
+python3 podcast_scraper.py --profile NAME --test   # preview a profile's reach (no writes)
+
+# One-time / after schema edits: create or migrate the active profile's DB
 python3 dashboard_server.py --migrate
 
 # Make transcript_status honest (reset fake 'obtained', drop stub transcript files)
@@ -213,8 +219,8 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
 
-### AI Intelligence stage (`analyze_transcripts.py`)
-LLM via OpenAI-compatible chat completions (stdlib `urllib`). Key/model from env or `~/.hermes/.env`: `PODCAST_LLM_KEY` (falls back to `OPENAI_API_KEY`), `PODCAST_LLM_BASE` (default OpenAI), `PODCAST_LLM_MODEL` (default `gpt-4o-mini`). **Reads only the on-disk transcript** (Working Rule 0). Timestamps come from `{id}.segments.json`.
+### LLM stages (`analyze_transcripts.py`, `generate_digest.py`, `generate_report.py`)
+LLM via OpenAI-compatible chat completions (stdlib `urllib`). Config is shared via `analyze_transcripts.llm_config()` / `call_llm()` — key/model from env or `~/.hermes/.env`: `PODCAST_LLM_KEY` (falls back to `OPENAI_API_KEY`), `PODCAST_LLM_BASE` (default OpenAI), `PODCAST_LLM_MODEL` (default `gpt-4o-mini`). All stages are framed by the active profile's `analysis_focus`. **Read only on-disk transcripts / their derived `key_points`+`ai_analysis`** (Working Rule 0); timestamps come from `{id}.segments.json`. The advisor report's citations are validated against the real source list — out-of-range source numbers are dropped, never rendered.
 
 ### yt-dlp / transcription notes
 yt-dlp is now the brew build at `/opt/homebrew/bin/yt-dlp` (2026.x) with `curl_cffi==0.10.0` for browser impersonation. YouTube gates captions behind PO tokens and rate-limits the timedtext endpoint (HTTP 429). `fetch_transcripts.py` handles this with the `android` player client, Chrome impersonation, and 429 backoff; truly-absent captions → `not_available`, blocked/gated → retryable `error`. A heavy testing session can trigger an **IP-wide 429 cooldown** (minutes–hours); `overnight_pipeline.py` rides it out by retrying rounds with a 20-min sleep.
