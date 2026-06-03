@@ -81,5 +81,21 @@
   "max_duration_sec": 5400,
   "min_days_old": 7,
   "max_videos_per_query": 20,
-  "max_videos_per_channel": 10
+  "max_videos_per_channel": 10,
+  "literature": {
+    "enabled": true,
+    "queries": [
+      "zone 2 training lactate threshold",
+      "aerobic base mitochondrial adaptation",
+      "polarized training endurance performance",
+      "fat oxidation exercise metabolism"
+    ],
+    "sources": [
+      "europepmc"
+    ],
+    "since_date": "2024-01-01",
+    "min_citations": 0,
+    "include_preprints": true,
+    "max_results_per_source": 6
+  }
 }

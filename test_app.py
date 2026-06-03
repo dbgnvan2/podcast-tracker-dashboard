@@ -24,7 +24,7 @@ import profiles
 SCHEMA = """
 CREATE TABLE videos (id TEXT PRIMARY KEY, channel_name TEXT, video_title TEXT,
     url TEXT, views INTEGER, quality_score REAL, transcript_status TEXT,
-    transcribed_date TEXT, discovered_via TEXT DEFAULT 'search');
+    transcribed_date TEXT, discovered_via TEXT DEFAULT 'search', source_type TEXT DEFAULT 'youtube');
 CREATE TABLE transcripts (video_id TEXT PRIMARY KEY, file_path TEXT,
     full_text TEXT, word_count INTEGER);
 CREATE TABLE key_points (id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT,
@@ -81,7 +81,7 @@ class TestAnalyze(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         long_text = "entity SEO matters for AI overviews and knowledge graphs. " * 20
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01','search')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01','search','youtube')")
         conn.execute("INSERT INTO transcripts VALUES ('vid1','f',?,?)", (long_text, len(long_text.split())))
         conn.commit(); conn.close()
         analyze_transcripts.DB_PATH = Path(self.db)
@@ -114,7 +114,7 @@ class TestDigest(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01','search')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01','search','youtube')")
         conn.execute("INSERT INTO ai_analysis VALUES ('vid1','[\"Ahrefs\"]','[\"AI Overviews\"]','Quote here.','2026-06-01')")
         conn.execute("INSERT INTO key_points VALUES (1,'vid1',30,'Do entity SEO','strategy')")
         conn.commit(); conn.close()
@@ -135,8 +135,8 @@ class TestReconcile(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         # fake obtained (no transcript row) + a real one
-        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01','search')")
-        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01','search')")
+        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube')")
         conn.execute("INSERT INTO transcripts VALUES ('real','f','text',1)")
         conn.commit(); conn.close()
         Path(self.tmp, "stub.txt").write_text("junk")        # unbacked -> removed
@@ -227,8 +227,8 @@ class TestReport(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','u',9,0.9,'obtained','2026-06-02','search')")
-        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','u',9,0.8,'obtained','2026-06-01','search')")
+        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','https://youtube.com/watch?v=vidA',9,0.9,'obtained','2026-06-02','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','https://youtube.com/watch?v=vidB',9,0.8,'obtained','2026-06-01','search','youtube')")
         conn.execute("INSERT INTO transcripts VALUES ('vidA','f','full text about entity SEO and AI overviews here.',8)")
         conn.execute("INSERT INTO transcripts VALUES ('vidB','f','full text about knowledge graphs and citations here.',8)")
         conn.execute("INSERT INTO ai_analysis VALUES ('vidA','[]','[]','Quote A.','2026-06-02')")
@@ -293,6 +293,38 @@ class TestMultiSource(unittest.TestCase):
         self.assertGreater(a["authority"], 0)          # 5 citations → some authority
         self.assertEqual(a["raw"]["citations"], 5)     # kept the higher-cited record
         self.assertNotIn("<i>", a["text"])             # html stripped
+
+    def test_ingest_stores_papers_as_obtained(self):
+        import ingest_literature as il
+        import profiles as P
+        from sources import scholarly
+        from sources.base import make_document
+        tmp = tempfile.mkdtemp(); db = os.path.join(tmp, "t.db")
+        dashboard_server.migrate(db)  # full schema for a fresh profile DB
+        orig_load, orig_disc = P.load, scholarly.ScholarlyAdapter.discover
+        try:
+            P.load = lambda name=None: {
+                "name": "t", "label": "T", "db_path": db, "keywords": ["lactate"],
+                "literature": {"enabled": True, "queries": ["x"], "max_results_per_source": 5}}
+            scholarly.ScholarlyAdapter.discover = lambda self, arm: [make_document(
+                "10.1/x", "literature", "europepmc", "Paper X about lactate", "Auth et al",
+                "https://doi.org/10.1/x", "2025-06-01", "abstract discussing lactate threshold",
+                authority=0.3, raw={"doi": "10.1/x", "citations": 4, "venue": "J Sport"})]
+            n = il.ingest("t")
+            self.assertEqual(n, 1)
+            conn = sqlite3.connect(db)
+            row = conn.execute("SELECT source_type, transcript_status, quality_score, url, citations "
+                               "FROM videos WHERE id='10.1/x'").fetchone()
+            tr = conn.execute("SELECT full_text FROM transcripts WHERE video_id='10.1/x'").fetchone()
+            conn.close()
+            self.assertEqual(row[0], "literature")
+            self.assertEqual(row[1], "obtained")        # papers need no transcription
+            self.assertGreater(row[2], 0)               # scored
+            self.assertEqual(row[3], "https://doi.org/10.1/x")
+            self.assertEqual(row[4], 4)
+            self.assertIn("lactate", tr[0])             # abstract stored as content
+        finally:
+            P.load, scholarly.ScholarlyAdapter.discover = orig_load, orig_disc
 
     def test_briefing_citation_validation(self):
         import spike_multisource as sp

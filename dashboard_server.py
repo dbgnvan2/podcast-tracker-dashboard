@@ -21,6 +21,7 @@ ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
 DIGEST_SCRIPT = os.path.join(SCRIPT_DIR, "generate_digest.py")
 REPORT_SCRIPT = os.path.join(SCRIPT_DIR, "generate_report.py")
 SCRAPER_SCRIPT = os.path.join(SCRIPT_DIR, "podcast_scraper.py")
+INGEST_LIT_SCRIPT = os.path.join(SCRIPT_DIR, "ingest_literature.py")
 
 
 def refresh_active_db():
@@ -46,7 +47,9 @@ def migrate(db=None):
             transcript_keywords_score REAL, quality_score REAL, selected INTEGER DEFAULT 0,
             transcript_summary TEXT, transcript_status TEXT DEFAULT 'not_requested',
             transcribed_date TEXT, channel_id TEXT, is_new_channel INTEGER DEFAULT 0,
-            discovered_via TEXT DEFAULT 'search', views_per_day REAL DEFAULT 0
+            discovered_via TEXT DEFAULT 'search', views_per_day REAL DEFAULT 0,
+            source_type TEXT DEFAULT 'youtube', source TEXT DEFAULT 'youtube',
+            doi TEXT, citations INTEGER DEFAULT 0, venue TEXT
         )
     """)
     cursor.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, run_date TEXT, videos_found INTEGER, videos_new INTEGER, errors TEXT)")
@@ -75,6 +78,12 @@ def migrate(db=None):
         ("is_new_channel", "ALTER TABLE videos ADD COLUMN is_new_channel INTEGER DEFAULT 0"),
         ("discovered_via", "ALTER TABLE videos ADD COLUMN discovered_via TEXT DEFAULT 'search'"),
         ("views_per_day", "ALTER TABLE videos ADD COLUMN views_per_day REAL DEFAULT 0"),
+        # Multi-source ("documents") columns — NULL/defaults for existing video rows.
+        ("source_type", "ALTER TABLE videos ADD COLUMN source_type TEXT DEFAULT 'youtube'"),
+        ("source", "ALTER TABLE videos ADD COLUMN source TEXT DEFAULT 'youtube'"),
+        ("doi", "ALTER TABLE videos ADD COLUMN doi TEXT"),
+        ("citations", "ALTER TABLE videos ADD COLUMN citations INTEGER DEFAULT 0"),
+        ("venue", "ALTER TABLE videos ADD COLUMN venue TEXT"),
     ]:
         if col not in columns:
             print(f"Adding '{col}' column...")
@@ -565,11 +574,13 @@ HTML = """
                 } else if (v.views_per_day) {
                     dateCol = `${(v.views_per_day).toLocaleString()}/day`;
                 }
-                const badge = v.is_new_channel ? ' <span class="chip" style="background:var(--warning);color:#000">🆕 new</span>' : '';
+                const newBadge = v.is_new_channel ? ' <span class="chip" style="background:var(--warning);color:#000">🆕 new</span>' : '';
+                const srcBadge = (v.source_type === 'literature') ? '📄 ' : '';
+                const docUrl = v.url || ('https://youtube.com/watch?v=' + v.id);
 
                 tr.innerHTML = `
                     <td class="score">${(v.quality_score || 0).toFixed(2)}</td>
-                    <td><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a>${badge}</td>
+                    <td>${srcBadge}<a href="${docUrl}" target="_blank">${v.video_title}</a>${newBadge}</td>
                     <td class="channel">${v.channel_name}</td>
                     <td class="views">${(v.views || 0).toLocaleString()}</td>
                     <td class="channel" style="font-size:0.8rem">${dateCol}</td>
@@ -784,16 +795,20 @@ HTML = """
                 return;
             }
             el.innerHTML = items.map(v => {
+                const isLit = v.source_type === 'literature';
+                const docUrl = v.url || ('https://youtube.com/watch?v=' + v.id);
                 const ents = (v.seo_entities||[]).map(e => `<span class="chip">${e}</span>`).join('');
                 const geos = (v.geo_signals||[]).map(g => `<span class="chip chip-geo">${g}</span>`).join('');
                 const kps = (v.key_points||[]).map(k => {
-                    const url = `https://youtube.com/watch?v=${v.id}&t=${parseInt(k.timestamp_sec||0)}s`;
                     const cat = k.category ? ` <span class="kp-cat">(${k.category})</span>` : '';
+                    if (isLit) return `<li>${k.point_text}${cat}</li>`;  // papers: no timestamps
+                    const url = `https://youtube.com/watch?v=${v.id}&t=${parseInt(k.timestamp_sec||0)}s`;
                     return `<li><a class="kp-time" href="${url}" target="_blank">${fmtTime(k.timestamp_sec)}</a>${k.point_text}${cat}</li>`;
                 }).join('');
+                const reach = isLit ? `${(v.citations||0).toLocaleString()} citations` : `${(v.views||0).toLocaleString()} views`;
                 return `<div class="intel-card">
-                    <h3><a href="https://youtube.com/watch?v=${v.id}" target="_blank">${v.video_title}</a></h3>
-                    <div class="intel-meta">${v.channel_name} · ${(v.views||0).toLocaleString()} views · score ${(v.quality_score||0).toFixed(2)}</div>
+                    <h3>${isLit?'📄 ':''}<a href="${docUrl}" target="_blank">${v.video_title}</a></h3>
+                    <div class="intel-meta">${v.channel_name} · ${reach} · score ${(v.quality_score||0).toFixed(2)}</div>
                     ${v.best_quote ? `<div class="intel-quote">“${v.best_quote}”</div>` : ''}
                     <div>${ents}${geos}</div>
                     ${kps ? `<ul class="kp-list">${kps}</ul>` : ''}
@@ -1122,11 +1137,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json({"started": True, "message": f"Generating advisor report from last {n} transcripts…"})
             return
         if self.path == "/api/run_discovery":
-            logfile = self._job_log("podcast_scraper")
-            subprocess.Popen([sys.executable, SCRAPER_SCRIPT],
-                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            prof = profiles.load()
+            launched = []
+            # YouTube arm (queries + channels)
+            if prof.get("youtube", {}).get("enabled", True) is not False:
+                subprocess.Popen([sys.executable, SCRAPER_SCRIPT],
+                                 stdout=self._job_log("podcast_scraper"),
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+                launched.append("video")
+            # Literature arm (queries + scholarly sources)
+            if prof.get("literature", {}).get("enabled", False):
+                subprocess.Popen([sys.executable, INGEST_LIT_SCRIPT],
+                                 stdout=self._job_log("ingest_literature"),
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+                launched.append("literature")
             self.json({"started": True,
-                       "message": "Discovery running in the background (this takes a few minutes)…"})
+                       "message": f"Discovery running ({' + '.join(launched) or 'video'}) in the background…"})
             return
         if self.path == "/api/suggest_terms":
             logfile = self._job_log("suggest_terms")
@@ -1258,6 +1284,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT v.id, v.video_title, v.channel_name, v.views, v.quality_score,
+                   v.url, v.source_type, v.citations,
                    a.seo_entities, a.geo_signals, a.best_quote, a.analyzed_at
             FROM videos v JOIN ai_analysis a ON a.video_id = v.id
             ORDER BY v.quality_score DESC LIMIT 100

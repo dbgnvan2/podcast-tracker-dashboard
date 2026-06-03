@@ -46,8 +46,8 @@ def select_sources(n):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
-        SELECT v.id, v.video_title, v.channel_name, v.transcribed_date,
-               t.full_text, a.best_quote
+        SELECT v.id, v.video_title, v.channel_name, v.transcribed_date, v.url,
+               v.source_type, t.full_text, a.best_quote
         FROM videos v
         JOIN transcripts t ON t.video_id = v.id
         JOIN ai_analysis a ON a.video_id = v.id
@@ -61,11 +61,14 @@ def select_sources(n):
         kps = conn.execute(
             "SELECT timestamp_sec, point_text FROM key_points WHERE video_id=? "
             "ORDER BY timestamp_sec LIMIT 8", (r["id"],)).fetchall()
+        is_yt = (r["source_type"] or "youtube") == "youtube"
         sources.append({
             "n": i,
             "id": r["id"],
             "title": r["video_title"],
             "channel": r["channel_name"],
+            "url": r["url"] or (f"https://youtube.com/watch?v={r['id']}" if is_yt else ""),
+            "is_youtube": is_yt,
             "best_quote": r["best_quote"] or "",
             "key_points": [{"t": k["timestamp_sec"], "text": k["point_text"]} for k in kps],
             "excerpt": (r["full_text"] or "")[:EXCERPT_CHARS],
@@ -138,8 +141,8 @@ def render(report, sources, today):
             s = by_n.get(int(x)) if str(x).isdigit() else None
             if not s:
                 continue
-            url = f"https://youtube.com/watch?v={s['id']}"
-            if s["first_ts"]:
+            url = s.get("url") or ""
+            if s.get("is_youtube") and s.get("first_ts"):
                 url += f"&t={int(s['first_ts'])}s"
             out.append(f"[S{s['n']}]({url})")
         return " " + " ".join(out) if out else ""
@@ -147,7 +150,7 @@ def render(report, sources, today):
     ideas = report.get("key_ideas", [])
 
     L = [f"# {TITLE} — {today}", ""]
-    L.append(f"_Factual, educational synthesis of {len(sources)} verified transcripts. "
+    L.append(f"_Factual, educational synthesis of {len(sources)} verified sources. "
              f"Every idea is cited to its source._\n")
     if report.get("overview"):
         L += [report["overview"].strip(), ""]
@@ -186,7 +189,8 @@ def render(report, sources, today):
 
     L += ["---", "", "## Sources", ""]
     for s in sources:
-        L.append(f"- **S{s['n']}** — [{s['title']}](https://youtube.com/watch?v={s['id']}) · {s['channel']}")
+        tag = "▶" if s.get("is_youtube") else "📄"
+        L.append(f"- **S{s['n']}** {tag} [{s['title']}]({s.get('url','')}) · {s['channel']}")
     return "\n".join(L)
 
 

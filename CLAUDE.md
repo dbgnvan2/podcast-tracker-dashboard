@@ -41,6 +41,7 @@ podcast-tracker-dashboard/
 ├── profiles.py                 # Investigation profiles: swappable search packages (queries/channels/keywords/filters/focus) — one DB per profile
 ├── podcast_scraper.py          # Search YouTube → score → upsert into videos table
 ├── fetch_transcripts.py        # Drain 'requested' queue → yt-dlp subs → transcripts (+segments)
+├── ingest_literature.py        # Literature arm: scholarly adapter → papers as 'obtained' documents
 ├── analyze_transcripts.py      # AI Intelligence: transcript → key_points + ai_analysis (LLM)
 ├── generate_digest.py          # Weekly "best of" markdown digest from analyzed videos
 ├── generate_report.py          # Advisor report: factual synthesis of last N transcripts, cited to sources
@@ -117,6 +118,9 @@ Weights: **authority 0.30** (known expertise — `channel_authority()`: monitore
 - **Velocity** — `views_per_day` feeds a 0.10-weight term in `quality_score` and powers the Candidates "🔥 Trending" sort, so breakouts surface early.
 - **Auto-promotion** — `sync_channels()` flags a non-curated channel `suggested` once it has **≥5 videos scoring >0.5** (consistent quality); the user promotes it (→ monitored) from the Discovery tab. Authority for scoring follows channel membership (`monitored_channels()` = profile `curated_channels` + DB `channels.curated`), not how a video was found.
 - **Query freshening** — `podcast_scraper.py --suggest-terms` asks an LLM to mine top titles for new search terms; the user accepts/dismisses them in the Discovery tab; accepted terms join the next scrape.
+
+### Multi-source documents (YouTube + literature)
+A profile may have a **`literature` arm** (queries + scholarly `sources`) alongside the YouTube arm. `ingest_literature.py` runs the `ScholarlyAdapter` (`sources/`), stores each paper's **abstract as the content** (`transcripts` row) and marks it `obtained` immediately — papers need no transcription — so the *existing* analyze → digest → report layers treat papers and videos identically. `videos` carries `source_type`/`source`/`doi`/`citations`/`venue`; links use the stored `url` column (DOI for papers, watch URL for videos). Run Discovery launches **both** arms when enabled. See `DESIGN-multisource.md`.
 
 > **AI-analysis grounding (hard requirement):** the analysis/digest/report stages read the **saved transcript file** (and its `key_points`/`ai_analysis` derived from it) as their only input — never a video's title/metadata, a browser snapshot, or the model's own recollection. Report/digest citations are validated against the real source list. This is the exact failure that wrecked the prototype (see Working Rule 0).
 

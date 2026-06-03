@@ -104,7 +104,12 @@ def init_db():
             channel_id TEXT,
             is_new_channel INTEGER DEFAULT 0,
             discovered_via TEXT DEFAULT 'search',
-            views_per_day REAL DEFAULT 0
+            views_per_day REAL DEFAULT 0,
+            source_type TEXT DEFAULT 'youtube',
+            source TEXT DEFAULT 'youtube',
+            doi TEXT,
+            citations INTEGER DEFAULT 0,
+            venue TEXT
         )
     """)
     conn.execute("""

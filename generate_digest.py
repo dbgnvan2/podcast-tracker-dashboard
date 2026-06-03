@@ -42,7 +42,7 @@ def build_digest(days=None, limit=10):
 
     rows = conn.execute(
         f"""SELECT v.id, v.video_title, v.channel_name, v.views, v.quality_score,
-                   a.seo_entities, a.geo_signals, a.best_quote
+                   v.url, v.source_type, a.seo_entities, a.geo_signals, a.best_quote
             FROM videos v JOIN ai_analysis a ON a.video_id = v.id
             WHERE {where}
             ORDER BY v.quality_score DESC LIMIT ?""",
@@ -73,18 +73,24 @@ def build_digest(days=None, limit=10):
             (r["id"],),
         ).fetchall()
 
+        is_yt = (r["source_type"] or "youtube") == "youtube"
+        doc_url = r["url"] or (f"https://youtube.com/watch?v={r['id']}" if is_yt else "")
+        reach = f"{int(r['views'] or 0):,} " + ("views" if is_yt else "citations")
         lines.append(f"## {i}. {r['video_title']}")
-        meta = f"**{r['channel_name']}** · {int(r['views'] or 0):,} views · score {r['quality_score']:.2f}"
-        lines.append(meta)
-        lines.append(f"https://youtube.com/watch?v={r['id']}\n")
+        lines.append(f"**{r['channel_name']}** · {reach} · score {r['quality_score']:.2f}")
+        lines.append(f"{doc_url}\n")
         if r["best_quote"]:
             lines.append(f"> {r['best_quote']}\n")
         if kps:
             lines.append("**Key points:**")
             for kp in kps:
-                url = f"https://youtube.com/watch?v={r['id']}&t={int(kp['timestamp_sec'] or 0)}s"
+                if is_yt:
+                    url = f"https://youtube.com/watch?v={r['id']}&t={int(kp['timestamp_sec'] or 0)}s"
+                    label = f"[{fmt_ts(kp['timestamp_sec'])}]({url}) "
+                else:
+                    label = ""  # papers have no timestamps
                 cat = f" _({kp['category']})_" if kp["category"] else ""
-                lines.append(f"- [{fmt_ts(kp['timestamp_sec'])}]({url}) {kp['point_text']}{cat}")
+                lines.append(f"- {label}{kp['point_text']}{cat}")
             lines.append("")
 
     if ent_counter:
