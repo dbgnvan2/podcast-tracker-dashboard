@@ -466,9 +466,15 @@ def sync_channels(conn):
             WHERE discovered_via = 'channel' AND channel_id IS NOT NULL AND channel_id != ''
         )
     """)
+    # Suggest a non-curated channel once it has shown CONSISTENT quality:
+    # at least 5 videos scoring over 0.5.
     cur.execute("""
         UPDATE channels SET suggested = 1
-        WHERE curated = 0 AND suggested = 0 AND video_count >= 2 AND best_score >= 0.6
+        WHERE curated = 0 AND suggested = 0 AND channel_id IN (
+            SELECT channel_id FROM videos
+            WHERE quality_score > 0.5 AND channel_id IS NOT NULL AND channel_id != ''
+            GROUP BY channel_id HAVING COUNT(*) >= 5
+        )
     """)
     conn.commit()
 

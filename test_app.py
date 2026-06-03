@@ -194,17 +194,22 @@ class TestEmergingDiscovery(unittest.TestCase):
             podcast_scraper.channel_authority("UCx", "Neil Patel", False))
 
     def test_suggested_and_autocurate(self):
-        self._add("a1","UCnew","Newbie","0.65","search")
-        self._add("a2","UCnew","Newbie","0.62","search")   # 2 strong -> suggested
-        self._add("b1","UCmon","Monitored","0.70","channel")  # monitored -> auto-curated
-        self._add("c1","UClow","Tiny","0.30","search")     # below threshold
+        # Rule: a non-curated channel needs >=5 videos scoring over 0.5 to be suggested.
+        for i in range(5):
+            self._add(f"a{i}", "UCnew", "Newbie", "0.55", "search")  # 5 strong -> suggested
+        self._add("b1","UCmon","Monitored","0.70","channel")        # monitored -> auto-curated
+        self._add("c1","UCfew","FewGood","0.65","search")           # only 1 good -> not enough
+        self._add("c2","UCfew","FewGood","0.62","search")
+        for i in range(6):
+            self._add(f"d{i}","UClow","LowScores","0.40","search")  # many but all <=0.5 -> no
         podcast_scraper.sync_channels(self.conn)
         rows = {r[0]: (r[1], r[2]) for r in self.conn.execute(
             "SELECT channel_name, curated, suggested FROM channels")}
-        self.assertEqual(rows["Newbie"], (0, 1))     # suggested, not curated
+        self.assertEqual(rows["Newbie"], (0, 1))     # 5 videos >0.5 -> suggested
         self.assertEqual(rows["Monitored"][0], 1)    # auto-curated (monitored)
         self.assertEqual(rows["Monitored"][1], 0)    # not suggested
-        self.assertEqual(rows["Tiny"], (0, 0))       # neither
+        self.assertEqual(rows["FewGood"][1], 0)      # only 2 videos -> not suggested
+        self.assertEqual(rows["LowScores"][1], 0)    # many videos but none >0.5
 
     def test_days_since(self):
         self.assertGreaterEqual(podcast_scraper.days_since("2026-05-01"), 1)
