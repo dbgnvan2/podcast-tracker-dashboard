@@ -223,6 +223,11 @@ HTML = """
             --warning: #d97706;
             --error: #dc2626;
         }
+        body.dark {
+            --bg-color: #0f172a; --card-bg: #1e293b; --text-main: #f8fafc;
+            --text-dim: #94a3b8; --accent: #38bdf8; --accent-hover: #7dd3fc;
+            --border: #334155; --row-alt: #2d3748;
+        }
         * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -299,17 +304,24 @@ HTML = """
         .kp-time { font-family: monospace; color: var(--accent); margin-right: 8px; }
         .kp-cat { color: var(--text-dim); font-size: 0.78rem; }
 
-        /* Print / Save-as-PDF: show only the active tab's content, black on white. */
+        #print-header { display: none; }
+        /* Print / Save-as-PDF: show only the active tab's content, always black on
+           white (even if the dark theme is on). */
         @media print {
-            body { background: #fff; color: #000; padding: 0; }
+            body, body.dark { background: #fff !important; color: #000 !important; padding: 0; }
             header, .tabs, .btn, .search-container, .modal-overlay, #loading,
             #report-n, [id$="-status"], #last-updated, #profile-select,
             #table-emerging, #suggested-channels, #suggested-terms { display: none !important; }
             .tab-content:not(.active) { display: none !important; }
             .container { max-width: 100%; margin: 0; }
-            .chart-section, .intel-card, table { border: 1px solid #ccc !important; box-shadow: none !important; }
+            .chart-section, .intel-card, table, td, th {
+                background: #fff !important; color: #000 !important;
+                border-color: #ccc !important; box-shadow: none !important; }
+            .intel-meta, .kp-cat, .channel { color: #333 !important; }
             #report-content, #digest-content { white-space: normal; line-height: 1.5; }
             a { color: #000; text-decoration: underline; }
+            #print-header { display: block; font-size: 0.85rem; color: #555;
+                border-bottom: 1px solid #ccc; margin-bottom: 14px; padding-bottom: 6px; }
         }
 
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
@@ -336,11 +348,13 @@ HTML = """
                 <span style="color:var(--text-dim);font-size:0.85rem">Investigation:</span>
                 <select id="profile-select" onchange="switchProfile(this.value)"
                         style="background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:0.9rem;"></select>
+                <button class="btn btn-view" onclick="toggleTheme()" title="Light / dark">🌓</button>
                 <button class="btn btn-view" onclick="openSettings()">⚙ Settings</button>
                 <button class="btn btn-primary" onclick="openNewProfile()">+ New</button>
                 <div id="last-updated" style="font-size: 0.8rem; color: var(--text-dim); margin-left:10px;"></div>
             </div>
         </header>
+        <div id="print-header"></div>
         
         <div class="tabs">
             <button class="tab-btn active" onclick="showTab('candidates', this)">Candidates</button>
@@ -402,7 +416,7 @@ HTML = """
         <div id="digest" class="tab-content">
             <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
                 <button class="btn btn-primary" onclick="generateDigest()">📰 Generate Weekly Digest</button>
-                <button class="btn btn-view" onclick="window.print()">🖨 Save as PDF</button>
+                <button class="btn btn-view" onclick="printDoc('Weekly Digest')">🖨 Save as PDF</button>
                 <span id="digest-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
             </div>
             <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
@@ -414,7 +428,7 @@ HTML = """
                 <input id="report-n" type="number" value="8" min="2" max="12" style="width:60px;background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;">
                 <span style="color:var(--text-dim);font-size:0.85rem">transcripts</span>
                 <button class="btn btn-primary" onclick="generateReport()">📋 Generate Advisor Report</button>
-                <button class="btn btn-view" onclick="window.print()">🖨 Save as PDF</button>
+                <button class="btn btn-view" onclick="printDoc('Advisor Report')">🖨 Save as PDF</button>
                 <span id="report-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
             </div>
             <div class="chart-section" id="report-content" style="white-space: pre-wrap; line-height: 1.65;"></div>
@@ -904,11 +918,13 @@ HTML = """
         }
 
         let activeSettings = {};
+        let activeProfileName = 'topic';
         async function loadProfiles() {
             try {
                 const res = await fetch('/api/profiles');
                 const d = await res.json();
                 activeSettings = d.settings || {};
+                activeProfileName = d.active || activeProfileName;
                 const sel = document.getElementById('profile-select');
                 sel.innerHTML = (d.profiles || []).map(p =>
                     `<option value="${p.name}" ${p.active?'selected':''}>${p.label} (${p.queries}q/${p.channels}ch)</option>`
@@ -916,6 +932,27 @@ HTML = """
                 document.getElementById('settings-profile').innerText = d.active || '';
             } catch (err) { console.error('profiles', err); }
         }
+
+        // Save-as-PDF: the browser uses document.title as the default PDF filename.
+        function printDoc(kind) {
+            const date = new Date().toISOString().slice(0, 10);
+            const safe = (activeProfileName || 'topic').replace(/[^a-z0-9-]+/gi, '-');
+            const fname = `${kind.replace(/ /g, '-')}_${safe}_${date}`;
+            const prevTitle = document.title;
+            document.title = fname;
+            document.getElementById('print-header').innerText = `${kind} · ${activeProfileName} · ${date}`;
+            const restore = () => { document.title = prevTitle; window.removeEventListener('afterprint', restore); };
+            window.addEventListener('afterprint', restore);
+            window.print();
+        }
+
+        function applyTheme(t) { document.body.classList.toggle('dark', t === 'dark'); }
+        function toggleTheme() {
+            const t = document.body.classList.contains('dark') ? 'light' : 'dark';
+            localStorage.setItem('pt_theme', t);
+            applyTheme(t);
+        }
+        applyTheme(localStorage.getItem('pt_theme') || 'light');
 
         function openSettings() {
             const f = ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel'];
