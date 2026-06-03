@@ -221,25 +221,35 @@ class TestReport(unittest.TestCase):
         self.gr.DB_PATH = Path(self.db)
 
     def test_report_cites_real_sources(self):
-        # Mock the LLM: it cites sources 1 and 2 (valid) and 9 (invalid → dropped).
+        # Mock the LLM with the rich two-layer shape; idea 2 cites invalid src 9.
         self.gr.A.call_llm = lambda *a, **k: {
             "overview": "Overview text.",
             "key_ideas": [
-                {"idea": "Big idea one.", "sources": [1]},
-                {"idea": "Big idea two.", "sources": [2, 9]},
+                {"title": "Idea One", "summary": "Short summary one.",
+                 "why_it_matters": "It matters because reasons.",
+                 "how_to_implement": ["Do step A", "Do step B"],
+                 "details": "Deeper explanation one.", "sources": [1]},
+                {"title": "Idea Two", "summary": "Short summary two.",
+                 "why_it_matters": "Second significance.",
+                 "how_to_implement": ["Do step C"],
+                 "details": "Deeper explanation two.", "sources": [2, 9]},
             ],
-            "sections": [{"heading": "Theme", "paragraphs": [{"text": "Para.", "sources": [1]}]}],
         }
         self.gr.A.llm_config = lambda: ("k", "http://x", "m")
         md, day = self.gr.build_report(n=8)
-        self.assertIn("Executive Key Ideas", md)
-        self.assertIn("Big idea one.", md)
-        # citation deep-links to the real source video + its key-point timestamp
+        # two-layer structure present
+        self.assertIn("## Executive Key Ideas", md)
+        self.assertIn("## Detailed Analysis", md)
+        self.assertIn("**Idea One**", md)            # summary list
+        self.assertIn("### 1. Idea One", md)         # detailed section
+        self.assertIn("**Why it matters.**", md)
+        self.assertIn("**How to implement:**", md)
+        self.assertIn("- Do step A", md)
+        # citations deep-link to the real source video + its key-point timestamp
         self.assertIn("watch?v=vidA&t=30s", md)
         self.assertIn("watch?v=vidB&t=60s", md)
         # invalid source 9 was dropped, not rendered
         self.assertNotIn("[S9]", md)
-        # sources section lists both
         self.assertIn("**S1**", md)
         self.assertIn("**S2**", md)
 

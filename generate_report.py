@@ -31,7 +31,7 @@ REPORTS_DIR = Path(_PROFILE["reports_dir"])
 FOCUS = _PROFILE.get("analysis_focus", "this topic")
 TITLE = _PROFILE.get("digest_title", "Advisor Report").replace("Best of", "Advisor Report:")
 
-EXCERPT_CHARS = 1600       # transcript excerpt per source
+EXCERPT_CHARS = 2800       # transcript excerpt per source (richer grounding)
 MAX_SOURCES = 12           # hard cap to keep the prompt grounded + affordable
 
 
@@ -86,29 +86,41 @@ def build_prompt(sources):
             f"  Transcript excerpt: {s['excerpt']}\n"
         )
     sources_text = "\n".join(blocks)
-    return f"""You are an expert advisor writing a factual, educational report about
+    return f"""You are an expert advisor writing a factual, educational briefing about
 {FOCUS}. You are given {len(sources)} verified sources (video transcripts), each
-numbered. Synthesize them into one cohesive report.
+numbered. Synthesize them into ONE cohesive report.
+
+The report has two layers:
+1. "Executive Key Ideas" = the SUMMARY: 5-7 of the most important takeaways, each a
+   short title + a one-sentence summary.
+2. A DETAILED expansion of each key idea — this is the bulk of the report. For each
+   idea explain, in depth: why it matters (significance/consequences), the mechanism
+   or reasoning behind it, and concretely what has to happen to implement it
+   (actionable steps). Include specifics, examples, numbers, and nuances from the
+   sources. Note where sources agree or disagree.
 
 STRICT RULES:
 - Use ONLY information contained in the supplied sources. Do not add outside facts.
-- Every key idea and every paragraph MUST cite the source number(s) it came from,
-  using the "sources" arrays. Never cite a source number that isn't provided.
-- Be factual and educational, not promotional. Resolve agreements/disagreements
-  across sources where relevant.
+- Every idea MUST cite the source number(s) it draws on via its "sources" array.
+  Never cite a source number that wasn't provided.
+- Be factual, specific and educational — not promotional or vague. Prefer concrete
+  guidance ("do X by doing Y") over generalities.
+- Do NOT write inline "(Source N)" references in your prose — citations are rendered
+  automatically from the "sources" arrays. Just put the numbers in "sources".
 
-Produce JSON with this exact shape:
+Produce JSON with this EXACT shape:
 {{
-  "overview": "2-4 sentence factual overview of what these sources collectively cover",
+  "overview": "3-5 sentence factual overview of what these sources collectively cover and who should care",
   "key_ideas": [
-     {{"idea": "one substantive, self-contained key idea (2-4 sentences)", "sources": [1,3]}}
-     // 5-8 of the most important, executive-level ideas
-  ],
-  "sections": [
-     {{"heading": "Theme heading",
-       "paragraphs": [ {{"text": "educational paragraph", "sources": [2]}} ]
+     {{
+       "title": "short imperative title (≤8 words)",
+       "summary": "one-sentence executive summary of the idea",
+       "why_it_matters": "1-2 substantial paragraphs: the significance, stakes, and consequences of getting this right or wrong",
+       "how_to_implement": ["concrete actionable step", "another concrete step", "..."],
+       "details": "1-2 paragraphs of deeper explanation: mechanism, evidence, examples, caveats, points of agreement/disagreement across sources",
+       "sources": [1, 3]
      }}
-     // 2-4 thematic sections that go deeper
+     // 5-7 ideas, ordered most-important first
   ]
 }}
 
@@ -132,21 +144,45 @@ def render(report, sources, today):
             out.append(f"[S{s['n']}]({url})")
         return " " + " ".join(out) if out else ""
 
+    ideas = report.get("key_ideas", [])
+
     L = [f"# {TITLE} — {today}", ""]
     L.append(f"_Factual, educational synthesis of {len(sources)} verified transcripts. "
              f"Every idea is cited to its source._\n")
     if report.get("overview"):
-        L += [report["overview"], ""]
+        L += [report["overview"].strip(), ""]
 
-    L += ["## Executive Key Ideas", ""]
-    for i, k in enumerate(report.get("key_ideas", []), 1):
-        L.append(f"{i}. {k.get('idea','').strip()}{cites(k.get('sources'))}")
+    # 1) Executive summary — the key ideas as a concise cited list
+    L += ["## Executive Key Ideas", "",
+          "_The summary. Each idea is expanded in Detailed Analysis below._", ""]
+    for i, k in enumerate(ideas, 1):
+        title = (k.get("title") or k.get("idea") or "").strip()
+        summary = (k.get("summary") or "").strip()
+        line = f"{i}. **{title}**" + (f" — {summary}" if summary else "")
+        L.append(line + cites(k.get("sources")))
     L.append("")
 
-    for sec in report.get("sections", []):
-        L += [f"## {sec.get('heading','').strip()}", ""]
-        for para in sec.get("paragraphs", []):
-            L.append(f"{para.get('text','').strip()}{cites(para.get('sources'))}\n")
+    # 2) Detailed analysis — each idea expanded: why it matters + how to implement
+    L += ["## Detailed Analysis", ""]
+    for i, k in enumerate(ideas, 1):
+        title = (k.get("title") or k.get("idea") or "").strip()
+        L += [f"### {i}. {title}", ""]
+        if k.get("why_it_matters"):
+            L += [f"**Why it matters.** {k['why_it_matters'].strip()}", ""]
+        steps = k.get("how_to_implement")
+        if isinstance(steps, str):
+            steps = [steps]
+        if steps:
+            L.append("**How to implement:**")
+            for st in steps:
+                if str(st).strip():
+                    L.append(f"- {str(st).strip()}")
+            L.append("")
+        if k.get("details"):
+            L += [f"**Details.** {k['details'].strip()}", ""]
+        srcline = cites(k.get("sources")).strip()
+        if srcline:
+            L += [f"_Sources: {srcline}_", ""]
 
     L += ["---", "", "## Sources", ""]
     for s in sources:
