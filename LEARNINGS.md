@@ -100,10 +100,11 @@ authority).
 
 ## Open risks (found by review, not yet bitten)
 
-- **SQLite concurrency:** the dashboard reads while `podcast_scraper`/
-  `fetch_transcripts`/`analyze_transcripts` subprocesses write the *same* DB. No
-  `busy_timeout` is set, so a long write could surface "database is locked". Cheap
-  fix: `PRAGMA busy_timeout=5000` on every connection. (P2/concurrency)
+- **SQLite concurrency:** the dashboard reads while background subprocesses write
+  the *same* DB. Mitigated by Python's default `sqlite3.connect(timeout=5.0)` (a 5s
+  busy-wait), and writes here are short — so low risk. Only a >5s write transaction
+  would surface "database is locked". Raise the `timeout=` if scrapes ever batch
+  writes. (verified: not as severe as first flagged — confirm claims, don't assume.)
 - **Recent-N-per-channel window:** monitoring fetches only the most recent
   `max_videos_per_channel` per tab; a channel that posts many Shorts could push an
   evergreen long-form out of the window. (P3 tradeoff — logged here so it's not silent.)
@@ -116,6 +117,19 @@ authority).
 ## Fix log
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Rule.**
+
+### 2026-06-03 — LLM call not hardened like the yt-dlp calls (found by review, pre-emptive)
+- **Issue:** `call_llm` (analyze/report) made a single `urlopen` with no retry; a
+  transient OpenAI 429/5xx or network blip would fail the call mid-run.
+- **Root cause:** inconsistent robustness across external-call classes — every
+  `yt-dlp` call was hardened (retry/backoff/impersonation) but the LLM call wasn't (P5).
+- **What would have caught it:** the P5 sweep — "are ALL external calls of this kind
+  hardened, or just the one that broke?" This was found by the learning-qa review, not
+  by a production failure.
+- **Fix:** `call_llm` retries with backoff on 429/5xx/network (3 attempts), raising
+  on non-retryable errors so callers' handling is unchanged.
+- **Rule:** P5 → checklist 1. A class of external call is only as reliable as its
+  weakest member.
 
 ### 2026-06-03 — Premiered/long-form video silently missing from discovery
 - **Issue:** A monitored channel's video (Neil Patel's 64-min "AEO/GEO vs SEO")

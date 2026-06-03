@@ -18,6 +18,7 @@ from the environment or ~/.hermes/.env:
 import os
 import re
 import sys
+import time
 import json
 import sqlite3
 import urllib.request
@@ -97,21 +98,40 @@ Transcript:
 """
 
 
-def call_llm(prompt, key, base, model):
+def call_llm(prompt, key, base, model, retries=3):
+    """LLM chat completion. Retries with backoff on transient errors (429/5xx,
+    network) so a momentary blip doesn't fail a whole analyze/report run —
+    consistent with the yt-dlp calls' hardening (see LEARNINGS.md P5)."""
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }).encode()
-    req = urllib.request.Request(
-        f"{base}/chat/completions", data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read())
-    content = data["choices"][0]["message"]["content"]
-    return json.loads(content)
+    last = None
+    for attempt in range(retries):
+        req = urllib.request.Request(
+            f"{base}/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+            return json.loads(data["choices"][0]["message"]["content"])
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+    if last:
+        raise last
 
 
 def load_transcript(vid, full_text):
