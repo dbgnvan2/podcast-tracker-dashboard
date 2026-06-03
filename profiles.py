@@ -69,13 +69,14 @@ DEFAULT_PROFILE = {
         "searchenginejournal": "Search Engine Journal",
         "searchengineland": "Search Engine Land",
         "LevelingUpOfficial": "Leveling Up with Eric Siu",
+        "https://www.youtube.com/channel/UCHbtzKwhxTCv2b85um7880A": "James Dooley",
     },
     "channel_bonus": {
         "neilpatel": 1.5, "SearchOffTheRecord": 1.5, "GoogleSearchCentral": 1.5,
         "SEOFOMO": 1.2, "Niche Pursuits": 1.2, "Experts on the Wire": 1.1,
         "Semantic Mastery": 1.1, "Marketing Oops": 1.0, "RustyBrick GEO": 1.2,
         "Cyrus Shepard": 1.3, "Aleyda Solis": 1.3, "Lily Ray": 1.3,
-        "Mordy Oberstein": 1.1, "Kevin Indig": 1.1,
+        "Mordy Oberstein": 1.1, "Kevin Indig": 1.1, "James Dooley": 1.3,
     },
     "keywords": [
         "generative engine optimization", "GEO", "AI overviews", "AI mode",

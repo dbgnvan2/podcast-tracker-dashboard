@@ -359,10 +359,37 @@ def parse_ymd_via_ytdlp(date_str):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+def _norm(name):
+    return (name or "").lower().replace(" ", "").replace("'", "")
+
+
+def monitored_channels(conn=None):
+    """Identifiers of channels we actively monitor: the profile's curated_channels
+    (by display name) + any channel marked curated=1 in the DB (by channel_id).
+    Authority should follow the *channel*, not how a given video was found."""
+    names = {_norm(v) for v in CURATED_CHANNELS.values()}
+    cur_ids = set()
+    if conn is not None:
+        try:
+            cur_ids = {r[0] for r in conn.execute(
+                "SELECT channel_id FROM channels WHERE curated=1 "
+                "AND channel_id IS NOT NULL AND channel_id != ''")}
+        except sqlite3.OperationalError:
+            pass
+    return names, cur_ids
+
+
+def _is_monitored(channel_name, channel_id, discovered_via, names, cur_ids):
+    return (discovered_via == "channel"
+            or _norm(channel_name) in names
+            or (channel_id and channel_id in cur_ids))
+
+
 def rescore_all(conn):
     """Recompute quality_score for every stored video using the current formula.
     Lets a scoring change take effect immediately without a full re-scrape."""
     conn.row_factory = sqlite3.Row
+    names, cur_ids = monitored_channels(conn)
     rows = conn.execute(
         "SELECT id, views, likes, comments, duration_seconds, transcript_keywords_score, "
         "channel_id, channel_name, views_per_day, discovered_via FROM videos"
@@ -373,7 +400,8 @@ def rescore_all(conn):
             r["views"] or 0, r["likes"] or 0, r["comments"] or 0,
             r["duration_seconds"] or 0, r["transcript_keywords_score"] or 0,
             r["channel_id"], r["channel_name"], r["views_per_day"] or 0,
-            is_curated=(r["discovered_via"] == "channel"),
+            is_curated=_is_monitored(r["channel_name"], r["channel_id"],
+                                     r["discovered_via"], names, cur_ids),
         )
         conn.execute("UPDATE videos SET quality_score=? WHERE id=?", (score, r["id"]))
         n += 1
@@ -648,6 +676,7 @@ def main():
           f"{MIN_DURATION_SEC//60}-{MAX_DURATION_SEC//60}min, {MIN_DAYS_OLD}+ days old): {len(enriched)}")
 
     # ── Step 3: Fetch transcripts & score (best-effort, skip if slow) ──
+    mon_names, mon_ids = monitored_channels(conn)
     for v in enriched:
         print(f"  Score: {v['title'][:60]}...", end=" ")
         transcript_text = fetch_transcript(v["id"])
@@ -665,7 +694,8 @@ def main():
             v["views"], v["likes"], v["comments"],
             v["duration"], v["kw_score"],
             v["channel_id"], v["channel_name"], v["views_per_day"],
-            is_curated=(v.get("discovered_via") == "channel"),
+            is_curated=_is_monitored(v["channel_name"], v["channel_id"],
+                                     v.get("discovered_via"), mon_names, mon_ids),
         )
 
     # ── Step 4: Sort by quality score ───────────────────────────────────
