@@ -178,6 +178,17 @@ def reconcile():
                 removed += 1
     print(f"  Removed {removed} unbacked transcript file(s).")
 
+    # 3. Curated-channel videos marked 'not_available' are suspect: YouTube blocks
+    #    (PO token / 429) are transient and were sometimes mis-recorded as "no
+    #    captions". Re-queue monitored authorities' false negatives for an honest
+    #    re-check (they have no transcript anyway).
+    requeued = conn.execute("""
+        UPDATE videos SET transcript_status = 'not_requested'
+        WHERE transcript_status = 'not_available' AND discovered_via = 'channel'
+          AND id NOT IN (SELECT video_id FROM transcripts)
+    """).rowcount
+    print(f"  Re-queued {requeued} curated 'not_available' video(s) for recheck.")
+
     conn.commit()
     conn.close()
     print("Reconcile complete.")

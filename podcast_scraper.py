@@ -164,25 +164,21 @@ def search_youtube(query, max_results=20):
     return videos
 
 
-def fetch_channel_videos(identifier, max_results=10):
-    """Pull a channel's most recent uploads directly (flat playlist).
-    `identifier` is a handle (e.g. 'neilpatel') or a full channel URL.
-    Returns video dicts tagged with `_curated=True` so downstream logic can
-    trust them (bypass view/age gates). Fault-tolerant: returns [] on failure."""
-    if identifier.startswith("http"):
-        url = identifier.rstrip("/")
-        if not url.endswith("/videos"):
-            url += "/videos"
-    else:
-        url = f"https://www.youtube.com/@{identifier}/videos"
+# Channel tabs to scan. Long-form interviews/podcasts are often premiered, so
+# they live on /streams (and sometimes /podcasts), NOT the main /videos grid —
+# scanning only /videos silently misses an expert's best long-form content.
+CHANNEL_TABS = ("/videos", "/streams", "/podcasts")
+
+
+def _fetch_channel_tab(base, tab, max_results):
     cmd = [
         YT_DLP, "--flat-playlist", "--dump-json",
         "--playlist-end", str(max_results),
         "--extractor-args", "youtube:player_client=android",
         "--impersonate", "chrome", "--no-warnings",
-        url,
+        base + tab,
     ]
-    videos = []
+    out = []
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         for line in result.stdout.strip().split("\n"):
@@ -194,9 +190,29 @@ def fetch_channel_videos(identifier, max_results=10):
             except json.JSONDecodeError:
                 continue
             data["_curated"] = True
-            videos.append(data)
+            out.append(data)
     except (subprocess.TimeoutExpired, Exception):
         pass
+    return out
+
+
+def fetch_channel_videos(identifier, max_results=10):
+    """Pull a channel's recent uploads from /videos, /streams and /podcasts.
+    `identifier` is a handle (e.g. 'neilpatel') or a full channel URL.
+    Returns video dicts tagged with `_curated=True` (downstream trusts them and
+    bypasses view/age gates). Fault-tolerant: returns [] on failure."""
+    base = identifier.rstrip("/") if identifier.startswith("http") else f"https://www.youtube.com/@{identifier}"
+    for tab in CHANNEL_TABS:
+        if base.endswith(tab):
+            base = base[: -len(tab)]
+            break
+    seen, videos = set(), []
+    for tab in CHANNEL_TABS:
+        for v in _fetch_channel_tab(base, tab, max_results):
+            vid = v.get("id")
+            if vid and vid not in seen:
+                seen.add(vid)
+                videos.append(v)
     return videos
 
 
@@ -260,10 +276,30 @@ def calculate_keyword_density(transcript_text, video_title, channel_name=""):
     return round(normalized, 3)
 
 
-def calculate_quality_score(views, likes, comments, duration, kw_score, channel_id, channel_name, views_per_day=0):
-    """Composite quality score. `views_per_day` adds a velocity signal so that
-    a video doing 14k views in 3 days outranks 14k accumulated over months —
-    the key signal for catching breakout/emerging content early."""
+def channel_authority(channel_id, channel_name, is_curated):
+    """0–1 authority signal for the SOURCE. Known experts should rank high
+    regardless of how keyword-dense their titles are. Monitored (curated)
+    channels get a strong floor; channels in the bonus list get a tier-scaled
+    score; everyone else gets 0."""
+    ch_key = (channel_name or "Unknown").lower().replace(" ", "").replace("'", "")
+    bonus = 1.0
+    for key, b in CHANNEL_BONUS.items():
+        if key.lower().replace(" ", "") in ch_key or (channel_id and channel_id.lower() in ch_key):
+            bonus = b
+            break
+    if is_curated:
+        return min(0.7 + (bonus - 1.0), 1.0)   # monitored authority: floor 0.7 + tier
+    if bonus > 1.0:
+        return min(bonus - 1.0, 1.0)            # known but not monitored
+    return 0.0
+
+
+def calculate_quality_score(views, likes, comments, duration, kw_score, channel_id,
+                            channel_name, views_per_day=0, is_curated=False):
+    """Composite quality score. Authority (known expertise) is a strong, additive
+    term so genuine experts outrank keyword-stuffed titles; `views_per_day` adds a
+    velocity signal so breakouts surface early. Title-only keyword density is
+    down-weighted (it's gameable and transcripts aren't available at scrape time)."""
     if views <= 0:
         return 0.0
 
@@ -289,25 +325,21 @@ def calculate_quality_score(views, likes, comments, duration, kw_score, channel_
     else:
         duration_score = 0.2
 
-    # channel bonus
-    channel_lookup = (channel_name or "Unknown").lower().replace(" ", "").replace("'", "")
-    ch_bonus = 1.0
-    for key, bonus in CHANNEL_BONUS.items():
-        if key.lower() in channel_lookup or (channel_id and channel_id.lower() in channel_lookup):
-            ch_bonus = bonus
-            break
+    # authority: known expertise of the source (strong, additive)
+    authority = channel_authority(channel_id, channel_name, is_curated)
 
     # velocity: views/day since publish, saturating at ~3000/day
     velocity_score = min((views_per_day or 0) / 3000.0, 1.0)
 
     score = (
-        views_score * 0.30 +
-        likes_score * 0.15 +
-        comments_score * 0.10 +
-        duration_score * 0.10 +
-        kw_score * 0.25 +
-        velocity_score * 0.10
-    ) * ch_bonus
+        authority * 0.30 +        # known expertise dominates — experts rank high
+        views_score * 0.25 +
+        velocity_score * 0.10 +
+        kw_score * 0.15 +         # title-only at scrape time → down-weighted
+        likes_score * 0.10 +
+        duration_score * 0.05 +
+        comments_score * 0.05
+    )
 
     return round(score, 3)
 
@@ -327,6 +359,28 @@ def parse_ymd_via_ytdlp(date_str):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+def rescore_all(conn):
+    """Recompute quality_score for every stored video using the current formula.
+    Lets a scoring change take effect immediately without a full re-scrape."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, views, likes, comments, duration_seconds, transcript_keywords_score, "
+        "channel_id, channel_name, views_per_day, discovered_via FROM videos"
+    ).fetchall()
+    n = 0
+    for r in rows:
+        score = calculate_quality_score(
+            r["views"] or 0, r["likes"] or 0, r["comments"] or 0,
+            r["duration_seconds"] or 0, r["transcript_keywords_score"] or 0,
+            r["channel_id"], r["channel_name"], r["views_per_day"] or 0,
+            is_curated=(r["discovered_via"] == "channel"),
+        )
+        conn.execute("UPDATE videos SET quality_score=? WHERE id=?", (score, r["id"]))
+        n += 1
+    conn.commit()
+    return n
+
+
 def days_since(date_str):
     """Whole days from a YYYY-MM-DD date to now (>=1 to avoid div-by-zero)."""
     try:
@@ -610,7 +664,8 @@ def main():
         v["quality_score"] = calculate_quality_score(
             v["views"], v["likes"], v["comments"],
             v["duration"], v["kw_score"],
-            v["channel_id"], v["channel_name"], v["views_per_day"]
+            v["channel_id"], v["channel_name"], v["views_per_day"],
+            is_curated=(v.get("discovered_via") == "channel"),
         )
 
     # ── Step 4: Sort by quality score ───────────────────────────────────
@@ -739,7 +794,12 @@ if __name__ == "__main__":
     if prof_name:
         apply_profile(prof_name)
 
-    if "--test" in sys.argv:
+    if "--rescore" in sys.argv:
+        c = init_db()
+        n = rescore_all(c)
+        c.close()
+        print(f"Re-scored {n} videos with the current formula.")
+    elif "--test" in sys.argv:
         summary = dry_run()
         if "--json" in sys.argv:
             print(json.dumps(summary))

@@ -24,7 +24,7 @@ import profiles
 SCHEMA = """
 CREATE TABLE videos (id TEXT PRIMARY KEY, channel_name TEXT, video_title TEXT,
     url TEXT, views INTEGER, quality_score REAL, transcript_status TEXT,
-    transcribed_date TEXT);
+    transcribed_date TEXT, discovered_via TEXT DEFAULT 'search');
 CREATE TABLE transcripts (video_id TEXT PRIMARY KEY, file_path TEXT,
     full_text TEXT, word_count INTEGER);
 CREATE TABLE key_points (id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT,
@@ -81,7 +81,7 @@ class TestAnalyze(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         long_text = "entity SEO matters for AI overviews and knowledge graphs. " * 20
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01','search')")
         conn.execute("INSERT INTO transcripts VALUES ('vid1','f',?,?)", (long_text, len(long_text.split())))
         conn.commit(); conn.close()
         analyze_transcripts.DB_PATH = Path(self.db)
@@ -114,7 +114,7 @@ class TestDigest(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01','search')")
         conn.execute("INSERT INTO ai_analysis VALUES ('vid1','[\"Ahrefs\"]','[\"AI Overviews\"]','Quote here.','2026-06-01')")
         conn.execute("INSERT INTO key_points VALUES (1,'vid1',30,'Do entity SEO','strategy')")
         conn.commit(); conn.close()
@@ -135,8 +135,8 @@ class TestReconcile(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         # fake obtained (no transcript row) + a real one
-        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01')")
-        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01')")
+        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01','search')")
+        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01','search')")
         conn.execute("INSERT INTO transcripts VALUES ('real','f','text',1)")
         conn.commit(); conn.close()
         Path(self.tmp, "stub.txt").write_text("junk")        # unbacked -> removed
@@ -180,6 +180,19 @@ class TestEmergingDiscovery(unittest.TestCase):
         lo = podcast_scraper.calculate_quality_score(5000,100,10,1800,0.5,"x","Unknown",views_per_day=10)
         self.assertGreater(hi, lo)
 
+    def test_authority_beats_keyword_stuffing(self):
+        # A monitored expert with a plain (low-keyword) title must outrank a
+        # non-curated channel with a keyword-stuffed title and even more views.
+        expert = podcast_scraper.calculate_quality_score(
+            14000, 300, 30, 900, 0.0, "UCx", "Neil Patel", views_per_day=200, is_curated=True)
+        stuffer = podcast_scraper.calculate_quality_score(
+            20000, 300, 30, 900, 1.0, "UCy", "Random SEO Guy", views_per_day=50, is_curated=False)
+        self.assertGreater(expert, stuffer)
+        # curated authority floor > non-curated for the same channel
+        self.assertGreater(
+            podcast_scraper.channel_authority("UCx", "Neil Patel", True),
+            podcast_scraper.channel_authority("UCx", "Neil Patel", False))
+
     def test_suggested_and_autocurate(self):
         self._add("a1","UCnew","Newbie","0.65","search")
         self._add("a2","UCnew","Newbie","0.62","search")   # 2 strong -> suggested
@@ -209,8 +222,8 @@ class TestReport(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','u',9,0.9,'obtained','2026-06-02')")
-        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','u',9,0.8,'obtained','2026-06-01')")
+        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','u',9,0.9,'obtained','2026-06-02','search')")
+        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','u',9,0.8,'obtained','2026-06-01','search')")
         conn.execute("INSERT INTO transcripts VALUES ('vidA','f','full text about entity SEO and AI overviews here.',8)")
         conn.execute("INSERT INTO transcripts VALUES ('vidB','f','full text about knowledge graphs and citations here.',8)")
         conn.execute("INSERT INTO ai_analysis VALUES ('vidA','[]','[]','Quote A.','2026-06-02')")

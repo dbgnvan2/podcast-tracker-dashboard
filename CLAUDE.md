@@ -107,7 +107,10 @@ discover (scrape) → score → mark for transcription → fetch verified transc
 
 ### Discovery model (two complementary arms — keep BOTH)
 - **Keyword search** (`SEARCH_QUERIES`) — the wide net that finds *new/unknown* channels. Do **not** put "podcast" in queries (it filters out educational creators like Neil Patel and pulls in off-topic literal podcasts).
-- **Channel monitoring** (`CURATED_CHANNELS` + DB `channels` where `curated=1`) — guarantees known authorities. Curated videos bypass the view/age gates.
+- **Channel monitoring** (`CURATED_CHANNELS` + DB `channels` where `curated=1`) — guarantees known authorities. `fetch_channel_videos()` scans **`/videos` + `/streams` + `/podcasts`** (long-form interviews/podcasts are often premiered and live on `/streams`, not the main grid — scanning only `/videos` silently misses an expert's best content). Curated videos bypass the view/age gates.
+
+### Scoring (`calculate_quality_score`) — authority-weighted
+Weights: **authority 0.30** (known expertise — `channel_authority()`: monitored channels get a 0.7 floor + bonus tier, channels in `channel_bonus` get a tier-scaled score), views 0.25, velocity 0.10, **kw_score 0.15** (title-only at scrape time, so deliberately down-weighted — it's gameable; James-Dooley-style keyword-stuffed titles must not outrank genuine experts), likes 0.10, duration 0.05, comments 0.05. Re-score the whole DB after a formula change with `python3 podcast_scraper.py --rescore` (no re-scrape needed).
 - **Emerging detection** — a video from a `channel_id` never catalogued before is flagged `is_new_channel`; surfaced in the Discovery tab.
 - **Velocity** — `views_per_day` feeds a 0.10-weight term in `quality_score` and powers the Candidates "🔥 Trending" sort, so breakouts surface early.
 - **Auto-promotion** — `sync_channels()` flags a non-curated channel `suggested` once it has ≥2 videos scoring ≥0.6; the user promotes it (→ monitored) from the Discovery tab.
@@ -159,8 +162,12 @@ python3 podcast_scraper.py --profile NAME --test   # preview a profile's reach (
 # One-time / after schema edits: create or migrate the active profile's DB
 python3 dashboard_server.py --migrate
 
-# Make transcript_status honest (reset fake 'obtained', drop stub transcript files)
+# Make transcript_status honest (reset fake 'obtained', drop stub files, re-queue
+# curated channels falsely marked 'not_available' by a transient block)
 python3 dashboard_server.py --reconcile
+
+# Re-score every video with the current formula (after a scoring change)
+python3 podcast_scraper.py --rescore
 
 # Discover + score new videos (writes to the videos table)
 python3 podcast_scraper.py
