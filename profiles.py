@@ -29,12 +29,13 @@ LEGACY_DB = HERMES / "podcast_tracker.db"  # the original SEO/GEO dataset
 
 # Filled-in defaults for any field a profile omits.
 DEFAULTS = {
-    "min_views": 2000,
+    "min_views": 1000,
     "min_duration_sec": 300,
     "max_duration_sec": 5400,
     "min_days_old": 7,
+    "min_publish_date": "2025-01-01",   # include evergreen content, not just the current year
     "max_videos_per_query": 20,
-    "max_videos_per_channel": 10,
+    "max_videos_per_channel": 15,
     "channel_bonus": {},
     "analysis_focus": "the topic of this investigation",
     "digest_title": "Weekly Digest",
@@ -58,6 +59,11 @@ DEFAULT_PROFILE = {
         "how to get cited by AI search",
         "SEO to drive website traffic 2026",
         "AI search visibility for brands",
+        "AEO vs GEO vs SEO",
+        "GEO vs SEO what is the difference",
+        "AI search optimization explained",
+        "what is answer engine optimization",
+        "is GEO just rebranded SEO",
     ],
     "curated_channels": {
         "neilpatel": "Neil Patel",
@@ -89,12 +95,13 @@ DEFAULT_PROFILE = {
         "AI visibility", "organic traffic", "website traffic", "drive traffic",
         "rank on Google", "search rankings", "llms.txt",
     ],
-    "min_views": 2000,
+    "min_views": 1000,
     "min_duration_sec": 300,
     "max_duration_sec": 5400,
     "min_days_old": 7,
+    "min_publish_date": "2025-01-01",
     "max_videos_per_query": 20,
-    "max_videos_per_channel": 10,
+    "max_videos_per_channel": 15,
 }
 
 

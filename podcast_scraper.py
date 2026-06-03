@@ -21,7 +21,7 @@ import profiles
 # apply_profile() (called below + on --profile) populates these module globals.
 DB_PATH = None
 SEARCH_QUERIES = CURATED_CHANNELS = CHANNEL_BONUS = KEYWORDS = None
-MIN_VIEWS = MIN_DURATION_SEC = MAX_DURATION_SEC = MIN_DAYS_OLD = None
+MIN_VIEWS = MIN_DURATION_SEC = MAX_DURATION_SEC = MIN_DAYS_OLD = MIN_PUBLISH_DATE = None
 MAX_VIDEOS_PER_QUERY = MAX_VIDEOS_PER_CHANNEL = MAX_RESULTS_TO_RETURN = None
 ANALYSIS_FOCUS = DIGEST_TITLE = ACTIVE_PROFILE = None
 
@@ -29,7 +29,7 @@ ANALYSIS_FOCUS = DIGEST_TITLE = ACTIVE_PROFILE = None
 def apply_profile(name=None):
     """Load an investigation profile into the module globals used throughout."""
     global DB_PATH, SEARCH_QUERIES, CURATED_CHANNELS, CHANNEL_BONUS, KEYWORDS
-    global MIN_VIEWS, MIN_DURATION_SEC, MAX_DURATION_SEC, MIN_DAYS_OLD
+    global MIN_VIEWS, MIN_DURATION_SEC, MAX_DURATION_SEC, MIN_DAYS_OLD, MIN_PUBLISH_DATE
     global MAX_VIDEOS_PER_QUERY, MAX_VIDEOS_PER_CHANNEL, MAX_RESULTS_TO_RETURN
     global ANALYSIS_FOCUS, DIGEST_TITLE, ACTIVE_PROFILE
     p = profiles.load(name)
@@ -44,6 +44,7 @@ def apply_profile(name=None):
     MIN_DURATION_SEC = p["min_duration_sec"]
     MAX_DURATION_SEC = p["max_duration_sec"]
     MIN_DAYS_OLD = p["min_days_old"]
+    MIN_PUBLISH_DATE = p.get("min_publish_date", "2025-01-01")
     MAX_VIDEOS_PER_QUERY = p["max_videos_per_query"]
     MAX_VIDEOS_PER_CHANNEL = p["max_videos_per_channel"]
     MAX_RESULTS_TO_RETURN = 20
@@ -638,8 +639,8 @@ def main():
             continue
         if upload_date > datetime.now(timezone.utc).strftime("%Y-%m-%d"):
             continue  # future dates
-        if upload_date < "2026-01-01":
-            continue  # only 2026+
+        if upload_date < MIN_PUBLISH_DATE:
+            continue  # profile's publish-date floor (default 2025-01-01)
 
         duration = details.get("duration", 0)
         views = details.get("view_count", 0) or 0

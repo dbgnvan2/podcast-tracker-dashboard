@@ -12,7 +12,12 @@
     "brand entity SEO knowledge graph",
     "how to get cited by AI search",
     "SEO to drive website traffic 2026",
-    "AI search visibility for brands"
+    "AI search visibility for brands",
+    "AEO vs GEO vs SEO",
+    "GEO vs SEO what is the difference",
+    "AI search optimization explained",
+    "what is answer engine optimization",
+    "is GEO just rebranded SEO"
   ],
   "curated_channels": {
     "neilpatel": "Neil Patel",
@@ -84,10 +89,11 @@
     "search rankings",
     "llms.txt"
   ],
-  "min_views": 2000,
+  "min_views": 1000,
   "min_duration_sec": 300,
   "max_duration_sec": 5400,
   "min_days_old": 7,
   "max_videos_per_query": 20,
-  "max_videos_per_channel": 10
+  "max_videos_per_channel": 15,
+  "min_publish_date": "2025-01-01"
 }
