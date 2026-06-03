@@ -197,7 +197,7 @@ def build_report(n=8):
         return (f"# {TITLE} — {today}\n\n_No analyzed transcripts yet. Transcribe and "
                 "analyze some videos first (Intelligence tab), then generate a report._\n"), today
 
-    key, base, model = A.llm_config()
+    key, base, model = A.synth_config()  # synthesis role (stronger model)
     if not key:
         return (f"# {TITLE} — {today}\n\n_No LLM API key configured "
                 "(set OPENAI_API_KEY or PODCAST_LLM_KEY)._\n"), today

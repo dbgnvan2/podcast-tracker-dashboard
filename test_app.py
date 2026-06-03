@@ -272,6 +272,43 @@ class TestReport(unittest.TestCase):
         self.assertIn("**S2**", md)
 
 
+class TestMultiSource(unittest.TestCase):
+    def test_scholarly_dedup_and_authority(self):
+        from sources import scholarly
+        recs = [
+            {"title": "Paper A", "abstractText": "<i>abstract</i> A about lactate",
+             "doi": "10.1/AAA", "citedByCount": 5, "firstPublicationDate": "2025-03-01",
+             "authorString": "X et al", "source": "MED", "id": "1",
+             "journalInfo": {"journal": {"title": "J Sport"}}},
+            {"title": "Paper A (preprint)", "abstractText": "abstract A", "doi": "10.1/aaa",
+             "citedByCount": 0, "firstPublicationDate": "2025-01-01", "source": "PPR", "id": "2"},
+            {"title": "Paper B", "abstractText": "abstract B", "doi": "10.2/BBB",
+             "citedByCount": 0, "firstPublicationDate": "2025-05-01", "source": "MED", "id": "3"},
+        ]
+        scholarly._europepmc_search = lambda q, per=25, retries=3: recs
+        docs = scholarly.ScholarlyAdapter().discover({"queries": ["lactate"], "since_date": "2024-01-01"})
+        # DOI dedup (case-insensitive) collapses the two A records → 2 unique docs
+        self.assertEqual(len({d["id"] for d in docs}), 2)
+        a = [d for d in docs if d["id"] == "10.1/aaa"][0]
+        self.assertGreater(a["authority"], 0)          # 5 citations → some authority
+        self.assertEqual(a["raw"]["citations"], 5)     # kept the higher-cited record
+        self.assertNotIn("<i>", a["text"])             # html stripped
+
+    def test_briefing_citation_validation(self):
+        import spike_multisource as sp
+        sources = [{"n": 1, "id": "10.1/A", "title": "A", "byline": "X", "url": "https://doi.org/10.1/A",
+                    "date": "2025-01-01", "kind": "literature", "text": "t", "meta": "5 citations"},
+                   {"n": 2, "id": "vidX", "title": "Vid", "byline": "Chan", "url": "https://youtube.com/watch?v=vidX",
+                    "date": "2026-01-01", "kind": "youtube", "text": "t", "meta": "Chan"}]
+        report = {"overview": "ov", "key_ideas": [
+            {"title": "Idea", "summary": "s", "why_it_matters": "w", "how_to_apply": ["do x"],
+             "details": "d", "sources": [1, 2, 9]}]}  # 9 is invalid
+        md = sp.render(report, sources, "topic", "2026-06-03")
+        self.assertIn("[S1](https://doi.org/10.1/A)", md)              # paper citation
+        self.assertIn("[S2](https://youtube.com/watch?v=vidX)", md)   # video citation (cross-source)
+        self.assertNotIn("[S9]", md)                                  # invalid dropped
+
+
 class TestProfiles(unittest.TestCase):
     def setUp(self):
         # Redirect all profile storage to a temp area (never touch ~/.hermes).

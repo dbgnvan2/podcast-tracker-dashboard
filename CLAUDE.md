@@ -44,6 +44,8 @@ podcast-tracker-dashboard/
 ├── analyze_transcripts.py      # AI Intelligence: transcript → key_points + ai_analysis (LLM)
 ├── generate_digest.py          # Weekly "best of" markdown digest from analyzed videos
 ├── generate_report.py          # Advisor report: factual synthesis of last N transcripts, cited to sources
+├── sources/                    # Source-adapter seam (DESIGN-multisource.md): base.py + scholarly.py (EuropePMC)
+├── spike_multisource.py        # Phase-1 spike: cited briefing across sources (papers now; video docs slot in identically)
 ├── overnight_pipeline.py       # Patient runner: fetch → analyze → digest, loops past 429 cooldown
 ├── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + --migrate/--reconcile
 ├── run.sh                      # Launch dashboard + open browser (GUI-first entry point)

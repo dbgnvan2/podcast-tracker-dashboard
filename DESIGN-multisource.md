@@ -255,14 +255,19 @@ table (or reuse `channels` with a `kind` column = `youtube_channel | author | ve
 
 ---
 
-## 12. Open decisions (need your call)
+## 12. Decisions
 
-- **One engine vs. import.** Recommended: generalize *this* repo into the engine and
-  import biorx's API clients as the `scholarly` adapter (keeps biorx's hard-won
-  multi-source/dedup/OA code, reuses this repo's profiles/report/dashboard). Alt: keep
-  biorx standalone and have it POST documents into this engine's DB.
-- **LLM backend per stage.** Local Qwen (biorx) for bulk abstract analysis vs. a
-  stronger hosted model for the synthesis report — make it a per-stage profile setting?
-- **DOI dedup ownership.** Reuse biorx's Crossref/Unpaywall dedup in the adapter, or
-  add a normalization pass in the engine. (Same paper as preprint + published.)
-- **Rename `videos`→`documents`?** Cosmetic; defer unless it aids clarity.
+- **[DECIDED] One engine.** *This* repo is the engine; scholarly sources are
+  adapters. Phase-1 ships a self-contained EuropePMC adapter in-repo (stdlib) as the
+  seam; production wraps biorx's broader multi-source/dedup/OA clients behind the
+  same `SourceAdapter` interface.
+- **[DECIDED] LLM per stage.** Two roles, configurable: a **bulk** model (cheap/local,
+  e.g. Ollama Qwen) for per-item abstract/transcript analysis, and a **synthesis**
+  model (stronger/hosted) for the digest + advisor report. Env/profile:
+  `PODCAST_LLM_MODEL` (bulk default) and `PODCAST_SYNTH_MODEL` (falls back to bulk).
+  Defaults preserve current behavior.
+- **[DECIDED] DOI dedup in the adapter.** The scholarly adapter owns dedup: normalize
+  DOIs, collapse duplicates, prefer the published version over the preprint when both
+  appear. Cross-modality (video vs paper) never dedups.
+- **[DEFERRED] Rename `videos`→`documents`.** Cosmetic; additive `source_type` columns
+  make the table source-aware without a rename.

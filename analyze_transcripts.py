@@ -47,10 +47,19 @@ def load_env():
 
 
 def llm_config():
+    """BULK role — cheap/local model for per-item abstract/transcript analysis."""
     load_env()
     key = os.environ.get("PODCAST_LLM_KEY") or os.environ.get("OPENAI_API_KEY")
     base = os.environ.get("PODCAST_LLM_BASE", "https://api.openai.com/v1").rstrip("/")
     model = os.environ.get("PODCAST_LLM_MODEL", "gpt-4o-mini")
+    return key, base, model
+
+
+def synth_config():
+    """SYNTHESIS role — stronger model for digests/advisor reports. Falls back to
+    the bulk model. (See DESIGN-multisource.md decision: LLM per stage.)"""
+    key, base, model = llm_config()
+    model = os.environ.get("PODCAST_SYNTH_MODEL", model)
     return key, base, model
 
 
