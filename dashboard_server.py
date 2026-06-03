@@ -211,16 +211,17 @@ HTML = """
     <title>Podcast Tracker Dashboard</title>
     <style>
         :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --text-main: #f8fafc;
-            --text-dim: #94a3b8;
-            --accent: #38bdf8;
-            --accent-hover: #7dd3fc;
-            --border: #334155;
-            --success: #22c55e;
-            --warning: #f59e0b;
-            --error: #ef4444;
+            --bg-color: #f7f8fa;
+            --card-bg: #ffffff;
+            --text-main: #1a1d21;
+            --text-dim: #5b6470;
+            --accent: #2563eb;
+            --accent-hover: #1d4ed8;
+            --border: #e2e6ea;
+            --row-alt: #f1f3f5;
+            --success: #16a34a;
+            --warning: #d97706;
+            --error: #dc2626;
         }
         * { box-sizing: border-box; }
         body {
@@ -239,7 +240,7 @@ HTML = """
             font-size: 1rem; border-radius: 6px; transition: all 0.2s;
         }
         .tab-btn:hover { background: var(--card-bg); color: var(--text-main); }
-        .tab-btn.active { background: var(--accent); color: var(--bg-color); font-weight: 600; }
+        .tab-btn.active { background: var(--accent); color: #fff; font-weight: 600; }
         
         .tab-content { display: none; }
         .tab-content.active { display: block; }
@@ -250,10 +251,10 @@ HTML = """
             background: var(--card-bg); color: var(--text-main); font-size: 1rem;
         }
         
-        table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; }
-        th { text-align: left; padding: 12px 15px; background: #2d3748; color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+        th { text-align: left; padding: 12px 15px; background: var(--row-alt); color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
         td { padding: 12px 15px; border-bottom: 1px solid var(--border); }
-        tr:hover td { background: #2d3748; }
+        tr:hover td { background: var(--row-alt); }
         
         .score { font-weight: bold; color: var(--accent); }
         .channel { color: var(--text-dim); font-size: 0.9rem; }
@@ -267,7 +268,7 @@ HTML = """
         }
         .btn-mark { background: var(--success); color: white; }
         .btn-unreq { background: var(--error); color: white; }
-        .btn-primary { background: var(--accent); color: var(--bg-color); padding: 8px 16px; font-size: 0.9rem; }
+        .btn-primary { background: var(--accent); color: #fff; padding: 8px 16px; font-size: 0.9rem; }
         .btn-view { background: var(--border); color: var(--text-main); }
         .btn:hover { opacity: 0.8; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -291,12 +292,25 @@ HTML = """
         .intel-card h3 { margin: 0 0 6px; font-size: 1.05rem; }
         .intel-meta { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 12px; }
         .intel-quote { border-left: 3px solid var(--accent); padding: 6px 14px; margin: 10px 0; color: var(--text-main); font-style: italic; }
-        .chip { display: inline-block; background: #2d3748; color: var(--accent-hover); border-radius: 12px; padding: 3px 10px; margin: 3px 4px 3px 0; font-size: 0.78rem; }
+        .chip { display: inline-block; background: var(--row-alt); color: var(--accent-hover); border: 1px solid var(--border); border-radius: 12px; padding: 3px 10px; margin: 3px 4px 3px 0; font-size: 0.78rem; }
         .chip-geo { color: var(--success); }
         .kp-list { list-style: none; padding: 0; margin: 10px 0 0; }
         .kp-list li { padding: 5px 0; border-top: 1px solid var(--border); font-size: 0.9rem; }
         .kp-time { font-family: monospace; color: var(--accent); margin-right: 8px; }
         .kp-cat { color: var(--text-dim); font-size: 0.78rem; }
+
+        /* Print / Save-as-PDF: show only the active tab's content, black on white. */
+        @media print {
+            body { background: #fff; color: #000; padding: 0; }
+            header, .tabs, .btn, .search-container, .modal-overlay, #loading,
+            #report-n, [id$="-status"], #last-updated, #profile-select,
+            #table-emerging, #suggested-channels, #suggested-terms { display: none !important; }
+            .tab-content:not(.active) { display: none !important; }
+            .container { max-width: 100%; margin: 0; }
+            .chart-section, .intel-card, table { border: 1px solid #ccc !important; box-shadow: none !important; }
+            #report-content, #digest-content { white-space: normal; line-height: 1.5; }
+            a { color: #000; text-decoration: underline; }
+        }
 
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .stat-card { background: var(--card-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border); }
@@ -388,6 +402,7 @@ HTML = """
         <div id="digest" class="tab-content">
             <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
                 <button class="btn btn-primary" onclick="generateDigest()">📰 Generate Weekly Digest</button>
+                <button class="btn btn-view" onclick="window.print()">🖨 Save as PDF</button>
                 <span id="digest-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
             </div>
             <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
@@ -399,6 +414,7 @@ HTML = """
                 <input id="report-n" type="number" value="8" min="2" max="12" style="width:60px;background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;">
                 <span style="color:var(--text-dim);font-size:0.85rem">transcripts</span>
                 <button class="btn btn-primary" onclick="generateReport()">📋 Generate Advisor Report</button>
+                <button class="btn btn-view" onclick="window.print()">🖨 Save as PDF</button>
                 <span id="report-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
             </div>
             <div class="chart-section" id="report-content" style="white-space: pre-wrap; line-height: 1.65;"></div>
