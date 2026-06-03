@@ -42,6 +42,7 @@ podcast-tracker-dashboard/
 ├── fetch_transcripts.py        # Drain 'requested' queue → yt-dlp subs → transcripts (+segments)
 ├── analyze_transcripts.py      # AI Intelligence: transcript → key_points + ai_analysis (LLM)
 ├── generate_digest.py          # Weekly "best of" markdown digest from analyzed videos
+├── generate_report.py          # Advisor report: factual synthesis of last N transcripts, cited to sources
 ├── overnight_pipeline.py       # Patient runner: fetch → analyze → digest, loops past 429 cooldown
 ├── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + --migrate/--reconcile
 ├── run.sh                      # Launch dashboard + open browser (GUI-first entry point)
@@ -167,6 +168,9 @@ python3 analyze_transcripts.py            # add --force to re-analyze, --id=VIDE
 # Build the weekly "best of" digest
 python3 generate_digest.py --days=7
 
+# Build an advisor report (factual synthesis of the last N transcripts, cited)
+python3 generate_report.py --n=8
+
 # Patient overnight runner: fetch → analyze → digest, looping past 429 cooldown
 python3 overnight_pipeline.py
 
@@ -190,7 +194,9 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | GET | `/api/stats` | Totals, per-status counts, top channels |
 | GET | `/api/transcript/{id}` | Verified `full_text` + word count for the Transcribed-tab "View" modal |
 | GET | `/api/intelligence` | Analyzed videos with `seo_entities`, `geo_signals`, `best_quote`, `key_points` |
-| GET | `/api/digest` | Latest digest markdown (`~/.hermes/digests/latest.md`) |
+| GET | `/api/digest` | Latest digest markdown (per active profile) |
+| GET | `/api/report` | Latest advisor report markdown (per active profile) |
+| POST | `/api/generate_report` | `{n}` → background-launch `generate_report.py --n=N` |
 | GET | `/api/discovery` | Emerging videos (new channels), suggested channels, suggested search terms |
 | POST | `/api/request_transcribe` | `{id}` → set status `requested` |
 | POST | `/api/unrequest` | `{id}` → set status `not_requested` |

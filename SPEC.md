@@ -196,3 +196,16 @@ The tool is now **topic-agnostic**. All search criteria are externalized into sw
 - **All scripts refactored** — `podcast_scraper.py` (criteria + `--profile` + `--test` dry-run), `fetch_transcripts.py`, `analyze_transcripts.py` (prompt framed by `analysis_focus`), `generate_digest.py` (per-profile dir + title) read the active profile. The dashboard refreshes `DB_PATH` per request, so switching is live without a restart.
 - **Dashboard** — header profile dropdown (live switch), "+ New" investigation modal (queries/channels/keywords/focus + **Test** preview + **Create & switch**). Endpoints: `/api/profiles`, `/api/set_profile`, `/api/create_profile`, `/api/test_profile`. `migrate(db)` self-creates a fresh profile's schema.
 - **Tests** — 12 total (added seed/active, create-switch-isolation, defaults). All pass.
+
+---
+
+## 13. v1.4 status — Advisor Report (shipped 2026-06-02)
+
+A new cross-transcript deliverable: a factual, educational **advisor report** synthesized from the last N transcripts, led by an **Executive Key Ideas** section where every idea is cited to its originating source.
+
+- **`generate_report.py`** — selects the last N analyzed transcripts, feeds the LLM each source's extracted key points (timestamped), best quote, and a transcript excerpt — all already grounded in real transcripts (Working Rule 0). The model must attribute every idea/paragraph to a supplied source number; `render()` validates those numbers against the real source list and drops any out-of-range citation, so citations can never point at something invented. Deep-links each citation to the source video at a representative timestamp. Writes to `~/.hermes/reports/<profile>/`.
+- **Report structure** — overview → Executive Key Ideas (each cited) → thematic sections (each paragraph cited) → Sources list.
+- **Dashboard "Report" tab** — N selector + "Generate Advisor Report" button; rendered as HTML (clickable citations) via a small markdown renderer that also upgraded the Digest tab. Endpoints `/api/report`, `/api/generate_report`.
+- **Profile-aware** — framed by `analysis_focus`, per-profile reports dir.
+- **Validated on real data** — produced a 5-source SEO report with 8 cited Executive Key Ideas, all citations resolving to the real James Dooley videos.
+- **Tests** — 13 total (added report citation-integrity test: valid sources deep-link, invalid source numbers are dropped). All pass.

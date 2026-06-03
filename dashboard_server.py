@@ -19,6 +19,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
 ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
 DIGEST_SCRIPT = os.path.join(SCRIPT_DIR, "generate_digest.py")
+REPORT_SCRIPT = os.path.join(SCRIPT_DIR, "generate_report.py")
 SCRAPER_SCRIPT = os.path.join(SCRIPT_DIR, "podcast_scraper.py")
 
 
@@ -312,6 +313,7 @@ HTML = """
             <button class="tab-btn" onclick="showTab('transcribed', this)">Transcribed</button>
             <button class="tab-btn" onclick="showTab('intelligence', this)">Intelligence</button>
             <button class="tab-btn" onclick="showTab('digest', this)">Digest</button>
+            <button class="tab-btn" onclick="showTab('report', this)">Report</button>
             <button class="tab-btn" onclick="showTab('discovery', this)">Discovery</button>
             <button class="tab-btn" onclick="showTab('stats', this)">Stats</button>
         </div>
@@ -368,6 +370,17 @@ HTML = """
                 <span id="digest-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
             </div>
             <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
+        </div>
+
+        <div id="report" class="tab-content">
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
+                <span style="color:var(--text-dim);font-size:0.85rem">Last</span>
+                <input id="report-n" type="number" value="8" min="2" max="12" style="width:60px;background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;">
+                <span style="color:var(--text-dim);font-size:0.85rem">transcripts</span>
+                <button class="btn btn-primary" onclick="generateReport()">📋 Generate Advisor Report</button>
+                <span id="report-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
+            </div>
+            <div class="chart-section" id="report-content" style="white-space: pre-wrap; line-height: 1.65;"></div>
         </div>
 
         <div id="discovery" class="tab-content">
@@ -773,16 +786,52 @@ HTML = """
             } catch (err) { s.innerText = 'Failed: ' + err; }
         }
 
+        function renderMd(md) {
+            return (md || '')
+                .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                .replace(/^### (.*)$/gm,'<h4 style="margin:12px 0 4px">$1</h4>')
+                .replace(/^## (.*)$/gm,'<h3 style="margin:16px 0 6px;color:var(--accent)">$1</h3>')
+                .replace(/^# (.*)$/gm,'<h2 style="margin:0 0 8px">$1</h2>')
+                .replace(/^&gt; (.*)$/gm,'<blockquote style="border-left:3px solid var(--accent);margin:6px 0;padding:4px 12px;color:var(--text-dim)">$1</blockquote>')
+                .replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>')
+                .replace(/\\[([^\\]]+)\\]\\((https?:[^)]+)\\)/g,'<a href="$2" target="_blank">$1</a>');
+        }
+
         async function loadDigest() {
             try {
                 const res = await fetch('/api/digest');
                 const d = await res.json();
-                document.getElementById('digest-content').innerText = d.markdown || 'No digest yet. Click “Generate Weekly Digest”.';
+                document.getElementById('digest-content').innerHTML = d.markdown ? renderMd(d.markdown) : 'No digest yet. Click “Generate Weekly Digest”.';
             } catch (err) {
                 document.getElementById('digest-content').innerText = 'Error loading digest: ' + err;
             }
         }
         loadDigest();
+
+        async function loadReport() {
+            try {
+                const res = await fetch('/api/report');
+                const d = await res.json();
+                document.getElementById('report-content').innerHTML = d.markdown ? renderMd(d.markdown) : 'No report yet. Choose how many transcripts and click “Generate Advisor Report”.';
+            } catch (err) {
+                document.getElementById('report-content').innerText = 'Error loading report: ' + err;
+            }
+        }
+        loadReport();
+
+        async function generateReport() {
+            const s = document.getElementById('report-status');
+            const n = parseInt(document.getElementById('report-n').value) || 8;
+            s.innerText = 'Generating (≈20–40s)…';
+            try {
+                await fetch('/api/generate_report', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({n})});
+                let ticks = 0;
+                const timer = setInterval(() => {
+                    loadReport();
+                    if (++ticks >= 12) { clearInterval(timer); s.innerText = 'Done.'; }
+                }, 5000);
+            } catch (err) { s.innerText = 'Failed: ' + err; }
+        }
 
         async function loadProfiles() {
             try {
@@ -903,6 +952,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with open(latest, encoding="utf-8") as fh:
                     md = fh.read()
             self.json({"markdown": md})
+        elif p == "/api/report":
+            md = ""
+            latest = os.path.join(profiles.load()["reports_dir"], "latest.md")
+            if os.path.isfile(latest):
+                with open(latest, encoding="utf-8") as fh:
+                    md = fh.read()
+            self.json({"markdown": md})
         elif p == "/api/profiles":
             self.json({"active": profiles.active_name(), "profiles": profiles.list_profiles()})
         else:
@@ -972,6 +1028,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             subprocess.Popen([sys.executable, DIGEST_SCRIPT, "--days=7"],
                              stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
             self.json({"started": True, "message": "Generating digest…"})
+            return
+        if self.path == "/api/generate_report":
+            n = int(body.get("n") or 8)
+            logfile = self._job_log("generate_report")
+            subprocess.Popen([sys.executable, REPORT_SCRIPT, f"--n={n}"],
+                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            self.json({"started": True, "message": f"Generating advisor report from last {n} transcripts…"})
             return
         if self.path == "/api/run_discovery":
             logfile = self._job_log("podcast_scraper")

@@ -130,6 +130,12 @@ def digest_dir_for(name):
     return d
 
 
+def reports_dir_for(name):
+    d = HERMES / "reports" / slug(name)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def active_name():
     _seed_default()
     try:
@@ -181,6 +187,7 @@ def load(name=None):
     cfg["label"] = cfg.get("label", cfg["name"])
     cfg["db_path"] = db_path_for(cfg["name"])
     cfg["digest_dir"] = str(digest_dir_for(cfg["name"]))
+    cfg["reports_dir"] = str(reports_dir_for(cfg["name"]))
     cfg.setdefault("search_queries", [])
     cfg.setdefault("curated_channels", {})
     cfg.setdefault("keywords", [])

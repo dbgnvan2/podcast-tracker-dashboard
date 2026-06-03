@@ -201,6 +201,49 @@ class TestEmergingDiscovery(unittest.TestCase):
         self.conn.close()
 
 
+class TestReport(unittest.TestCase):
+    def setUp(self):
+        import generate_report
+        self.gr = generate_report
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "t.db")
+        fresh_db(self.db)
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','u',9,0.9,'obtained','2026-06-02')")
+        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','u',9,0.8,'obtained','2026-06-01')")
+        conn.execute("INSERT INTO transcripts VALUES ('vidA','f','full text about entity SEO and AI overviews here.',8)")
+        conn.execute("INSERT INTO transcripts VALUES ('vidB','f','full text about knowledge graphs and citations here.',8)")
+        conn.execute("INSERT INTO ai_analysis VALUES ('vidA','[]','[]','Quote A.','2026-06-02')")
+        conn.execute("INSERT INTO ai_analysis VALUES ('vidB','[]','[]','Quote B.','2026-06-01')")
+        conn.execute("INSERT INTO key_points VALUES (1,'vidA',30,'Point A','insight')")
+        conn.execute("INSERT INTO key_points VALUES (2,'vidB',60,'Point B','strategy')")
+        conn.commit(); conn.close()
+        self.gr.DB_PATH = Path(self.db)
+
+    def test_report_cites_real_sources(self):
+        # Mock the LLM: it cites sources 1 and 2 (valid) and 9 (invalid → dropped).
+        self.gr.A.call_llm = lambda *a, **k: {
+            "overview": "Overview text.",
+            "key_ideas": [
+                {"idea": "Big idea one.", "sources": [1]},
+                {"idea": "Big idea two.", "sources": [2, 9]},
+            ],
+            "sections": [{"heading": "Theme", "paragraphs": [{"text": "Para.", "sources": [1]}]}],
+        }
+        self.gr.A.llm_config = lambda: ("k", "http://x", "m")
+        md, day = self.gr.build_report(n=8)
+        self.assertIn("Executive Key Ideas", md)
+        self.assertIn("Big idea one.", md)
+        # citation deep-links to the real source video + its key-point timestamp
+        self.assertIn("watch?v=vidA&t=30s", md)
+        self.assertIn("watch?v=vidB&t=60s", md)
+        # invalid source 9 was dropped, not rendered
+        self.assertNotIn("[S9]", md)
+        # sources section lists both
+        self.assertIn("**S1**", md)
+        self.assertIn("**S2**", md)
+
+
 class TestProfiles(unittest.TestCase):
     def setUp(self):
         # Redirect all profile storage to a temp area (never touch ~/.hermes).
