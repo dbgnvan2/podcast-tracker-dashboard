@@ -218,19 +218,30 @@ def fetch_channel_videos(identifier, max_results=10):
 
 
 def get_video_details(video_id):
-    """Fetch full metadata for a single video."""
+    """Fetch full metadata for a single video. Uses the android client + Chrome
+    impersonation and retries on 429 — bulk runs enrich ~100+ videos rapidly and
+    a plain call gets rate-limited, silently dropping videos (e.g. premiered
+    long-form content)."""
     cmd = [
-        YT_DLP,
-        "--dump-json",
-        "--no-download",
+        YT_DLP, "--dump-json", "--no-download",
+        "--extractor-args", "youtube:player_client=android",
+        "--impersonate", "chrome", "--no-warnings",
         f"https://youtube.com/watch?v={video_id}",
     ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.stdout.strip():
-            return json.loads(result.stdout.strip())
-    except (subprocess.TimeoutExpired, json.JSONDecodeError):
-        pass
+    for attempt in range(3):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.stdout.strip():
+                return json.loads(result.stdout.strip())
+            err = (result.stderr or "").lower()
+            if "429" in err or "too many" in err:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return None
+        except subprocess.TimeoutExpired:
+            continue
+        except json.JSONDecodeError:
+            return None
     return None
 
 
@@ -384,6 +395,54 @@ def _is_monitored(channel_name, channel_id, discovered_via, names, cur_ids):
     return (discovered_via == "channel"
             or _norm(channel_name) in names
             or (channel_id and channel_id in cur_ids))
+
+
+def add_video(conn, vid):
+    """Fetch, score and upsert a single video via the real enrichment path.
+    Useful to capture a specific video that bulk discovery missed (e.g. a
+    premiered long-form upload). Never fabricates — uses real metadata."""
+    d = get_video_details(vid)
+    if not d:
+        print(f"  Could not fetch details for {vid}.")
+        return False
+    up = parse_ymd_via_ytdlp(d.get("upload_date")) or ""
+    dur = d.get("duration", 0) or 0
+    views = d.get("view_count", 0) or 0
+    likes = d.get("like_count", 0) or 0
+    comments = d.get("comment_count", 0) or 0
+    channel_name = d.get("channel") or "Unknown"
+    channel_id = d.get("channel_id", "") or ""
+    channel_url = d.get("channel_url", "") or ""
+    title = d.get("title", "Untitled")
+
+    names, cur_ids = monitored_channels(conn)
+    is_cur = _is_monitored(channel_name, channel_id, None, names, cur_ids)
+    kw = calculate_keyword_density("", title, channel_name)
+    vpd = round(views / days_since(up), 1) if up else 0
+    score = calculate_quality_score(views, likes, comments, dur, kw,
+                                    channel_id, channel_name, vpd, is_curated=is_cur)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.cursor()
+    exists = cur.execute("SELECT 1 FROM videos WHERE id=?", (vid,)).fetchone()
+    if exists:
+        cur.execute("UPDATE videos SET views=?, likes=?, comments=?, quality_score=?, "
+                    "views_per_day=?, channel_id=?, discovered_via=? WHERE id=?",
+                    (views, likes, comments, score, vpd, channel_id,
+                     "channel" if is_cur else "search", vid))
+    else:
+        cur.execute("""INSERT INTO videos (id, channel_name, channel_url, video_title, url,
+            publish_date, duration_seconds, views, likes, comments, first_seen_date,
+            last_updated_date, prev_views, view_change, view_change_pct,
+            transcript_keywords_score, quality_score, transcript_summary,
+            channel_id, is_new_channel, discovered_via, views_per_day)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (vid, channel_name, channel_url, title, f"https://youtube.com/watch?v={vid}",
+             up, dur, views, likes, comments, now, now, 0, 0, 0, kw, score, "",
+             channel_id, 0, "channel" if is_cur else "search", vpd))
+    conn.commit()
+    print(f"  {'Updated' if exists else 'Added'} {vid}: {title[:50]} "
+          f"(score {score}, curated={is_cur}, {views:,} views)")
+    return True
 
 
 def rescore_all(conn):
@@ -831,7 +890,15 @@ if __name__ == "__main__":
     if prof_name:
         apply_profile(prof_name)
 
-    if "--rescore" in sys.argv:
+    add_id = None
+    for a in sys.argv[1:]:
+        if a.startswith("--add="):
+            add_id = a.split("=", 1)[1]
+    if add_id:
+        c = init_db()
+        add_video(c, add_id)
+        c.close()
+    elif "--rescore" in sys.argv:
         c = init_db()
         n = rescore_all(c)
         c.close()
