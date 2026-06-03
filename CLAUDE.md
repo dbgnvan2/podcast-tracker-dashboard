@@ -139,6 +139,7 @@ Weights: **authority 0.30** (known expertise — `channel_authority()`: monitore
 3. **Don't fake success.** When something can't be transcribed/analyzed, set the honest status (`not_available` / `error`) — never report "done" optimistically. The user explicitly distrusts "8 were transcribed" claims that don't reconcile with the data.
 4. **The user works from the GUI, not the terminal.** They avoid terminal sessions and won't run multi-line shell one-liners reliably. Prefer: a single script + a one-word command, or a dashboard button. This is *why* "option A" (dashboard fires backend processing) is the chosen direction.
 5. **When the prototype's approach was wrong, prefer a proper fix over a patch**, and surface a clear spec before large changes.
+6. **Before reviewing/writing discovery, fetch, or scoring code, read [`LEARNINGS.md`](LEARNINGS.md)** — the catalogue of failure patterns (transient-as-permanent, silent drops, narrow-scope exclusion, hardcoded assumptions, inconsistent robustness, unverified status, gameable scoring) and the review checklist derived from them. After fixing any real bug, add a Fix-log entry and fold any new rule into the checklist.
 
 ---
 

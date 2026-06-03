@@ -144,25 +144,38 @@ def init_db():
 
 # ── YouTube search via yt-dlp ──────────────────────────────────────────────
 def search_youtube(query, max_results=20):
+    # Same hardening as get_video_details: impersonation + 429 retry. A plain
+    # call silently returns [] when rate-limited, so a whole query's worth of
+    # discovery vanishes with no signal.
     cmd = [
-        YT_DLP,
-        "--flat-playlist",
-        "--dump-json",
+        YT_DLP, "--flat-playlist", "--dump-json",
+        "--extractor-args", "youtube:player_client=android",
+        "--impersonate", "chrome", "--no-warnings",
         f"ytsearch{max_results}:{query}",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    videos = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
+    for attempt in range(3):
         try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
             continue
-        videos.append(data)
-
-    return videos
+        videos = []
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                videos.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if videos:
+            return videos
+        err = (result.stderr or "").lower()
+        if "429" in err or "too many" in err:
+            print(f"    429 on search '{query}', backoff {5*(attempt+1)}s")
+            time.sleep(5 * (attempt + 1))
+            continue
+        return videos  # genuinely no results
+    return []
 
 
 # Channel tabs to scan. Long-form interviews/podcasts are often premiered, so
