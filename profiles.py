@@ -95,7 +95,7 @@ DEFAULT_PROFILE = {
         "AI visibility", "organic traffic", "website traffic", "drive traffic",
         "rank on Google", "search rankings", "llms.txt",
     ],
-    "min_views": 1000,
+    "min_views": 2000,
     "min_duration_sec": 300,
     "max_duration_sec": 5400,
     "min_days_old": 7,
@@ -214,6 +214,22 @@ def save(profile):
     profile.setdefault("keywords", [])
     (PROFILES_DIR / f"{name}.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
     return name
+
+
+EDITABLE_SETTINGS = ("min_views", "min_duration_sec", "max_duration_sec",
+                     "min_days_old", "min_publish_date", "max_videos_per_channel",
+                     "analysis_focus", "digest_title")
+
+
+def update(name, fields):
+    """Update specific fields of an existing profile (raw JSON, defaults untouched)."""
+    name = slug(name)
+    path = PROFILES_DIR / f"{name}.json"
+    p = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"name": name}
+    for k, v in fields.items():
+        if v is not None and v != "":
+            p[k] = v
+    return save(p)
 
 
 def create(name, label=None, search_queries=None, curated_channels=None,

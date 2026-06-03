@@ -89,7 +89,7 @@
     "search rankings",
     "llms.txt"
   ],
-  "min_views": 1000,
+  "min_views": 2000,
   "min_duration_sec": 300,
   "max_duration_sec": 5400,
   "min_days_old": 7,

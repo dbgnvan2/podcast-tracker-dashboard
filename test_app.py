@@ -308,6 +308,16 @@ class TestProfiles(unittest.TestCase):
         self.assertEqual(p["min_views"], profiles.DEFAULTS["min_views"])
         self.assertTrue(p["db_path"].endswith("podcast_bare.db"))
 
+    def test_update_settings(self):
+        profiles.create("vid", label="Vid")
+        profiles.update("vid", {"min_views": 2000, "min_publish_date": "2024-06-01"})
+        p = profiles.load("vid")
+        self.assertEqual(p["min_views"], 2000)
+        self.assertEqual(p["min_publish_date"], "2024-06-01")
+        # blanks/None are ignored, existing values preserved
+        profiles.update("vid", {"min_views": None, "max_videos_per_channel": ""})
+        self.assertEqual(profiles.load("vid")["min_views"], 2000)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -313,6 +313,7 @@ HTML = """
                 <span style="color:var(--text-dim);font-size:0.85rem">Investigation:</span>
                 <select id="profile-select" onchange="switchProfile(this.value)"
                         style="background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:0.9rem;"></select>
+                <button class="btn btn-view" onclick="openSettings()">⚙ Settings</button>
                 <button class="btn btn-primary" onclick="openNewProfile()">+ New</button>
                 <div id="last-updated" style="font-size: 0.8rem; color: var(--text-dim); margin-left:10px;"></div>
             </div>
@@ -421,6 +422,33 @@ HTML = """
             <div class="chart-section">
                 <h3>Top Channels by Video Count</h3>
                 <div class="bar-container" id="channel-chart"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettings()">
+        <div class="modal" style="max-width:560px">
+            <div class="modal-header">
+                <div><h3 class="modal-title">Settings — <span id="settings-profile"></span></h3>
+                <div class="modal-sub">Discovery filters for the active investigation. Applied on the next scrape.</div></div>
+                <button class="modal-close" onclick="closeSettings()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                    <label>Minimum view count<input id="set-min_views" type="number" class="search-box" min="0" step="100"></label>
+                    <label>Published on/after<input id="set-min_publish_date" class="search-box" placeholder="2025-01-01"></label>
+                    <label>Min duration (sec)<input id="set-min_duration_sec" type="number" class="search-box" min="0"></label>
+                    <label>Max duration (sec)<input id="set-max_duration_sec" type="number" class="search-box" min="0"></label>
+                    <label>Min days old<input id="set-min_days_old" type="number" class="search-box" min="0"></label>
+                    <label>Videos per channel<input id="set-max_videos_per_channel" type="number" class="search-box" min="1"></label>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+                    <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+                    <span id="set-status" style="color:var(--text-dim);font-size:0.85rem"></span>
+                </div>
+                <div style="color:var(--text-dim);font-size:0.8rem;margin-top:10px">
+                    Curated/monitored channels bypass the view & date filters (we always keep authorities).
+                </div>
             </div>
         </div>
     </div>
@@ -844,15 +872,38 @@ HTML = """
             } catch (err) { s.innerText = 'Failed: ' + err; }
         }
 
+        let activeSettings = {};
         async function loadProfiles() {
             try {
                 const res = await fetch('/api/profiles');
                 const d = await res.json();
+                activeSettings = d.settings || {};
                 const sel = document.getElementById('profile-select');
                 sel.innerHTML = (d.profiles || []).map(p =>
                     `<option value="${p.name}" ${p.active?'selected':''}>${p.label} (${p.queries}q/${p.channels}ch)</option>`
                 ).join('');
+                document.getElementById('settings-profile').innerText = d.active || '';
             } catch (err) { console.error('profiles', err); }
+        }
+
+        function openSettings() {
+            const f = ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel'];
+            f.forEach(k => { const el = document.getElementById('set-'+k); if (el) el.value = activeSettings[k] ?? ''; });
+            document.getElementById('set-status').innerText = '';
+            document.getElementById('settings-modal').classList.add('active');
+        }
+        function closeSettings() { document.getElementById('settings-modal').classList.remove('active'); }
+
+        async function saveSettings() {
+            const s = document.getElementById('set-status');
+            const body = {};
+            ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel']
+                .forEach(k => { body[k] = document.getElementById('set-'+k).value; });
+            s.innerText = 'Saving…';
+            const res = await fetch('/api/update_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            const d = await res.json();
+            if (d.ok) { s.innerText = 'Saved. Applies on the next Run Discovery.'; await loadProfiles(); }
+            else s.innerText = 'Failed: ' + (d.error||'');
         }
 
         async function switchProfile(name) {
@@ -971,7 +1022,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     md = fh.read()
             self.json({"markdown": md})
         elif p == "/api/profiles":
-            self.json({"active": profiles.active_name(), "profiles": profiles.list_profiles()})
+            active = profiles.load()
+            settings = {k: active.get(k) for k in profiles.EDITABLE_SETTINGS}
+            self.json({"active": profiles.active_name(),
+                       "profiles": profiles.list_profiles(),
+                       "settings": settings})
         else:
             self.send_error(404)
 
@@ -1007,6 +1062,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 migrate(profiles.db_path_for(nm))
                 self.json({"ok": True, "name": nm})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e)})
+            return
+        if self.path == "/api/update_profile":
+            name = body.get("name") or profiles.active_name()
+            fields = {}
+            for k in ("min_views", "min_duration_sec", "max_duration_sec",
+                      "min_days_old", "max_videos_per_channel"):
+                if body.get(k) not in (None, ""):
+                    try:
+                        fields[k] = int(body[k])
+                    except (ValueError, TypeError):
+                        pass
+            for k in ("min_publish_date", "analysis_focus", "digest_title"):
+                if body.get(k) not in (None, ""):
+                    fields[k] = body[k]
+            try:
+                profiles.update(name, fields)
+                self.json({"ok": True})
             except Exception as e:
                 self.json({"ok": False, "error": str(e)})
             return

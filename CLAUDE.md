@@ -223,6 +223,7 @@ Requires `yt-dlp` on `PATH` (or installed at a Homebrew/pip path the scripts pro
 | POST | `/api/set_profile` | `{name}` → switch active profile (migrates its DB) |
 | POST | `/api/create_profile` | Create a profile from a JSON body (queries/channels/keywords/focus/filters) |
 | POST | `/api/test_profile` | `{name}` → dry-run a profile's reach (counts + top channels + sample titles), no writes |
+| POST | `/api/update_profile` | Edit the active profile's discovery filters (`min_views`, `min_publish_date`, durations, `min_days_old`, `max_videos_per_channel`) — dashboard ⚙ Settings |
 
 Any new endpoint the frontend calls must be added to the inline JS in the same change.
 
