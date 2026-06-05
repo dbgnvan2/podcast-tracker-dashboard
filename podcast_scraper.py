@@ -643,6 +643,9 @@ def dry_run():
 
 
 def main():
+    if not ACTIVE_PROFILE.get("youtube_enabled", True):
+        print(f"YouTube arm disabled for profile '{ACTIVE_PROFILE['name']}' — skipping.")
+        return
     conn = init_db()
     cursor = conn.cursor()
     run_date = datetime.now(timezone.utc).isoformat()

@@ -501,18 +501,32 @@ HTML = """
             </div>
             <div class="modal-body">
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-                    <label>Name (id)<input id="np-name" class="search-box" placeholder="zone2-training"></label>
-                    <label>Label<input id="np-label" class="search-box" placeholder="Zone 2 Training"></label>
+                    <label>Name (id)<input id="np-name" class="search-box" placeholder="interstitium"></label>
+                    <label>Label<input id="np-label" class="search-box" placeholder="Interstitium"></label>
                 </div>
-                <label>Search queries (one per line)
-                    <textarea id="np-queries" class="search-box" rows="5" placeholder="zone 2 training explained&#10;aerobic base building&#10;lactate threshold training"></textarea></label>
-                <label>Curated channels — <span style="color:var(--text-dim);font-size:0.8rem">one per line, <code>handle = Name</code></span>
-                    <textarea id="np-channels" class="search-box" rows="3" placeholder="PeterAttiaMD = Peter Attia&#10;flotrack = FloTrack"></textarea></label>
-                <label>Scoring keywords (comma-separated)
-                    <textarea id="np-keywords" class="search-box" rows="2" placeholder="zone 2, aerobic base, lactate, VO2 max, mitochondria, heart rate"></textarea></label>
                 <label>Analysis focus (for AI extraction + digest framing)
-                    <input id="np-focus" class="search-box" placeholder="Zone 2 / aerobic base endurance training"></label>
-                <label>Digest title<input id="np-digest" class="search-box" placeholder="Best of Zone 2 Training"></label>
+                    <input id="np-focus" class="search-box" placeholder="the human interstitium — anatomy, interstitial fluid, lymphatics, disease"></label>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                    <label>Digest title<input id="np-digest" class="search-box" placeholder="Best of Interstitium Research"></label>
+                    <label>Scoring keywords (comma-separated)<input id="np-keywords" class="search-box" placeholder="interstitium, interstitial fluid, collagen, lymphatic"></label>
+                </div>
+
+                <fieldset style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:14px">
+                    <legend style="padding:0 6px"><label style="display:inline"><input type="checkbox" id="np-yt-enabled" checked> ▶ Search YouTube</label></legend>
+                    <label>Video search queries (one per line)
+                        <textarea id="np-queries" class="search-box" rows="3" placeholder="interstitium explained&#10;interstitial system anatomy"></textarea></label>
+                    <label>Channels to monitor — <span style="color:var(--text-dim);font-size:0.8rem">one per line, <code>handle = Name</code></span>
+                        <textarea id="np-channels" class="search-box" rows="2" placeholder="nucleusmedicalmedia = Nucleus Medical Media"></textarea></label>
+                </fieldset>
+
+                <fieldset style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px">
+                    <legend style="padding:0 6px"><label style="display:inline"><input type="checkbox" id="np-lit-enabled"> 📄 Search literature (papers)</label></legend>
+                    <label>Paper search queries (one per line)
+                        <textarea id="np-lit-queries" class="search-box" rows="3" placeholder="human interstitium anatomy&#10;interstitial fluid connective tissue&#10;interstitium fibrosis disease"></textarea></label>
+                    <label style="display:block;margin-top:6px">Published since <input id="np-lit-since" class="search-box" style="max-width:140px" placeholder="2018-01-01">
+                        <span style="color:var(--text-dim);font-size:0.8rem"> · source: EuropePMC (PubMed + preprints + PMC)</span></label>
+                </fieldset>
+
                 <div style="display:flex;gap:10px;margin-top:14px;align-items:center">
                     <button class="btn btn-view" onclick="testNewProfile()">Test (preview reach)</button>
                     <button class="btn btn-primary" onclick="createProfile()">Create &amp; switch</button>
@@ -994,6 +1008,10 @@ HTML = """
                 keywords: document.getElementById('np-keywords').value.split(',').map(s=>s.trim()).filter(Boolean),
                 analysis_focus: document.getElementById('np-focus').value.trim(),
                 digest_title: document.getElementById('np-digest').value.trim(),
+                youtube_enabled: document.getElementById('np-yt-enabled').checked,
+                literature_enabled: document.getElementById('np-lit-enabled').checked,
+                literature_queries: lines('np-lit-queries'),
+                literature_since: document.getElementById('np-lit-since').value.trim(),
             };
         }
 
@@ -1123,11 +1141,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     keywords=body.get("keywords") or [],
                     analysis_focus=body.get("analysis_focus"),
                     digest_title=body.get("digest_title"),
-                    min_views=body.get("min_views"),
-                    min_duration_sec=body.get("min_duration_sec"),
-                    max_duration_sec=body.get("max_duration_sec"),
-                    min_days_old=body.get("min_days_old"),
                 )
+                # Per-arm enable + the literature arm
+                extra = {"youtube_enabled": bool(body.get("youtube_enabled", True))}
+                if body.get("literature_enabled"):
+                    extra["literature"] = {
+                        "enabled": True,
+                        "queries": body.get("literature_queries") or [],
+                        "sources": ["europepmc"],
+                        "since_date": body.get("literature_since") or "2020-01-01",
+                        "min_citations": 0, "include_preprints": True,
+                        "max_results_per_source": 8,
+                    }
+                profiles.update(nm, extra)
                 migrate(profiles.db_path_for(nm))
                 self.json({"ok": True, "name": nm})
             except Exception as e:
@@ -1192,8 +1218,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/run_discovery":
             prof = profiles.load()
             launched = []
-            # YouTube arm (queries + channels)
-            if prof.get("youtube", {}).get("enabled", True) is not False:
+            # YouTube arm (queries + channels) — on unless explicitly disabled
+            if prof.get("youtube_enabled", True):
                 subprocess.Popen([sys.executable, SCRAPER_SCRIPT],
                                  stdout=self._job_log("podcast_scraper"),
                                  stderr=subprocess.STDOUT, start_new_session=True)
