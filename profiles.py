@@ -20,7 +20,7 @@ import re
 import json
 from pathlib import Path
 
-HERMES = Path.home() / ".hermes"
+HERMES = Path(os.environ.get("HERMES_DIR") or (Path.home() / ".hermes"))
 PROFILES_DIR = HERMES / "profiles"
 DB_DIR = HERMES / "db"
 DIGESTS_DIR = HERMES / "digests"
@@ -39,6 +39,10 @@ DEFAULTS = {
     "channel_bonus": {},
     "analysis_focus": "the topic of this investigation",
     "digest_title": "Weekly Digest",
+    # Enrichment cache thresholds — skip re-fetching video details if recently updated
+    "enrich_recent_days": 30,    # videos published within N days are "new"
+    "enrich_recent_hours": 24,   # re-enrich new videos after N hours
+    "enrich_older_days": 7,      # re-enrich older videos after N days
 }
 
 # The built-in SEO/AI/GEO profile — seeds on first run. Points at the legacy DB
@@ -87,13 +91,15 @@ DEFAULT_PROFILE = {
     "keywords": [
         "generative engine optimization", "GEO", "AI overviews", "AI mode",
         "search generative experience", "SGE", "brand entity", "entity SEO",
-        "knowledge graph", "AI search", "AI SEO", "ChatGPT search", "Perplexity",
-        "Google AI", "large language model", "LLM", "RAG", "zero-click",
-        "zero click search", "answer engine", "answer engine optimization", "AEO",
-        "featured snippet", "get cited", "cited by AI", "AI citations", "E-E-A-T",
-        "EEAT", "topical authority", "AI-generated content", "AIO", "AI optimization",
-        "AI visibility", "organic traffic", "website traffic", "drive traffic",
-        "rank on Google", "search rankings", "llms.txt",
+        "knowledge graph", "AI search", "AI SEO", "ChatGPT", "ChatGPT search",
+        "recommended by ChatGPT", "recommended by AI", "Perplexity",
+        "Google AI", "Gemini", "Copilot", "large language model", "LLM", "RAG",
+        "zero-click", "zero click search", "answer engine", "answer engine optimization",
+        "AEO", "featured snippet", "get cited", "cited by AI", "AI citations",
+        "E-E-A-T", "EEAT", "topical authority", "AI-generated content", "AIO",
+        "AI optimization", "AI visibility", "organic traffic", "website traffic",
+        "drive traffic", "rank on Google", "google rank", "search rankings",
+        "search traffic", "AI tools", "AI Mode", "llms.txt",
     ],
     "min_views": 2000,
     "min_duration_sec": 300,
@@ -218,7 +224,8 @@ def save(profile):
 
 EDITABLE_SETTINGS = ("min_views", "min_duration_sec", "max_duration_sec",
                      "min_days_old", "min_publish_date", "max_videos_per_channel",
-                     "analysis_focus", "digest_title")
+                     "analysis_focus", "digest_title",
+                     "enrich_recent_days", "enrich_recent_hours", "enrich_older_days")
 
 
 def update(name, fields):

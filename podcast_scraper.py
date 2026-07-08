@@ -17,6 +17,8 @@ from pathlib import Path
 # ── Config ──────────────────────────────────────────────────────────────────
 import profiles
 
+TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
+
 # All topic-specific criteria come from the active investigation profile.
 # apply_profile() (called below + on --profile) populates these module globals.
 DB_PATH = None
@@ -32,6 +34,7 @@ def apply_profile(name=None):
     global MIN_VIEWS, MIN_DURATION_SEC, MAX_DURATION_SEC, MIN_DAYS_OLD, MIN_PUBLISH_DATE
     global MAX_VIDEOS_PER_QUERY, MAX_VIDEOS_PER_CHANNEL, MAX_RESULTS_TO_RETURN
     global ANALYSIS_FOCUS, DIGEST_TITLE, ACTIVE_PROFILE
+    global ENRICH_RECENT_DAYS, ENRICH_RECENT_HOURS, ENRICH_OLDER_DAYS
     p = profiles.load(name)
     ACTIVE_PROFILE = p
     DB_PATH = Path(p["db_path"])
@@ -47,9 +50,12 @@ def apply_profile(name=None):
     MIN_PUBLISH_DATE = p.get("min_publish_date", "2025-01-01")
     MAX_VIDEOS_PER_QUERY = p["max_videos_per_query"]
     MAX_VIDEOS_PER_CHANNEL = p["max_videos_per_channel"]
-    MAX_RESULTS_TO_RETURN = 20
+    MAX_RESULTS_TO_RETURN = p.get("max_results_to_return", 20)
     ANALYSIS_FOCUS = p["analysis_focus"]
     DIGEST_TITLE = p["digest_title"]
+    ENRICH_RECENT_DAYS = int(p.get("enrich_recent_days", 30))
+    ENRICH_RECENT_HOURS = int(p.get("enrich_recent_hours", 24))
+    ENRICH_OLDER_DAYS = int(p.get("enrich_older_days", 7))
     return p
 
 
@@ -264,7 +270,20 @@ def get_video_details(video_id):
 
 
 def fetch_transcript(video_id):
-    """Fetch transcript using youtube-transcript-api (best-effort)."""
+    """Return transcript text for scoring. Checks local cache first so second+
+    runs don't make a network call for every already-processed video."""
+    # Local cache written by fetch_transcripts.py — check this first
+    cache_txt = TRANSCRIPTS_DIR / f"{video_id}.txt"
+    if cache_txt.is_file():
+        return cache_txt.read_text(errors="replace")
+    cache_seg = TRANSCRIPTS_DIR / f"{video_id}.segments.json"
+    if cache_seg.is_file():
+        try:
+            segs = json.loads(cache_seg.read_text())
+            return " ".join(s.get("text", "") for s in segs)
+        except Exception:
+            pass
+    # Not cached — fetch live from YouTube (best-effort, 15s timeout)
     cmd = [
         sys.executable, "-c", f"""
 import sys
@@ -275,16 +294,33 @@ try:
     import json
     transcript_list = [{{"text": seg.text, "start": seg.start, "duration": seg.duration}} for seg in transcript]
     print(json.dumps(transcript_list))
-except Exception:
+except Exception as e:
+    sys.stderr.write(type(e).__name__ + ": " + str(e))
     sys.exit(1)
 """
     ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, Exception):
-        pass
+    # Retry on transient blocks/timeouts so a momentary rate-limit doesn't make
+    # the video score title-only and persist that bad score (LEARNINGS P5/P1) —
+    # this call must be as hardened as the yt-dlp siblings.
+    transient = ("toomanyrequests", "ratelimit", "rate limit", "429",
+                 "timeout", "temporar", "connection", "blocked")
+    for attempt in range(3):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            err = (result.stderr or "").lower()
+            if any(t in err for t in transient) and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return None
+        except subprocess.TimeoutExpired:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            return None
     return None
 
 
@@ -312,9 +348,14 @@ def channel_authority(channel_id, channel_name, is_curated):
     channels get a strong floor; channels in the bonus list get a tier-scaled
     score; everyone else gets 0."""
     ch_key = (channel_name or "Unknown").lower().replace(" ", "").replace("'", "")
+    cid = (channel_id or "").lower()
     bonus = 1.0
     for key, b in CHANNEL_BONUS.items():
-        if key.lower().replace(" ", "") in ch_key or (channel_id and channel_id.lower() in ch_key):
+        k = key.lower().replace(" ", "").replace("'", "")
+        # EXACT match only — by channel id (key written as "UC...") or normalized
+        # name. Substring matching let an impostor channel named to *contain* a
+        # known expert's handle inherit the top authority weight (LEARNINGS P7).
+        if (key.startswith("UC") and cid == key.lower()) or k == ch_key:
             bonus = b
             break
     if is_curated:
@@ -707,10 +748,71 @@ def main():
     # ── Step 2: Get full details for each ───────────────────────────────
     enriched = []
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=MIN_DAYS_OLD)).strftime("%Y-%m-%d")
+    now_utc = datetime.now(timezone.utc)
 
-    for vid, v in all_videos.items():
-        # Fetch full details first (flat search doesn't have dates/views)
-        details = get_video_details(vid)
+    # Snapshot existing DB rows so we can skip re-fetching recently-updated videos
+    _db_snap = {}
+    _dismissed = set()
+    try:
+        _snap_conn = sqlite3.connect(str(DB_PATH))
+        for row in _snap_conn.execute(
+            "SELECT id, publish_date, last_updated_date, views, likes, comments, "
+            "duration_seconds, channel_name, channel_id, channel_url, video_title, url, "
+            "COALESCE(dismissed, 0) "
+            "FROM videos"
+        ).fetchall():
+            if row[12]:  # dismissed
+                _dismissed.add(row[0])
+            else:
+                _db_snap[row[0]] = row[:12]
+        _snap_conn.close()
+    except Exception:
+        pass  # DB may not exist yet on first run
+
+    def _is_fresh(vid_id):
+        """Return cached DB row tuple if recently updated (skip re-enrichment), else None."""
+        row = _db_snap.get(vid_id)
+        if not row:
+            return None
+        _, pub, last_upd, views, likes, comments, duration_sec, ch_name, ch_id, ch_url, title, url = row
+        try:
+            last_updated = datetime.fromisoformat(last_upd).replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+        try:
+            pub_dt = datetime.fromisoformat((pub or "2000-01-01")[:10]).replace(tzinfo=timezone.utc)
+            age_days = (now_utc - pub_dt).days
+        except ValueError:
+            age_days = 9999
+        if age_days <= ENRICH_RECENT_DAYS:
+            fresh = (now_utc - last_updated).total_seconds() < ENRICH_RECENT_HOURS * 3600
+        else:
+            fresh = (now_utc - last_updated).days < ENRICH_OLDER_DAYS
+        return row if fresh else None
+
+    total_to_enrich = len(all_videos)
+    skipped = 0
+    for i, (vid, v) in enumerate(all_videos.items(), 1):
+        if i % 25 == 0 or i == 1:
+            print(f"  Enriching {i}/{total_to_enrich} ({skipped} skipped as fresh)…", flush=True)
+
+        if vid in _dismissed:
+            skipped += 1
+            continue
+        cached = _is_fresh(vid)
+        if cached:
+            skipped += 1
+            _, pub, _, views, likes, comments, duration_sec, ch_name, ch_id, ch_url, title, url = cached
+            details = {
+                "upload_date": (pub or "").replace("-", ""),
+                "duration": duration_sec or 0,
+                "view_count": views or 0, "like_count": likes or 0,
+                "comment_count": comments or 0,
+                "channel": ch_name or "", "channel_id": ch_id or "",
+                "channel_url": ch_url or "", "title": title or "",
+            }
+        else:
+            details = get_video_details(vid)
         if not details:
             continue
 
@@ -757,8 +859,10 @@ def main():
             "discovered_via": "channel" if curated else "search",
         })
 
-        time.sleep(0.3)
+        if not cached:
+            time.sleep(0.3)
 
+    print(f"  Enriched {total_to_enrich - skipped} videos ({skipped} used cached data).", flush=True)
     print(f"After filtering (curated bypass view/age; others views>={MIN_VIEWS}, "
           f"{MIN_DURATION_SEC//60}-{MAX_DURATION_SEC//60}min, {MIN_DAYS_OLD}+ days old): {len(enriched)}")
 
@@ -785,9 +889,63 @@ def main():
                                      v.get("discovered_via"), mon_names, mon_ids),
         )
 
+    # ── Step 3b: Semantic title scoring for zero-score videos ───────────
+    # Videos with kw_score=0 have no transcript and no keyword match in their
+    # title. Batch their titles to the LLM in one call to catch semantic
+    # relevance the keyword list misses (e.g. "ChatGPT rank" vs "AI search").
+    zero_score = [v for v in enriched if v["kw_score"] == 0.0]
+    sem_updated = 0
+    if zero_score:
+        try:
+            import analyze_transcripts as _at
+            key, base, model = _at.llm_config()
+            if key:
+                print(f"  Semantic title check: {len(zero_score)} zero-score videos…", flush=True)
+                titles_payload = [{"id": v["id"], "title": v["title"]} for v in zero_score]
+                sem_prompt = (
+                    f'You are scoring YouTube video titles for relevance to this topic:\n'
+                    f'"{ANALYSIS_FOCUS}"\n\n'
+                    f'Rate each title 0.0–1.0:\n'
+                    f'  1.0 = directly on-topic\n'
+                    f'  0.5 = related / adjacent\n'
+                    f'  0.0 = off-topic\n\n'
+                    f'Return ONLY a JSON array: [{{"id":"...","score":0.0}}, ...]\n\n'
+                    f'Titles:\n{json.dumps(titles_payload, ensure_ascii=False)}'
+                )
+                raw = _at.call_llm(sem_prompt, key, base, model)
+                # call_llm returns parsed JSON; expect a list or dict with a list
+                scores_list = raw if isinstance(raw, list) else next(
+                    (v for v in raw.values() if isinstance(v, list)), []
+                )
+                score_map = {item["id"]: float(item.get("score", 0)) for item in scores_list
+                             if isinstance(item, dict) and "id" in item}
+                updated = 0
+                for v in zero_score:
+                    sem = score_map.get(v["id"], 0.0)
+                    if sem > 0:
+                        v["kw_score"] = round(sem, 3)
+                        v["quality_score"] = calculate_quality_score(
+                            v["views"], v["likes"], v["comments"],
+                            v["duration"], v["kw_score"],
+                            v["channel_id"], v["channel_name"], v["views_per_day"],
+                            is_curated=_is_monitored(v["channel_name"], v["channel_id"],
+                                                     v.get("discovered_via"), mon_names, mon_ids),
+                        )
+                        updated += 1
+                sem_updated = updated
+                print(f"  Semantic scoring: {updated}/{len(zero_score)} titles updated.", flush=True)
+        except Exception as e:
+            print(f"  Semantic title scoring skipped: {e}", flush=True)
+
     # ── Step 4: Sort by quality score ───────────────────────────────────
     enriched.sort(key=lambda x: x["quality_score"], reverse=True)
     top_n = enriched[:MAX_RESULTS_TO_RETURN]
+    if len(enriched) > MAX_RESULTS_TO_RETURN:
+        # Never let the cap silently hide finds (LEARNINGS P9 / checklist 10).
+        print(f"  Reporting top {MAX_RESULTS_TO_RETURN} of {len(enriched)} "
+              f"qualified videos (raise 'max_results_to_return' in the profile to "
+              f"see more). All {len(enriched)} are still written to the DB.",
+              flush=True)
 
     # ── Step 5: Update DB ────────────────────────────────────────────────
     # Channels seen before THIS run (for emerging detection). Empty on first run.
@@ -889,12 +1047,23 @@ def main():
         print(f"    {v['url']}")
         print()
 
-    print(f"\nEmerging videos (new channels) this run: {emerging}")
+    fetched = total_to_enrich - skipped
+    print(f"\n{'─'*50}")
+    print(f"  Discovery run complete")
+    print(f"{'─'*50}")
+    print(f"  Found:          {total_to_enrich:>5} unique videos")
+    print(f"  Enriched:       {fetched:>5} via yt-dlp")
+    print(f"  Cached:         {skipped:>5} skipped (recently updated)")
+    print(f"  Passed filters: {len(enriched):>5}")
+    if zero_score:
+        print(f"  Semantic check: {sem_updated:>5} of {len(zero_score)} zero-score titles updated")
+    print(f"  New to DB:      {new_count:>5}")
+    print(f"  Emerging:       {emerging:>5} (new channels)")
+    print(f"{'─'*50}")
     if suggestions:
-        print("Suggested channels to monitor (review in dashboard → Discovery):")
+        print("  Suggested channels (review in dashboard → Discovery):")
         for name, best, cnt in suggestions:
-            print(f"  • {name} — best score {best:.2f}, {cnt} videos")
-
+            print(f"    • {name} — best score {best:.2f}, {cnt} videos")
     print(f"--- Run complete ---")
 
 

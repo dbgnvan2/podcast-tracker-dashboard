@@ -24,7 +24,8 @@ import profiles
 SCHEMA = """
 CREATE TABLE videos (id TEXT PRIMARY KEY, channel_name TEXT, video_title TEXT,
     url TEXT, views INTEGER, quality_score REAL, transcript_status TEXT,
-    transcribed_date TEXT, discovered_via TEXT DEFAULT 'search', source_type TEXT DEFAULT 'youtube');
+    transcribed_date TEXT, discovered_via TEXT DEFAULT 'search', source_type TEXT DEFAULT 'youtube',
+    dismissed INTEGER DEFAULT 0, digested_at TEXT);
 CREATE TABLE transcripts (video_id TEXT PRIMARY KEY, file_path TEXT,
     full_text TEXT, word_count INTEGER);
 CREATE TABLE key_points (id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT,
@@ -81,7 +82,7 @@ class TestAnalyze(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         long_text = "entity SEO matters for AI overviews and knowledge graphs. " * 20
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Title','u',1000,0.9,'obtained','2026-06-01','search','youtube',0,NULL)")
         conn.execute("INSERT INTO transcripts VALUES ('vid1','f',?,?)", (long_text, len(long_text.split())))
         conn.commit(); conn.close()
         analyze_transcripts.DB_PATH = Path(self.db)
@@ -95,9 +96,15 @@ class TestAnalyze(unittest.TestCase):
             "geo_signals": ["AI Overviews"],
             "best_quote": "Entities beat keywords.",
         }
+        orig_call_llm = analyze_transcripts.call_llm
+        orig_llm_config = analyze_transcripts.llm_config
         analyze_transcripts.call_llm = lambda *a, **k: canned
         analyze_transcripts.llm_config = lambda: ("fakekey", "http://x", "m")
-        done = analyze_transcripts.analyze_all()
+        try:
+            done = analyze_transcripts.analyze_all()
+        finally:
+            analyze_transcripts.call_llm = orig_call_llm
+            analyze_transcripts.llm_config = orig_llm_config
         self.assertEqual(done, 1)
         conn = sqlite3.connect(self.db)
         kp = conn.execute("SELECT timestamp_sec, point_text FROM key_points WHERE video_id='vid1'").fetchone()
@@ -107,6 +114,43 @@ class TestAnalyze(unittest.TestCase):
         self.assertIn("Google", ai[0])
         self.assertEqual(ai[1], "Entities beat keywords.")
 
+    def test_load_transcript_truncation_is_visible(self):
+        """P9 regression: a transcript longer than the budget is truncated, and
+        load_transcript reports the true full length so the caller can warn.
+        (Real-scale fixture: the cap MUST bite — toy data hid the original bug.)"""
+        orig_max = analyze_transcripts.MAX_TRANSCRIPT_CHARS
+        analyze_transcripts.MAX_TRANSCRIPT_CHARS = 500
+        try:
+            big = "x" * 50_000  # ~ a long-form transcript
+            text, full_len = analyze_transcripts.load_transcript("no_such_vid", big)
+            self.assertEqual(len(text), 500)      # capped
+            self.assertEqual(full_len, 50_000)    # true length reported, not the cap
+            # And with the real default the same transcript goes through whole.
+            analyze_transcripts.MAX_TRANSCRIPT_CHARS = 150_000
+            text2, full2 = analyze_transcripts.load_transcript("no_such_vid", big)
+            self.assertEqual(len(text2), 50_000)  # full transcript sent
+        finally:
+            analyze_transcripts.MAX_TRANSCRIPT_CHARS = orig_max
+
+    def test_empty_analysis_writes_no_row(self):
+        """P6 regression: an empty LLM result must NOT create an ai_analysis row,
+        or the video is marked 'analyzed' and never retried."""
+        orig_call = analyze_transcripts.call_llm
+        orig_cfg = analyze_transcripts.llm_config
+        analyze_transcripts.call_llm = lambda *a, **k: {
+            "key_points": [], "seo_entities": [], "geo_signals": [], "best_quote": ""}
+        analyze_transcripts.llm_config = lambda: ("fakekey", "http://x", "m")
+        try:
+            done = analyze_transcripts.analyze_all()
+        finally:
+            analyze_transcripts.call_llm = orig_call
+            analyze_transcripts.llm_config = orig_cfg
+        self.assertEqual(done, 0)  # nothing counted as analyzed
+        conn = sqlite3.connect(self.db)
+        n = conn.execute("SELECT COUNT(*) FROM ai_analysis WHERE video_id='vid1'").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 0)  # no row written → next run retries it
+
 
 class TestDigest(unittest.TestCase):
     def setUp(self):
@@ -114,18 +158,86 @@ class TestDigest(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('vid1','Chan','Great Talk','u',5000,0.95,'obtained','2026-06-01','search','youtube',0,NULL)")
         conn.execute("INSERT INTO ai_analysis VALUES ('vid1','[\"Ahrefs\"]','[\"AI Overviews\"]','Quote here.','2026-06-01')")
         conn.execute("INSERT INTO key_points VALUES (1,'vid1',30,'Do entity SEO','strategy')")
         conn.commit(); conn.close()
         generate_digest.DB_PATH = Path(self.db)
 
     def test_build_digest(self):
-        md, day = generate_digest.build_digest(days=None, limit=10)
+        md, day, ids = generate_digest.build_digest(limit=10)
         self.assertIn("Great Talk", md)
         self.assertIn("Quote here.", md)
         self.assertIn("Do entity SEO", md)
         self.assertIn("Ahrefs", md)
+
+
+class TestDigestBehavior(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "t.db")
+        fresh_db(self.db)
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO videos VALUES ('v1','Chan','Title One','u',1000,0.9,'obtained','2026-06-01','search','youtube',0,NULL)")
+        conn.execute("INSERT INTO videos VALUES ('v2','Chan','Title Two','u',800,0.8,'obtained','2026-06-02','search','youtube',0,NULL)")
+        conn.execute("INSERT INTO ai_analysis (video_id,seo_entities,geo_signals,best_quote,analyzed_at) VALUES ('v1','[]','[]','quote one','2026-06-01')")
+        conn.execute("INSERT INTO ai_analysis (video_id,seo_entities,geo_signals,best_quote,analyzed_at) VALUES ('v2','[]','[]','quote two','2026-06-02')")
+        conn.commit(); conn.close()
+        import generate_digest
+        self._orig_db = generate_digest.DB_PATH
+        self._orig_dir = generate_digest.DIGEST_DIR
+        generate_digest.DB_PATH = Path(self.db)
+        generate_digest.DIGEST_DIR = self.tmp / "digests"
+        generate_digest.DIGEST_DIR.mkdir()
+
+    def tearDown(self):
+        import generate_digest
+        generate_digest.DB_PATH = self._orig_db
+        generate_digest.DIGEST_DIR = self._orig_dir
+
+    def test_digest_includes_undigested(self):
+        import generate_digest
+        md, today, ids = generate_digest.build_digest()
+        self.assertIn('v1', ids)
+        self.assertIn('v2', ids)
+
+    def test_build_digest_does_NOT_mark(self):
+        """Safety property: build_digest must not mark videos digested — marking
+        before the file is durably written risks losing them forever (P6/P8)."""
+        import generate_digest
+        generate_digest.build_digest()  # build only, no mark_digested
+        conn = sqlite3.connect(self.db)
+        rows = {r[0]: r[1] for r in conn.execute("SELECT id, digested_at FROM videos").fetchall()}
+        conn.close()
+        self.assertIsNone(rows['v1'])
+        self.assertIsNone(rows['v2'])
+
+    def test_mark_digested_after_build(self):
+        """The intended flow: build, (write file), then mark_digested marks them."""
+        import generate_digest
+        md, today, ids = generate_digest.build_digest()
+        generate_digest.mark_digested(ids, today)
+        conn = sqlite3.connect(self.db)
+        rows = {r[0]: r[1] for r in conn.execute("SELECT id, digested_at FROM videos").fetchall()}
+        conn.close()
+        self.assertIsNotNone(rows['v1'])
+        self.assertIsNotNone(rows['v2'])
+
+    def test_second_digest_skips_already_digested(self):
+        import generate_digest
+        _, day, ids = generate_digest.build_digest()
+        generate_digest.mark_digested(ids, day)
+        md, today, ids2 = generate_digest.build_digest()
+        self.assertEqual(ids2, [])
+        self.assertIn("No new analyzed videos", md)
+
+    def test_digest_force_includes_already_digested(self):
+        import generate_digest
+        _, day, ids = generate_digest.build_digest()
+        generate_digest.mark_digested(ids, day)
+        md, today, ids2 = generate_digest.build_digest(force=True)
+        self.assertIn('v1', ids2)
+        self.assertIn('v2', ids2)
 
 
 class TestReconcile(unittest.TestCase):
@@ -135,8 +247,8 @@ class TestReconcile(unittest.TestCase):
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
         # fake obtained (no transcript row) + a real one
-        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube')")
-        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('fake','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube',0,NULL)")
+        conn.execute("INSERT INTO videos VALUES ('real','C','T','u',1,0.5,'obtained','2026-06-01','search','youtube',0,NULL)")
         conn.execute("INSERT INTO transcripts VALUES ('real','f','text',1)")
         conn.commit(); conn.close()
         Path(self.tmp, "stub.txt").write_text("junk")        # unbacked -> removed
@@ -179,6 +291,32 @@ class TestEmergingDiscovery(unittest.TestCase):
         hi = podcast_scraper.calculate_quality_score(5000,100,10,1800,0.5,"x","Unknown",views_per_day=5000)
         lo = podcast_scraper.calculate_quality_score(5000,100,10,1800,0.5,"x","Unknown",views_per_day=10)
         self.assertGreater(hi, lo)
+
+    def test_authority_exact_match_not_substring(self):
+        """An impostor channel named to CONTAIN a known expert's handle must not
+        inherit that expert's authority weight (LEARNINGS P7 — was substring)."""
+        orig = podcast_scraper.CHANNEL_BONUS
+        podcast_scraper.CHANNEL_BONUS = {"Neil Patel": 2.0, "UC_REAL_ID": 1.8}
+        try:
+            # Exact normalized name still matches.
+            self.assertGreater(
+                podcast_scraper.channel_authority("UCx", "Neil Patel", False), 0.0)
+            # Impostor that merely contains the name does NOT.
+            self.assertEqual(
+                podcast_scraper.channel_authority("UCy", "Neil Patel Daily SEO", False), 0.0)
+            self.assertEqual(
+                podcast_scraper.channel_authority("UCz", "Fake Neil Patel", False), 0.0)
+            # A bonus key written as a channel id matches the id exactly.
+            self.assertGreater(
+                podcast_scraper.channel_authority("UC_REAL_ID", "Whatever Name", False), 0.0)
+        finally:
+            podcast_scraper.CHANNEL_BONUS = orig
+
+    def test_timeout_is_retryable(self):
+        """A yt-dlp timeout must be classified transient (retryable 'error'),
+        not terminal 'not_available' (LEARNINGS P1)."""
+        import fetch_transcripts
+        self.assertIn("timeout", fetch_transcripts.BLOCKED_MARKERS)
 
     def test_authority_beats_keyword_stuffing(self):
         # A monitored expert with a plain (low-keyword) title must outrank a
@@ -227,8 +365,8 @@ class TestReport(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
         fresh_db(self.db)
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','https://youtube.com/watch?v=vidA',9,0.9,'obtained','2026-06-02','search','youtube')")
-        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','https://youtube.com/watch?v=vidB',9,0.8,'obtained','2026-06-01','search','youtube')")
+        conn.execute("INSERT INTO videos VALUES ('vidA','ChanA','Talk A','https://youtube.com/watch?v=vidA',9,0.9,'obtained','2026-06-02','search','youtube',0,NULL)")
+        conn.execute("INSERT INTO videos VALUES ('vidB','ChanB','Talk B','https://youtube.com/watch?v=vidB',9,0.8,'obtained','2026-06-01','search','youtube',0,NULL)")
         conn.execute("INSERT INTO transcripts VALUES ('vidA','f','full text about entity SEO and AI overviews here.',8)")
         conn.execute("INSERT INTO transcripts VALUES ('vidB','f','full text about knowledge graphs and citations here.',8)")
         conn.execute("INSERT INTO ai_analysis VALUES ('vidA','[]','[]','Quote A.','2026-06-02')")
@@ -238,8 +376,69 @@ class TestReport(unittest.TestCase):
         conn.commit(); conn.close()
         self.gr.DB_PATH = Path(self.db)
 
+    def test_report_date_from_filter(self):
+        """date_from='2026-06-02' should include only vidA (transcribed 2026-06-02), not vidB."""
+        sources = self.gr.select_sources(8, date_from='2026-06-02')
+        ids = [s["id"] for s in sources]
+        self.assertIn('vidA', ids)
+        self.assertNotIn('vidB', ids)
+
+    def test_report_date_to_filter(self):
+        """date_to='2026-06-01' should include only vidB (transcribed 2026-06-01), not vidA."""
+        sources = self.gr.select_sources(8, date_to='2026-06-01')
+        ids = [s["id"] for s in sources]
+        self.assertIn('vidB', ids)
+        self.assertNotIn('vidA', ids)
+
+    def test_report_channel_filter(self):
+        """channel='ChanA' filter should include only vidA."""
+        sources = self.gr.select_sources(8, channel='ChanA')
+        ids = [s["id"] for s in sources]
+        self.assertIn('vidA', ids)
+        self.assertNotIn('vidB', ids)
+
+    def test_allocate_excerpts_budget(self):
+        """Fair allocation: under budget = full text; over budget = capped to budget,
+        with short transcripts kept whole and the leftover flowing to long ones."""
+        # Under budget — everything goes in whole.
+        texts = ["a" * 100, "b" * 200, "c" * 300]
+        out = self.gr.allocate_excerpts(texts, 10_000)
+        self.assertEqual([len(x) for x in out], [100, 200, 300])
+        # Over budget — total sent never exceeds the budget.
+        out2 = self.gr.allocate_excerpts(texts, 360)
+        self.assertLessEqual(sum(len(x) for x in out2), 360)
+        # The shortest transcript is still sent in full (water-filling).
+        self.assertEqual(len(out2[0]), 100)
+        # Empty input is safe.
+        self.assertEqual(self.gr.allocate_excerpts([], 100), [])
+
+    def test_build_prompt_sends_full_transcript(self):
+        """build_prompt must include the actual transcript text, not a 2800-char stub."""
+        big = "Entity SEO insight number %d. " % 0 + ("detail " * 2000)  # ~14k chars
+        src = [{"n": 1, "id": "v1", "title": "T", "channel": "C", "url": "",
+                "is_youtube": True, "best_quote": "Q", "key_points": [],
+                "full_text": big, "first_ts": 0}]
+        prompt = self.gr.build_prompt(src)
+        # The whole transcript is present (well beyond the old 2800-char cap).
+        self.assertIn(big, prompt)
+        self.assertIn("full transcript", prompt)
+
+    def test_report_multi_channel_filter(self):
+        """A list of channels matches any of them exactly (multi-select picklist)."""
+        both = [s["id"] for s in self.gr.select_sources(8, channel=['ChanA', 'ChanB'])]
+        self.assertIn('vidA', both)
+        self.assertIn('vidB', both)
+        # Single-element list still exact-matches just that channel.
+        just_b = [s["id"] for s in self.gr.select_sources(8, channel=['ChanB'])]
+        self.assertEqual(just_b, ['vidB'])
+        # Exact match: a partial name in the list matches nothing.
+        none = self.gr.select_sources(8, channel=['Chan'])
+        self.assertEqual(none, [])
+
     def test_report_cites_real_sources(self):
         # Mock the LLM with the rich two-layer shape; idea 2 cites invalid src 9.
+        orig_call_llm = self.gr.A.call_llm
+        orig_llm_config = self.gr.A.llm_config
         self.gr.A.call_llm = lambda *a, **k: {
             "overview": "Overview text.",
             "key_ideas": [
@@ -254,7 +453,11 @@ class TestReport(unittest.TestCase):
             ],
         }
         self.gr.A.llm_config = lambda: ("k", "http://x", "m")
-        md, day = self.gr.build_report(n=8)
+        try:
+            md, day = self.gr.build_report(n=8)
+        finally:
+            self.gr.A.call_llm = orig_call_llm
+            self.gr.A.llm_config = orig_llm_config
         # two-layer structure present
         self.assertIn("## Executive Key Ideas", md)
         self.assertIn("## Detailed Analysis", md)
@@ -326,6 +529,40 @@ class TestMultiSource(unittest.TestCase):
         finally:
             P.load, scholarly.ScholarlyAdapter.discover = orig_load, orig_disc
 
+    def test_reingest_refreshes_metadata(self):
+        """P3 regression: re-ingesting a paper whose title/venue changed upstream
+        must refresh the descriptive fields, not just the metrics."""
+        import ingest_literature as il
+        import profiles as P
+        from sources import scholarly
+        from sources.base import make_document
+        tmp = tempfile.mkdtemp(); db = os.path.join(tmp, "t.db")
+        dashboard_server.migrate(db)
+        orig_load, orig_disc = P.load, scholarly.ScholarlyAdapter.discover
+        try:
+            P.load = lambda name=None: {
+                "name": "t", "label": "T", "db_path": db, "keywords": ["lactate"],
+                "literature": {"enabled": True, "queries": ["x"]}}
+            scholarly.ScholarlyAdapter.discover = lambda self, arm: [make_document(
+                "10.1/x", "literature", "europepmc", "Old Title", "Auth et al",
+                "https://doi.org/10.1/x", "2025-06-01", "abstract about lactate",
+                authority=0.3, raw={"doi": "10.1/x", "citations": 1, "venue": "Old Venue"})]
+            il.ingest("t")
+            # Upstream correction: title + venue change.
+            scholarly.ScholarlyAdapter.discover = lambda self, arm: [make_document(
+                "10.1/x", "literature", "europepmc", "Corrected Title", "Auth et al",
+                "https://doi.org/10.1/x", "2025-06-01", "abstract about lactate",
+                authority=0.5, raw={"doi": "10.1/x", "citations": 9, "venue": "New Venue"})]
+            il.ingest("t")
+            conn = sqlite3.connect(db)
+            row = conn.execute("SELECT video_title, venue, citations FROM videos WHERE id='10.1/x'").fetchone()
+            conn.close()
+            self.assertEqual(row[0], "Corrected Title")  # title refreshed (was the bug)
+            self.assertEqual(row[1], "New Venue")        # venue refreshed
+            self.assertEqual(row[2], 9)                  # metric refreshed
+        finally:
+            P.load, scholarly.ScholarlyAdapter.discover = orig_load, orig_disc
+
     def test_briefing_citation_validation(self):
         import spike_multisource as sp
         sources = [{"n": 1, "id": "10.1/A", "title": "A", "byline": "X", "url": "https://doi.org/10.1/A",
@@ -386,6 +623,451 @@ class TestProfiles(unittest.TestCase):
         # blanks/None are ignored, existing values preserved
         profiles.update("vid", {"min_views": None, "max_videos_per_channel": ""})
         self.assertEqual(profiles.load("vid")["min_views"], 2000)
+
+
+class TestHTMLJavaScript(unittest.TestCase):
+    """Catch Python-string-escape bugs that break the embedded JS at runtime."""
+
+    def _extract_js(self):
+        html = dashboard_server.HTML
+        start = html.find("<script>")
+        end = html.find("</script>", start)
+        self.assertGreater(start, 0, "No <script> block found in HTML")
+        return html[start + 8:end]
+
+    def test_js_parses_with_node(self):
+        import subprocess
+        js = self._extract_js()
+        result = subprocess.run(
+            ["node", "--check", "--input-type=commonjs"],
+            input=js.encode(), capture_output=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 0,
+            f"JS syntax error:\n{result.stderr.decode()[:800]}")
+
+    def test_no_python_escape_in_js_joins(self):
+        """Detect the Python-string-escape-in-JS bug: join('\\n') where the \\n
+        is a real newline (from Python's string escaping) rather than the two
+        characters backslash-n. node --check catches this too, but this test
+        gives a more precise error message pointing at the exact pattern."""
+        import re
+        js = self._extract_js()
+        # A real newline inside a join() call string argument — the bug we hit
+        bad = re.findall(r"join\('[^']*\n[^']*'\)", js)
+        self.assertEqual(bad, [],
+            f"Raw newline in .join() string arg (Python escape leak): {bad}")
+
+    def test_all_api_routes_referenced_in_html(self):
+        """Key API calls in the JS should have matching server routes."""
+        js = self._extract_js()
+        for route in ("/api/candidates", "/api/profiles", "/api/llm_providers",
+                      "/api/run_discovery", "/api/job_log", "/api/llm_selection"):
+            self.assertIn(route, js, f"Route {route} missing from JS")
+
+
+class TestLLMProviders(unittest.TestCase):
+    """Provider CRUD: add, edit, delete, key storage, selection persistence."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._orig_providers = dashboard_server.PROVIDERS_FILE
+        self._orig_env = dashboard_server.ENV_FILE
+        dashboard_server.PROVIDERS_FILE = self.tmp / "llm_providers.json"
+        dashboard_server.ENV_FILE = self.tmp / ".env"
+
+    def tearDown(self):
+        dashboard_server.PROVIDERS_FILE = self._orig_providers
+        dashboard_server.ENV_FILE = self._orig_env
+
+    def test_empty_returns_defaults(self):
+        d = dashboard_server._load_providers()
+        self.assertEqual(d["providers"], [])
+        self.assertEqual(d["bulk"], {})
+
+    def test_add_provider_and_key(self):
+        pid = "p_test"
+        data = dashboard_server._load_providers()
+        data["providers"].append({"id": pid, "label": "Test", "base": "https://api.test.com/v1"})
+        dashboard_server._save_providers(data)
+        dashboard_server._write_env_file({f"LLM_KEY_{pid}": "sk-test123"})
+
+        loaded = dashboard_server._load_providers()
+        self.assertEqual(len(loaded["providers"]), 1)
+        self.assertEqual(loaded["providers"][0]["label"], "Test")
+        self.assertEqual(dashboard_server._provider_key(pid), "sk-test123")
+
+    def test_edit_provider(self):
+        data = {"providers": [{"id": "p1", "label": "Old", "base": "https://a.com/v1"}],
+                "bulk": {}, "synth": {}}
+        dashboard_server._save_providers(data)
+        data["providers"][0]["label"] = "New"
+        data["providers"][0]["base"] = "https://b.com/v1"
+        dashboard_server._save_providers(data)
+        loaded = dashboard_server._load_providers()
+        self.assertEqual(loaded["providers"][0]["label"], "New")
+        self.assertEqual(loaded["providers"][0]["base"], "https://b.com/v1")
+
+    def test_delete_clears_selection(self):
+        data = {
+            "providers": [{"id": "p1", "label": "A", "base": "https://a.com/v1"}],
+            "bulk": {"provider_id": "p1", "model": "gpt-4o", "thinking": "low"},
+            "synth": {"provider_id": "p1", "model": "gpt-4o", "thinking": "medium"},
+        }
+        dashboard_server._save_providers(data)
+        data["providers"] = []
+        for role in ("bulk", "synth"):
+            if data.get(role, {}).get("provider_id") == "p1":
+                data[role] = {}
+        dashboard_server._save_providers(data)
+        loaded = dashboard_server._load_providers()
+        self.assertEqual(loaded["providers"], [])
+        self.assertEqual(loaded["bulk"], {})
+        self.assertEqual(loaded["synth"], {})
+
+    def test_key_hint_masked(self):
+        dashboard_server._write_env_file({"LLM_KEY_px": "sk-abcdefghij"})
+        key = dashboard_server._provider_key("px")
+        self.assertEqual(key, "sk-abcdefghij")
+        hint = ("..." + key[-4:]) if len(key) > 4 else "*" * len(key)
+        self.assertEqual(hint, "...ghij")
+
+    def test_selection_written_to_env(self):
+        data = {
+            "providers": [
+                {"id": "p1", "label": "OpenAI", "base": "https://api.openai.com/v1"},
+                {"id": "p2", "label": "Anthropic", "base": "https://api.anthropic.com/v1"},
+            ],
+            "bulk": {}, "synth": {},
+        }
+        dashboard_server._save_providers(data)
+        dashboard_server._write_env_file({"LLM_KEY_p1": "sk-oai", "LLM_KEY_p2": "sk-ant"})
+        # Simulate what /api/llm_selection does
+        env_updates = {
+            "PODCAST_LLM_BASE": "https://api.openai.com/v1",
+            "PODCAST_LLM_MODEL": "gpt-4o-mini",
+            "PODCAST_LLM_KEY": "sk-oai",
+            "PODCAST_SYNTH_BASE": "https://api.anthropic.com/v1",
+            "PODCAST_SYNTH_MODEL": "claude-sonnet-4-6",
+            "PODCAST_SYNTH_KEY": "sk-ant",
+        }
+        dashboard_server._write_env_file(env_updates)
+        env = dashboard_server._load_env_file()
+        self.assertEqual(env["PODCAST_LLM_MODEL"], "gpt-4o-mini")
+        self.assertEqual(env["PODCAST_SYNTH_MODEL"], "claude-sonnet-4-6")
+        self.assertEqual(env["PODCAST_SYNTH_KEY"], "sk-ant")
+        self.assertNotEqual(env["PODCAST_LLM_KEY"], env["PODCAST_SYNTH_KEY"])
+
+
+class TestSynthConfig(unittest.TestCase):
+    """synth_config must use PODCAST_SYNTH_KEY/BASE when set (different provider)."""
+
+    def setUp(self):
+        self._saved = {}
+        for k in ("PODCAST_LLM_KEY", "PODCAST_LLM_BASE", "PODCAST_LLM_MODEL",
+                  "PODCAST_SYNTH_KEY", "PODCAST_SYNTH_BASE", "PODCAST_SYNTH_MODEL",
+                  "OPENAI_API_KEY"):
+            self._saved[k] = os.environ.pop(k, None)
+        # Disable load_env so it doesn't pull from disk
+        self._orig_load_env = analyze_transcripts.load_env
+        analyze_transcripts.load_env = lambda: None
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+        analyze_transcripts.load_env = self._orig_load_env
+
+    def test_synth_falls_back_to_bulk(self):
+        os.environ["PODCAST_LLM_KEY"] = "bulk-key"
+        os.environ["PODCAST_LLM_BASE"] = "https://api.openai.com/v1"
+        os.environ["PODCAST_LLM_MODEL"] = "gpt-4o-mini"
+        key, base, model = analyze_transcripts.synth_config()
+        self.assertEqual(key, "bulk-key")
+        self.assertEqual(base, "https://api.openai.com/v1")
+        self.assertEqual(model, "gpt-4o-mini")
+
+    def test_synth_uses_own_key_and_base(self):
+        os.environ["PODCAST_LLM_KEY"] = "bulk-key"
+        os.environ["PODCAST_LLM_BASE"] = "https://api.openai.com/v1"
+        os.environ["PODCAST_LLM_MODEL"] = "gpt-4o-mini"
+        os.environ["PODCAST_SYNTH_KEY"] = "synth-key"
+        os.environ["PODCAST_SYNTH_BASE"] = "https://api.anthropic.com/v1"
+        os.environ["PODCAST_SYNTH_MODEL"] = "claude-sonnet-4-6"
+        key, base, model = analyze_transcripts.synth_config()
+        self.assertEqual(key, "synth-key")
+        self.assertEqual(base, "https://api.anthropic.com/v1")
+        self.assertEqual(model, "claude-sonnet-4-6")
+
+    def test_synth_model_only_override(self):
+        os.environ["PODCAST_LLM_KEY"] = "shared-key"
+        os.environ["PODCAST_LLM_BASE"] = "https://api.openai.com/v1"
+        os.environ["PODCAST_LLM_MODEL"] = "gpt-4o-mini"
+        os.environ["PODCAST_SYNTH_MODEL"] = "gpt-4o"
+        key, base, model = analyze_transcripts.synth_config()
+        self.assertEqual(key, "shared-key")   # key unchanged
+        self.assertEqual(base, "https://api.openai.com/v1")  # base unchanged
+        self.assertEqual(model, "gpt-4o")    # model overridden
+
+
+class TestHermesDirEnvVar(unittest.TestCase):
+    """profiles.HERMES must respect the HERMES_DIR env var."""
+
+    def test_default_is_home_hermes(self):
+        import importlib
+        saved = os.environ.pop("HERMES_DIR", None)
+        try:
+            import profiles as p
+            importlib.reload(p)
+            self.assertEqual(p.HERMES, Path.home() / ".hermes")
+        finally:
+            if saved:
+                os.environ["HERMES_DIR"] = saved
+            importlib.reload(profiles)
+
+    def test_override_via_env_var(self):
+        import importlib
+        tmp = tempfile.mkdtemp()
+        os.environ["HERMES_DIR"] = tmp
+        try:
+            import profiles as p
+            importlib.reload(p)
+            self.assertEqual(str(p.HERMES), tmp)
+        finally:
+            del os.environ["HERMES_DIR"]
+            importlib.reload(profiles)
+
+
+class TestAPISmoke(unittest.TestCase):
+    """Start a real test server and verify all key endpoints return valid JSON."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading, http.client, time
+        cls.tmp = Path(tempfile.mkdtemp())
+        # Point everything at the temp dir — DB, providers, env, and HERMES (for logs)
+        fresh_db(str(cls.tmp / "t.db"))
+        dashboard_server.DB_PATH = str(cls.tmp / "t.db")
+        dashboard_server.PROVIDERS_FILE = cls.tmp / "llm_providers.json"
+        dashboard_server.ENV_FILE = cls.tmp / ".env"
+        cls._orig_hermes = profiles.HERMES
+        cls._orig_legacy_db = profiles.LEGACY_DB
+        cls._orig_digests_dir = profiles.DIGESTS_DIR
+        profiles.HERMES = cls.tmp
+        profiles.LEGACY_DB = cls.tmp / "t.db"  # refresh_active_db() calls profiles.load() on every request
+        profiles.DIGESTS_DIR = cls.tmp / "digests"  # digest_dir_for() uses module-level DIGESTS_DIR
+        (cls.tmp / "logs").mkdir(exist_ok=True)
+        (cls.tmp / "digests").mkdir(exist_ok=True)
+        cls.server = __import__("http").server.HTTPServer(("127.0.0.1", 0), dashboard_server.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        profiles.HERMES = cls._orig_hermes
+        profiles.LEGACY_DB = cls._orig_legacy_db
+        profiles.DIGESTS_DIR = cls._orig_digests_dir
+
+    def _get(self, path):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        r = conn.getresponse()
+        body = r.read()
+        conn.close()
+        return r.status, json.loads(body)
+
+    def _post(self, path, payload):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        data = json.dumps(payload).encode()
+        conn.request("POST", path, body=data, headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        body = r.read()
+        conn.close()
+        return r.status, json.loads(body)
+
+    def test_candidates_returns_list(self):
+        status, body = self._get("/api/candidates")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body, list)
+
+    def test_stats_returns_dict(self):
+        status, body = self._get("/api/stats")
+        self.assertEqual(status, 200)
+        self.assertIn("total", body)
+
+    def test_profiles_returns_active(self):
+        status, body = self._get("/api/profiles")
+        self.assertEqual(status, 200)
+        self.assertIn("active", body)
+        self.assertIn("settings", body)
+
+    def test_llm_providers_returns_list(self):
+        status, body = self._get("/api/llm_providers")
+        self.assertEqual(status, 200)
+        self.assertIn("providers", body)
+        self.assertIsInstance(body["providers"], list)
+
+    def test_job_log_missing_returns_exists_false(self):
+        status, body = self._get("/api/job_log?name=nonexistent_job_xyz")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["exists"])
+
+    def test_job_status_returns_running_bool(self):
+        status, body = self._get("/api/job_status?name=podcast_scraper")
+        self.assertEqual(status, 200)
+        self.assertIn("running", body)
+        self.assertIsInstance(body["running"], bool)
+
+    def test_add_then_delete_provider(self):
+        status, body = self._post("/api/llm_providers/add",
+            {"label": "TestCo", "base": "https://api.test.com/v1", "key": "sk-test99"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        pid = body["id"]
+        # verify it appears in list
+        _, providers = self._get("/api/llm_providers")
+        ids = [p["id"] for p in providers["providers"]]
+        self.assertIn(pid, ids)
+        # delete it
+        status2, body2 = self._post("/api/llm_providers/delete", {"id": pid})
+        self.assertTrue(body2["ok"])
+        _, providers2 = self._get("/api/llm_providers")
+        ids2 = [p["id"] for p in providers2["providers"]]
+        self.assertNotIn(pid, ids2)
+
+    def test_job_log_offset_excludes_previous_run(self):
+        """Second run: reader must not see lines from the first run."""
+        log_dir = self.tmp / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / "podcast_scraper.log"
+        # Simulate a completed first run already in the log
+        first_run = "\n".join(f"line {i}" for i in range(50)) + "\n--- Run complete ---\n"
+        log_file.write_text(first_run)
+        # Snapshot offset (what the client records before starting run 2)
+        status, snap = self._get("/api/job_log?name=podcast_scraper&lines=1")
+        offset = snap["total_lines"]
+        self.assertEqual(offset, 51)  # 50 lines + "--- Run complete ---"
+        # Append second run output
+        log_file.write_text(first_run + "run2 line A\nrun2 line B\n")
+        # Fetch with offset — should only see run 2 lines
+        status, body = self._get(f"/api/job_log?name=podcast_scraper&lines=80&offset={offset}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["lines"], ["run2 line A", "run2 line B"])
+        self.assertNotIn("--- Run complete ---", body["lines"])
+
+    def test_unknown_route_returns_404(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/does_not_exist")
+        r = conn.getresponse()
+        conn.close()
+        self.assertEqual(r.status, 404)
+
+    def test_digest_pending_returns_count(self):
+        status, body = self._get("/api/digest_pending")
+        self.assertEqual(status, 200)
+        self.assertIn("count", body)
+
+    def test_report_channels_returns_list(self):
+        status, body = self._get("/api/report_channels")
+        self.assertEqual(status, 200)
+        self.assertIn("channels", body)
+        self.assertIsInstance(body["channels"], list)
+
+    def _digest_dir(self):
+        """Returns the digest dir the test server resolves to (DIGESTS_DIR / profile-slug)."""
+        import profiles as p
+        ddir = p.DIGESTS_DIR / "seo-geo"
+        ddir.mkdir(parents=True, exist_ok=True)
+        return ddir
+
+    def test_digest_list_returns_list(self):
+        ddir = self._digest_dir()
+        (ddir / "digest_2026-06-01.md").write_text("# Test Digest\n")
+        status, body = self._get("/api/digest_list")
+        self.assertEqual(status, 200)
+        self.assertIn("digests", body)
+        self.assertIsInstance(body["digests"], list)
+        names = [d["filename"] for d in body["digests"]]
+        self.assertIn("digest_2026-06-01.md", names)
+
+    def test_digest_file_returns_content(self):
+        ddir = self._digest_dir()
+        (ddir / "digest_2026-06-02.md").write_text("# Hello Digest\n")
+        status, body = self._get("/api/digest_file?name=digest_2026-06-02.md")
+        self.assertEqual(status, 200)
+        self.assertIn("Hello Digest", body["markdown"])
+
+    def test_digest_file_rejects_traversal(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/digest_file?name=../../../etc/passwd")
+        r = conn.getresponse()
+        conn.close()
+        self.assertEqual(r.status, 400)
+
+    def test_delete_digest_removes_file(self):
+        ddir = self._digest_dir()
+        (ddir / "digest_2026-06-03.md").write_text("# To Delete\n")
+        status, body = self._post("/api/delete_digest", {"filename": "digest_2026-06-03.md"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertFalse((ddir / "digest_2026-06-03.md").exists())
+
+    def test_delete_digest_rejects_traversal(self):
+        status, body = self._post("/api/delete_digest", {"filename": "../../../tmp/evil.md"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"])
+
+
+class TestOvernightPipeline(unittest.TestCase):
+    """The unattended runner must not crash, and must stop re-promoting a
+    stubbornly-failing 'error' row forever (LEARNINGS P8)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "t.db")
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE videos (id TEXT PRIMARY KEY, transcript_status TEXT, "
+                     "fetch_attempts INTEGER DEFAULT 0)")
+        conn.execute("INSERT INTO videos VALUES ('dead', 'error', 0)")
+        conn.execute("INSERT INTO videos VALUES ('ok', 'requested', 0)")
+        conn.commit(); conn.close()
+        import overnight_pipeline
+        self.op = overnight_pipeline
+
+    def test_promote_errors_caps_retries(self):
+        # Promote up to MAX_FETCH_ATTEMPTS times, then stop (row becomes capped).
+        promoted_rounds = 0
+        for _ in range(self.op.MAX_FETCH_ATTEMPTS + 3):
+            # Re-mark the dead row as error each round (a real fetch would).
+            c = sqlite3.connect(self.db)
+            c.execute("UPDATE videos SET transcript_status='error' WHERE id='dead' "
+                      "AND transcript_status='requested'")
+            c.commit(); c.close()
+            promoted, capped = self.op.promote_errors(self.db)
+            if promoted:
+                promoted_rounds += 1
+        # It promoted at most MAX_FETCH_ATTEMPTS times, then gave up.
+        self.assertLessEqual(promoted_rounds, self.op.MAX_FETCH_ATTEMPTS)
+        c = sqlite3.connect(self.db)
+        attempts = c.execute("SELECT fetch_attempts FROM videos WHERE id='dead'").fetchone()[0]
+        c.close()
+        self.assertEqual(attempts, self.op.MAX_FETCH_ATTEMPTS)
+
+    def test_write_digest_signature_matches(self):
+        # Regression: overnight called build_digest(days=...) which doesn't exist,
+        # crashing every round. Ensure the call signature is now valid.
+        import inspect, generate_digest
+        sig = inspect.signature(generate_digest.build_digest)
+        self.assertNotIn("days", sig.parameters)
+        self.assertIn("force", sig.parameters)
 
 
 if __name__ == "__main__":

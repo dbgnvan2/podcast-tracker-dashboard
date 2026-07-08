@@ -30,15 +30,13 @@ def fmt_ts(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def build_digest(days=None, limit=10):
+def build_digest(force=False, limit=10):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
     where = "v.transcript_status='obtained' AND a.video_id IS NOT NULL"
-    params = []
-    if days:
-        where += " AND (v.transcribed_date IS NULL OR v.transcribed_date >= date('now', ?))"
-        params.append(f"-{int(days)} days")
+    if not force:
+        where += " AND v.digested_at IS NULL"
 
     rows = conn.execute(
         f"""SELECT v.id, v.video_title, v.channel_name, v.views, v.quality_score,
@@ -46,16 +44,17 @@ def build_digest(days=None, limit=10):
             FROM videos v JOIN ai_analysis a ON a.video_id = v.id
             WHERE {where}
             ORDER BY v.quality_score DESC LIMIT ?""",
-        params + [limit],
+        [limit],
     ).fetchall()
 
     today = datetime.now().strftime("%Y-%m-%d")
     if not rows:
         md = (f"# {DIGEST_TITLE} — {today}\n\n"
-              "_No analyzed videos yet. Transcribe and analyze some candidates "
-              "to populate the digest._\n")
+              "_No new analyzed videos since last digest. Use --force to re-digest all._\n")
         conn.close()
-        return md, today
+        return md, today, []
+
+    ids = [r["id"] for r in rows]
 
     ent_counter, geo_counter = Counter(), Counter()
     lines = [f"# {DIGEST_TITLE} — {today}", ""]
@@ -100,23 +99,51 @@ def build_digest(days=None, limit=10):
         top = ", ".join(f"{g} ({c})" for g, c in geo_counter.most_common(10))
         lines += ["### Trending GEO signals", top, ""]
 
+    # NOTE: we deliberately do NOT mark videos digested here. Marking before the
+    # digest file is durably written would lose those videos forever if the write
+    # fails (digested_at != NULL excludes them from every future run, recoverable
+    # only via --force). The caller must write the file, THEN call mark_digested().
     conn.close()
-    return "\n".join(lines), today
+    return "\n".join(lines), today, ids
+
+
+def mark_digested(ids, day):
+    """Record that these video ids were included in a successfully-written digest.
+    Call ONLY after the digest file is durably on disk (see build_digest note)."""
+    if not ids:
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(
+        f"UPDATE videos SET digested_at=? WHERE id IN ({placeholders})",
+        [day] + list(ids),
+    )
+    conn.commit()
+    conn.close()
 
 
 def main():
-    days = None
-    limit = 10
+    force = False
+    limit = 50
     for a in sys.argv[1:]:
-        if a.startswith("--days="):
-            days = int(a.split("=", 1)[1])
+        if a == "--force":
+            force = True
         elif a.startswith("--limit="):
             limit = int(a.split("=", 1)[1])
-    md, today = build_digest(days=days, limit=limit)
+    md, today, ids = build_digest(force=force, limit=limit)
+    # Avoid overwriting an earlier digest from the same day
     out = DIGEST_DIR / f"digest_{today}.md"
+    if out.exists() and ids:
+        seq = 2
+        while (DIGEST_DIR / f"digest_{today}_{seq}.md").exists():
+            seq += 1
+        out = DIGEST_DIR / f"digest_{today}_{seq}.md"
     out.write_text(md, encoding="utf-8")
     (DIGEST_DIR / "latest.md").write_text(md, encoding="utf-8")
+    # Mark digested only AFTER the file is durably written.
+    mark_digested(ids, today)
     print(f"Wrote {out}")
+    print(f"Newly digested: {len(ids)} video(s)")
     print(md)
 
 

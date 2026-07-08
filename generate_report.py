@@ -31,8 +31,37 @@ REPORTS_DIR = Path(_PROFILE["reports_dir"])
 FOCUS = _PROFILE.get("analysis_focus", "this topic")
 TITLE = _PROFILE.get("digest_title", "Advisor Report").replace("Best of", "Advisor Report:")
 
-EXCERPT_CHARS = 2800       # transcript excerpt per source (richer grounding)
-MAX_SOURCES = 12           # hard cap to keep the prompt grounded + affordable
+MAX_SOURCES = 24           # hard cap on how many analyzed videos feed one report
+MAX_KEY_POINTS = 20        # extracted key points per source sent to the model
+
+# Total transcript characters sent across ALL sources. ~4 chars/token, so the
+# default ~320k chars ≈ 80k tokens of transcript — well within a 128k-context
+# model while leaving room for key points, scaffolding, and a long output.
+# Override with PODCAST_REPORT_BUDGET_CHARS for bigger/smaller context models.
+TRANSCRIPT_BUDGET_CHARS = int(os.environ.get("PODCAST_REPORT_BUDGET_CHARS", 320_000))
+
+
+def allocate_excerpts(texts, budget):
+    """Max-min fair allocation of a global char budget across transcripts.
+
+    Short transcripts are sent in full; whatever they don't use is redistributed
+    to longer ones. With a budget >= total length, every source goes in whole.
+    Returns excerpts in the same order as `texts`.
+    """
+    n = len(texts)
+    if n == 0:
+        return []
+    out = [""] * n
+    remaining = budget
+    left = n
+    # Settle shortest-first so leftover flows to the long transcripts.
+    for idx in sorted(range(n), key=lambda i: len(texts[i] or "")):
+        share = remaining // max(left, 1)
+        take = min(len(texts[idx] or ""), share)
+        out[idx] = (texts[idx] or "")[:take]
+        remaining -= take
+        left -= 1
+    return out
 
 
 def fmt_ts(sec):
@@ -41,26 +70,46 @@ def fmt_ts(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def select_sources(n):
-    """Last N analyzed transcripts (most recently transcribed first)."""
+def select_sources(n, date_from=None, date_to=None, channel=None):
+    """Last N analyzed transcripts (most recently transcribed first), with optional filters."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("""
+    where_clauses = ["v.transcript_status = 'obtained'"]
+    params = []
+    if date_from:
+        where_clauses.append("v.transcribed_date >= ?")
+        params.append(date_from)
+    if date_to:
+        where_clauses.append("v.transcribed_date <= ?")
+        params.append(date_to)
+    if channel:
+        if isinstance(channel, (list, tuple)):
+            # Multiple channels — exact match on any of the picklist names.
+            ph = ",".join("?" * len(channel))
+            where_clauses.append(f"v.channel_name IN ({ph})")
+            params.extend(channel)
+        else:
+            # Single channel (CLI / legacy) — substring match.
+            where_clauses.append("v.channel_name LIKE ?")
+            params.append(channel)
+    where = " AND ".join(where_clauses)
+    params.append(min(n, MAX_SOURCES))
+    rows = conn.execute(f"""
         SELECT v.id, v.video_title, v.channel_name, v.transcribed_date, v.url,
                v.source_type, t.full_text, a.best_quote
         FROM videos v
         JOIN transcripts t ON t.video_id = v.id
         JOIN ai_analysis a ON a.video_id = v.id
-        WHERE v.transcript_status = 'obtained'
+        WHERE {where}
         ORDER BY v.transcribed_date DESC, v.quality_score DESC
         LIMIT ?
-    """, (min(n, MAX_SOURCES),)).fetchall()
+    """, params).fetchall()
 
     sources = []
     for i, r in enumerate(rows, 1):
         kps = conn.execute(
             "SELECT timestamp_sec, point_text FROM key_points WHERE video_id=? "
-            "ORDER BY timestamp_sec LIMIT 8", (r["id"],)).fetchall()
+            "ORDER BY timestamp_sec LIMIT ?", (r["id"], MAX_KEY_POINTS)).fetchall()
         is_yt = (r["source_type"] or "youtube") == "youtube"
         sources.append({
             "n": i,
@@ -71,7 +120,7 @@ def select_sources(n):
             "is_youtube": is_yt,
             "best_quote": r["best_quote"] or "",
             "key_points": [{"t": k["timestamp_sec"], "text": k["point_text"]} for k in kps],
-            "excerpt": (r["full_text"] or "")[:EXCERPT_CHARS],
+            "full_text": r["full_text"] or "",
             "first_ts": kps[0]["timestamp_sec"] if kps else 0,
         })
     conn.close()
@@ -79,28 +128,41 @@ def select_sources(n):
 
 
 def build_prompt(sources):
+    # Fairly distribute the transcript budget so long videos aren't starved.
+    excerpts = allocate_excerpts([s["full_text"] for s in sources], TRANSCRIPT_BUDGET_CHARS)
     blocks = []
-    for s in sources:
+    for s, excerpt in zip(sources, excerpts):
         kp = "\n".join(f"    - [{fmt_ts(k['t'])}] {k['text']}" for k in s["key_points"])
+        full = s["full_text"] or ""
+        tag = " (full transcript)" if len(excerpt) >= len(full) else f" (excerpt: {len(excerpt):,} of {len(full):,} chars)"
         blocks.append(
             f"SOURCE {s['n']}: \"{s['title']}\" — {s['channel']}\n"
             f"  Key points:\n{kp}\n"
             f"  Notable quote: {s['best_quote']}\n"
-            f"  Transcript excerpt: {s['excerpt']}\n"
+            f"  Transcript{tag}: {excerpt}\n"
         )
     sources_text = "\n".join(blocks)
     return f"""You are an expert advisor writing a factual, educational briefing about
 {FOCUS}. You are given {len(sources)} verified sources (video transcripts), each
-numbered. Synthesize them into ONE cohesive report.
+numbered. Synthesize them into ONE cohesive, comprehensive report.
 
 The report has two layers:
-1. "Executive Key Ideas" = the SUMMARY: 5-7 of the most important takeaways, each a
+1. "Executive Key Ideas" = the SUMMARY: the most important distinct takeaways, each a
    short title + a one-sentence summary.
-2. A DETAILED expansion of each key idea — this is the bulk of the report. For each
-   idea explain, in depth: why it matters (significance/consequences), the mechanism
-   or reasoning behind it, and concretely what has to happen to implement it
-   (actionable steps). Include specifics, examples, numbers, and nuances from the
-   sources. Note where sources agree or disagree.
+2. A DETAILED expansion of each key idea — this is the bulk of the report and should be
+   thorough. For each idea explain, in depth: why it matters (significance/consequences),
+   the mechanism or reasoning behind it, and concretely what has to happen to implement
+   it (actionable steps). Include the specifics, examples, numbers, frameworks, and
+   nuances from the sources. Note where sources agree, disagree, or add nuance.
+
+COVERAGE — be comprehensive, do not over-compress:
+- Extract as many distinct, non-overlapping ideas as the sources genuinely support.
+  For a large corpus like this, that is typically 10-18 ideas. Do NOT collapse the
+  whole corpus into a handful of generic points, and do NOT pad with filler — every
+  idea must be substantive and grounded in the sources.
+- Prefer splitting a broad theme into several specific, actionable ideas over merging
+  distinct techniques into one vague idea.
+- Make sure ideas collectively cover the breadth of ALL sources, not just the first few.
 
 STRICT RULES:
 - Use ONLY information contained in the supplied sources. Do not add outside facts.
@@ -113,17 +175,17 @@ STRICT RULES:
 
 Produce JSON with this EXACT shape:
 {{
-  "overview": "3-5 sentence factual overview of what these sources collectively cover and who should care",
+  "overview": "4-6 sentence factual overview of what these sources collectively cover and who should care",
   "key_ideas": [
      {{
        "title": "short imperative title (≤8 words)",
        "summary": "one-sentence executive summary of the idea",
        "why_it_matters": "1-2 substantial paragraphs: the significance, stakes, and consequences of getting this right or wrong",
        "how_to_implement": ["concrete actionable step", "another concrete step", "..."],
-       "details": "1-2 paragraphs of deeper explanation: mechanism, evidence, examples, caveats, points of agreement/disagreement across sources",
+       "details": "2-3 paragraphs of deeper explanation: mechanism, evidence, examples, numbers, caveats, and points of agreement/disagreement across sources",
        "sources": [1, 3]
      }}
-     // 5-7 ideas, ordered most-important first
+     // as many distinct ideas as the sources support (typically 10-18), most-important first
   ]
 }}
 
@@ -194,8 +256,8 @@ def render(report, sources, today):
     return "\n".join(L)
 
 
-def build_report(n=8):
-    sources = select_sources(n)
+def build_report(n=8, date_from=None, date_to=None, channel=None):
+    sources = select_sources(n, date_from=date_from, date_to=date_to, channel=channel)
     today = datetime.now().strftime("%Y-%m-%d")
     if not sources:
         return (f"# {TITLE} — {today}\n\n_No analyzed transcripts yet. Transcribe and "
@@ -217,13 +279,30 @@ def build_report(n=8):
 
 
 def main():
+    import re as _re
     n = 8
+    date_from = None
+    date_to = None
+    channels = []
     for a in sys.argv[1:]:
         if a.startswith("--n="):
             n = int(a.split("=", 1)[1])
-    md, today = build_report(n=n)
+        elif a.startswith("--from="):
+            date_from = a.split("=", 1)[1]
+        elif a.startswith("--to="):
+            date_to = a.split("=", 1)[1]
+        elif a.startswith("--channel="):
+            channels.append(a.split("=", 1)[1])
+    channel = channels or None  # list of exact names, or None for all
+    md, today = build_report(n=n, date_from=date_from, date_to=date_to, channel=channel)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = REPORTS_DIR / f"report_{today}.md"
+    suffix = ""
+    if date_from or date_to:
+        suffix = f"_{date_from or 'start'}_{date_to or 'end'}"
+    elif channels:
+        joined = "_".join(channels) if len(channels) <= 2 else f"{channels[0]}_plus{len(channels)-1}"
+        suffix = "_" + _re.sub(r'[^a-z0-9]+', '_', joined.lower()).strip('_')[:30]
+    out = REPORTS_DIR / f"report_{today}{suffix}.md"
     out.write_text(md, encoding="utf-8")
     (REPORTS_DIR / "latest.md").write_text(md, encoding="utf-8")
     print(f"Wrote {out}")

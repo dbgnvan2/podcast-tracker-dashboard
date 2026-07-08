@@ -7,14 +7,98 @@ import urllib.parse
 import sys
 import argparse
 import subprocess
+import urllib.request
+from pathlib import Path
 
 import profiles
+
+ENV_FILE = profiles.HERMES / ".env"
+LLM_KEYS = ("PODCAST_LLM_KEY", "PODCAST_LLM_BASE", "PODCAST_LLM_MODEL", "PODCAST_SYNTH_MODEL")
+
+
+def _load_env_file():
+    if not ENV_FILE.is_file():
+        return {}
+    out = {}
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _write_env_file(updates: dict):
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.is_file() else []
+    written = set()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.split("=", 1)[0].strip()
+            if k in updates:
+                if updates[k]:
+                    new_lines.append(f'{k}={updates[k]}')
+                written.add(k)
+                continue
+        new_lines.append(line)
+    for k, v in updates.items():
+        if k not in written and v:
+            new_lines.append(f'{k}={v}')
+    ENV_FILE.write_text("\n".join(new_lines) + "\n")
+
+PROVIDERS_FILE = profiles.HERMES / "llm_providers.json"
+
+def _load_providers():
+    if not PROVIDERS_FILE.is_file():
+        return {"providers": [], "bulk": {}, "synth": {}}
+    try:
+        return json.loads(PROVIDERS_FILE.read_text())
+    except Exception:
+        return {"providers": [], "bulk": {}, "synth": {}}
+
+def _save_providers(data):
+    PROVIDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROVIDERS_FILE.write_text(json.dumps(data, indent=2))
+
+def _provider_key(pid):
+    """Return the API key for a provider id from ~/.hermes/.env."""
+    return _load_env_file().get(f"LLM_KEY_{pid}", "")
+
+def _make_provider_id():
+    import time
+    return f"p{int(time.time() * 1000) % 10000000}"
+
+def _migrate_legacy_llm():
+    """One-time migration: if old PODCAST_LLM_KEY exists but no providers, create one."""
+    data = _load_providers()
+    if data["providers"]:
+        return
+    env = _load_env_file()
+    key = env.get("PODCAST_LLM_KEY") or env.get("OPENAI_API_KEY", "")
+    base = env.get("PODCAST_LLM_BASE", "https://api.openai.com/v1")
+    model = env.get("PODCAST_LLM_MODEL", "gpt-4o-mini")
+    synth_model = env.get("PODCAST_SYNTH_MODEL", "")
+    if not key:
+        return
+    pid = _make_provider_id()
+    label = "OpenAI" if "openai" in base else "LLM"
+    data["providers"].append({"id": pid, "label": label, "base": base.rstrip("/")})
+    data["bulk"] = {"provider_id": pid, "model": model, "thinking": "low"}
+    if synth_model:
+        data["synth"] = {"provider_id": pid, "model": synth_model, "thinking": "medium"}
+    _write_env_file({f"LLM_KEY_{pid}": key})
+    _save_providers(data)
+
+_migrate_legacy_llm()
 
 # DB_PATH is refreshed from the active investigation profile at the start of
 # every request (the server is single-threaded, so this is safe). This is what
 # makes profile-switching show a different dataset without restarting.
 DB_PATH = profiles.load()["db_path"]
-TRANSCRIPTS_DIR = os.path.expanduser("~/.hermes/transcripts")
+TRANSCRIPTS_DIR = str(profiles.HERMES / "transcripts")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FETCH_SCRIPT = os.path.join(SCRIPT_DIR, "fetch_transcripts.py")
 ANALYZE_SCRIPT = os.path.join(SCRIPT_DIR, "analyze_transcripts.py")
@@ -84,6 +168,13 @@ def migrate(db=None):
         ("doi", "ALTER TABLE videos ADD COLUMN doi TEXT"),
         ("citations", "ALTER TABLE videos ADD COLUMN citations INTEGER DEFAULT 0"),
         ("venue", "ALTER TABLE videos ADD COLUMN venue TEXT"),
+        # User-initiated dismiss — hide permanently without affecting transcript pipeline
+        ("dismissed", "ALTER TABLE videos ADD COLUMN dismissed INTEGER DEFAULT 0"),
+        # Track which videos have been included in a digest
+        ("digested_at", "ALTER TABLE videos ADD COLUMN digested_at TEXT"),
+        # Count fetch attempts so the overnight runner stops re-promoting a
+        # stubbornly-failing 'error' row forever (see overnight_pipeline.py).
+        ("fetch_attempts", "ALTER TABLE videos ADD COLUMN fetch_attempts INTEGER DEFAULT 0"),
     ]:
         if col not in columns:
             print(f"Adding '{col}' column...")
@@ -338,6 +429,14 @@ HTML = """
         .bar-count { width: 50px; font-size: 0.85rem; font-family: monospace; }
         
         #loading { text-align: center; padding: 50px; color: var(--text-dim); }
+        .thinking-btn { padding:4px 12px; border:1px solid var(--border); background:var(--card-bg); color:var(--text-main); border-radius:4px; cursor:pointer; font-size:0.8rem; }
+        .thinking-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+        .llm-provider-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; margin-bottom:6px; background:var(--card-bg); }
+        .llm-provider-row .prov-label { font-weight:600; font-size:0.9rem; min-width:100px; }
+        .llm-provider-row .prov-base { font-size:0.8rem; color:var(--text-dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .llm-provider-row .prov-hint { font-size:0.8rem; color:var(--text-dim); min-width:70px; text-align:right; }
+        .icon-btn { background:none; border:none; cursor:pointer; font-size:1rem; padding:2px 6px; border-radius:4px; color:var(--text-dim); }
+        .icon-btn:hover { background:var(--border); color:var(--text-main); }
     </style>
 </head>
 <body>
@@ -369,6 +468,17 @@ HTML = """
         
         <div id="loading">Loading data...</div>
 
+        <div id="discovery-log-panel" style="display:none;margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:var(--card-bg);border-bottom:1px solid var(--border)">
+                <span style="font-weight:600;font-size:0.85rem">Discovery log</span>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <span id="discovery-log-status" style="font-size:0.8rem;color:var(--text-dim)"></span>
+                    <button class="btn" onclick="toggleLogPanel()" style="font-size:0.75rem;padding:2px 8px">Hide</button>
+                </div>
+            </div>
+            <pre id="discovery-log-lines" style="margin:0;padding:8px 12px;font-size:0.72rem;line-height:1.45;max-height:160px;overflow-y:auto;background:var(--bg);color:var(--text-main);white-space:pre-wrap;word-break:break-word"></pre>
+        </div>
+
         <div id="candidates" class="tab-content active">
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
                 <button class="btn btn-primary" onclick="runDiscovery()">🔄 Run Discovery</button>
@@ -379,6 +489,7 @@ HTML = """
                 <button id="sort-trending" class="tab-btn" onclick="setCandidateSort('trending')">🔥 Trending</button>
             </div>
             <div class="search-container"><input type="text" class="search-box" placeholder="Search candidates..." oninput="filterTable('candidates')"></div>
+            <div id="candidates-count" style="color:var(--text-dim);font-size:0.8rem;margin-bottom:6px"></div>
             <table id="table-candidates">
                 <thead><tr><th width="50">Score</th><th>Title</th><th>Channel</th><th>Views</th><th>Views/day</th><th width="100">Action</th></tr></thead>
                 <tbody></tbody>
@@ -387,7 +498,7 @@ HTML = """
 
         <div id="requested" class="tab-content">
             <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
-                <button class="btn btn-primary" onclick="processQueue()">⚙ Process Queue</button>
+                <button id="queue-btn" class="btn btn-primary" onclick="processQueue()">⚙ Process Queue</button>
                 <span id="queue-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
             </div>
             <div class="search-container"><input type="text" class="search-box" placeholder="Search requested..." oninput="filterTable('requested')"></div>
@@ -407,30 +518,40 @@ HTML = """
 
         <div id="intelligence" class="tab-content">
             <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
-                <button class="btn btn-primary" onclick="runAnalyze()">🧠 Analyze Transcripts</button>
+                <button id="analyze-btn" class="btn btn-primary" onclick="runAnalyze()">🧠 Analyze Transcripts</button>
                 <span id="analyze-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
             </div>
             <div id="intel-list"></div>
         </div>
 
         <div id="digest" class="tab-content">
-            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
-                <button class="btn btn-primary" onclick="generateDigest()">📰 Generate Weekly Digest</button>
-                <button class="btn btn-view" onclick="printDoc('Weekly Digest')">🖨 Save as PDF</button>
+            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:15px;">
+                <button id="digest-btn" class="btn btn-primary" onclick="generateDigest()">📰 Generate Digest</button>
+                <span id="digest-pending" style="color:var(--text-dim);font-size:0.85rem;margin-left:8px"></span>
+                <button class="btn" onclick="toggleDigestList(this)">📋 Past Digests</button>
+                <button class="btn btn-view" onclick="printDoc('Digest')">🖨 Save as PDF</button>
                 <span id="digest-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
+            </div>
+            <div id="digest-list-panel" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:15px;">
+                <div id="digest-list-rows"></div>
             </div>
             <div class="chart-section" id="digest-content" style="white-space: pre-wrap; line-height: 1.6;"></div>
         </div>
 
         <div id="report" class="tab-content">
-            <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
-                <span style="color:var(--text-dim);font-size:0.85rem">Last</span>
-                <input id="report-n" type="number" value="8" min="2" max="12" style="width:60px;background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;">
-                <span style="color:var(--text-dim);font-size:0.85rem">transcripts</span>
-                <button class="btn btn-primary" onclick="generateReport()">📋 Generate Advisor Report</button>
-                <button class="btn btn-view" onclick="printDoc('Advisor Report')">🖨 Save as PDF</button>
+            <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+                <label style="color:var(--text-dim);font-size:0.85rem">From<input type="date" id="report-from" style="background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;margin-left:4px"></label>
+                <label style="color:var(--text-dim);font-size:0.85rem">To<input type="date" id="report-to" style="background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;margin-left:4px"></label>
+                <label style="color:var(--text-dim);font-size:0.85rem">Max sources<input id="report-n" type="number" value="12" min="2" max="24" style="width:60px;background:var(--card-bg);color:var(--text-main);border:1px solid var(--border);border-radius:6px;padding:6px;margin-left:4px"></label>
+                <span id="report-source-count" style="color:var(--text-dim);font-size:0.85rem;min-width:90px"></span>
+                <button id="report-btn" class="btn btn-primary" onclick="generateReport()">📋 Generate Advisor Report</button>
                 <span id="report-status" style="color:var(--text-dim);font-size:0.85rem;"></span>
             </div>
+            <div style="margin-bottom:14px">
+                <div style="font-size:0.8rem;color:var(--text-dim);margin-bottom:6px">Filter by channel <span style="font-style:italic">(click to toggle; pick any number — none = all channels)</span></div>
+                <div id="report-channel-list" style="display:flex;flex-wrap:wrap;gap:6px;max-height:120px;overflow-y:auto;padding:2px"></div>
+            </div>
+            <button class="btn btn-view" onclick="printDoc('Advisor Report')">🖨 Save as PDF</button>
             <div class="chart-section" id="report-content" style="white-space: pre-wrap; line-height: 1.65;"></div>
         </div>
 
@@ -466,27 +587,118 @@ HTML = """
     </div>
 
     <div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettings()">
-        <div class="modal" style="max-width:560px">
+        <div class="modal" style="max-width:900px">
             <div class="modal-header">
                 <div><h3 class="modal-title">Settings — <span id="settings-profile"></span></h3>
                 <div class="modal-sub">Discovery filters for the active investigation. Applied on the next scrape.</div></div>
                 <button class="modal-close" onclick="closeSettings()">&times;</button>
             </div>
-            <div class="modal-body">
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-                    <label>Minimum view count<input id="set-min_views" type="number" class="search-box" min="0" step="100"></label>
+            <div class="modal-body" style="max-height:80vh;overflow-y:auto">
+                <!-- Discovery Filters -->
+                <h4 style="margin:0 0 12px;font-size:0.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim)">Discovery Filters</h4>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+                    <label>Min views<input id="set-min_views" type="number" class="search-box" min="0" step="100"></label>
                     <label>Published on/after<input id="set-min_publish_date" class="search-box" placeholder="2025-01-01"></label>
                     <label>Min duration (sec)<input id="set-min_duration_sec" type="number" class="search-box" min="0"></label>
                     <label>Max duration (sec)<input id="set-max_duration_sec" type="number" class="search-box" min="0"></label>
                     <label>Min days old<input id="set-min_days_old" type="number" class="search-box" min="0"></label>
                     <label>Videos per channel<input id="set-max_videos_per_channel" type="number" class="search-box" min="1"></label>
                 </div>
-                <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
-                    <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+                <h4 style="margin:16px 0 8px;font-size:0.85rem;color:var(--text-dim)">Enrichment Cache — skip re-fetching recently updated videos</h4>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+                    <label title="Videos published within this many days are treated as new">"New" if published within (days)<input id="set-enrich_recent_days" type="number" class="search-box" min="1"></label>
+                    <label title="Re-fetch new videos after this many hours">Re-enrich new videos after (hours)<input id="set-enrich_recent_hours" type="number" class="search-box" min="1"></label>
+                    <label title="Re-fetch older videos after this many days">Re-enrich older videos after (days)<input id="set-enrich_older_days" type="number" class="search-box" min="1"></label>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
+                    <button class="btn btn-primary" onclick="saveSettings()">Save filters</button>
                     <span id="set-status" style="color:var(--text-dim);font-size:0.85rem"></span>
                 </div>
-                <div style="color:var(--text-dim);font-size:0.8rem;margin-top:10px">
-                    Curated/monitored channels bypass the view & date filters (we always keep authorities).
+
+                <hr style="border:none;border-top:1px solid var(--border);margin:20px 0">
+
+                <!-- LLM Providers -->
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                    <h4 style="margin:0;font-size:0.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim)">LLM Providers</h4>
+                    <button class="btn btn-primary" onclick="openAddProvider()" style="font-size:0.8rem;padding:4px 12px">+ Add LLM API</button>
+                </div>
+                <div id="llm-providers-list" style="margin-bottom:16px">
+                    <div style="color:var(--text-dim);font-size:0.85rem">Loading…</div>
+                </div>
+
+                <hr style="border:none;border-top:1px solid var(--border);margin:20px 0">
+
+                <!-- Active Model Selection -->
+                <h4 style="margin:0 0 12px;font-size:0.9rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim)">Active Model Selection</h4>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:var(--text-main);margin-bottom:6px">Bulk — per-transcript analysis</div>
+                        <label style="font-size:0.8rem">Provider
+                            <select id="sel-bulk-provider" class="search-box" onchange="onProviderChange('bulk')"></select>
+                        </label>
+                        <label style="font-size:0.8rem;margin-top:6px;display:block">Model
+                            <div style="display:flex;gap:6px">
+                                <select id="sel-bulk-model" class="search-box" style="flex:1"></select>
+                                <button class="btn" onclick="fetchModelsFor('bulk')" title="Refresh models" style="padding:4px 8px">⟳</button>
+                            </div>
+                        </label>
+                        <div style="margin-top:8px;font-size:0.8rem;font-weight:600;color:var(--text-main)">Thinking level</div>
+                        <div style="display:flex;gap:6px;margin-top:4px" id="bulk-thinking-btns">
+                            <button class="thinking-btn" data-role="bulk" data-level="low" onclick="setThinking('bulk','low')">Low</button>
+                            <button class="thinking-btn" data-role="bulk" data-level="medium" onclick="setThinking('bulk','medium')">Medium</button>
+                            <button class="thinking-btn" data-role="bulk" data-level="high" onclick="setThinking('bulk','high')">High</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="font-size:0.8rem;font-weight:600;color:var(--text-main);margin-bottom:6px">Synth — digests &amp; reports</div>
+                        <label style="font-size:0.8rem">Provider
+                            <select id="sel-synth-provider" class="search-box" onchange="onProviderChange('synth')"></select>
+                        </label>
+                        <label style="font-size:0.8rem;margin-top:6px;display:block">Model
+                            <div style="display:flex;gap:6px">
+                                <select id="sel-synth-model" class="search-box" style="flex:1"></select>
+                                <button class="btn" onclick="fetchModelsFor('synth')" title="Refresh models" style="padding:4px 8px">⟳</button>
+                            </div>
+                        </label>
+                        <div style="margin-top:8px;font-size:0.8rem;font-weight:600;color:var(--text-main)">Thinking level</div>
+                        <div style="display:flex;gap:6px;margin-top:4px" id="synth-thinking-btns">
+                            <button class="thinking-btn" data-role="synth" data-level="low" onclick="setThinking('synth','low')">Low</button>
+                            <button class="thinking-btn" data-role="synth" data-level="medium" onclick="setThinking('synth','medium')">Medium</button>
+                            <button class="thinking-btn" data-role="synth" data-level="high" onclick="setThinking('synth','high')">High</button>
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+                    <button class="btn btn-primary" onclick="saveModelSelection()">Save model selection</button>
+                    <span id="llm-sel-status" style="font-size:0.85rem;color:var(--text-dim)"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="llm-provider-modal" onclick="if(event.target===this)closeProviderModal()">
+        <div class="modal" style="max-width:480px">
+            <div class="modal-header">
+                <div><h3 class="modal-title" id="llm-prov-modal-title">Add LLM Provider</h3></div>
+                <button class="modal-close" onclick="closeProviderModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="llm-prov-id">
+                <div style="display:flex;flex-direction:column;gap:12px">
+                    <label>Label (e.g. "OpenAI", "Anthropic")
+                        <input id="llm-prov-label" class="search-box" placeholder="OpenAI">
+                    </label>
+                    <label>API Base URL
+                        <input id="llm-prov-base" class="search-box" placeholder="https://api.openai.com/v1">
+                    </label>
+                    <label>API Key <span id="llm-prov-key-hint" style="font-size:0.8rem;color:var(--text-dim)"></span>
+                        <input id="llm-prov-key" type="password" class="search-box" placeholder="sk-…">
+                    </label>
+                </div>
+                <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+                    <button class="btn btn-primary" onclick="saveProvider()">Save</button>
+                    <button class="btn" onclick="closeProviderModal()">Cancel</button>
+                    <span id="llm-prov-status" style="font-size:0.85rem;color:var(--text-dim)"></span>
                 </div>
             </div>
         </div>
@@ -586,6 +798,16 @@ HTML = """
             renderIntelligence();
             renderDiscovery();
             renderStats();
+            // Surface list truncation: the endpoints cap at 200, but stats has the
+            // true totals — never let a cap silently hide rows (LEARNINGS P9).
+            const cc = document.getElementById('candidates-count');
+            if (cc) {
+                const shown = (data.candidates || []).length;
+                const total = (data.stats && data.stats.not_requested) || shown;
+                cc.innerText = total > shown
+                    ? `Showing top ${shown} of ${total} candidates by quality score — transcribe or dismiss some to surface the rest.`
+                    : `${shown} candidate${shown === 1 ? '' : 's'}.`;
+            }
             document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
         }
 
@@ -604,7 +826,10 @@ HTML = """
 
                 let actionHtml = '';
                 if (type === 'candidates') {
-                    actionHtml = `<td><button class="btn btn-mark" onclick="postAction('/api/request_transcribe', '${v.id}')">Transcribe</button></td>`;
+                    actionHtml = `<td style="white-space:nowrap">
+                        <button class="btn btn-mark" onclick="postAction('/api/request_transcribe', '${v.id}')">Transcribe</button>
+                        <button class="btn" style="background:var(--border);color:var(--text-dim);margin-left:4px" title="Hide permanently" onclick="dismissVideo('${v.id}', this)">Skip</button>
+                    </td>`;
                 } else if (type === 'requested') {
                     actionHtml = `<td><button class="btn btn-unreq" onclick="postAction('/api/unrequest', '${v.id}')">Remove</button></td>`;
                 } else if (type === 'transcribed') {
@@ -693,22 +918,163 @@ HTML = """
             setTimeout(() => { fetchData(); s.innerText = 'Done — review below.'; }, 4000);
         }
 
+        let _discoveryTimer = null;
+        let _logTimer = null;
+        let _lastLogLine = 0;
+        let _logOffset = 0;
+
+        function toggleLogPanel() {
+            const p = document.getElementById('discovery-log-panel');
+            p.style.display = p.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function pollDiscoveryLog(scrollToBottom) {
+            try {
+                const res = await fetch(`/api/job_log?name=podcast_scraper&lines=80&offset=${_logOffset}`);
+                const d = await res.json();
+                if (!d.exists) return;
+                if (d.total_lines === _lastLogLine) return;  // no new lines
+                _lastLogLine = d.total_lines;
+                const pre = document.getElementById('discovery-log-lines');
+                pre.textContent = d.lines.join('\\n');
+                if (scrollToBottom) pre.scrollTop = pre.scrollHeight;
+                // Parse lines for a live progress summary
+                const all = d.lines;
+                let query = '', totalUnique = 0, newCount = '', filtered = '', enriching = '', scoreCount = 0;
+                for (const line of all) {
+                    const mSearch = line.match(/^Searching: (.+)/);
+                    if (mSearch) query = mSearch[1].length > 40 ? mSearch[1].slice(0, 40) + '…' : mSearch[1];
+                    const mUnique = line.match(/total unique: (\\d+)/);
+                    if (mUnique) totalUnique = parseInt(mUnique[1]);
+                    const mEnrich = line.match(/Enriching (\\d+\\/(\\d+))/);
+                    if (mEnrich) enriching = mEnrich[1];
+                    if (line.match(/^  Score:/)) scoreCount++;
+                    const mNew = line.match(/New videos this run: (\\d+)/);
+                    if (mNew) newCount = mNew[1];
+                    const mFilter = line.match(/After filtering[^:]*:\\s*(\\d+)/);
+                    if (mFilter) filtered = mFilter[1];
+                }
+                let summary = '';
+                if (newCount) summary = `${newCount} new videos saved`;
+                else if (scoreCount > 0 && filtered) summary = `Scoring ${scoreCount}/${filtered}…`;
+                else if (scoreCount > 0) summary = `Scoring ${scoreCount} videos…`;
+                else if (filtered) summary = `${filtered} kept after filters`;
+                else if (enriching) summary = `Enriching ${enriching} videos…`;
+                else if (totalUnique) summary = `${totalUnique} unique found` + (query ? ` · ${query}` : '');
+                else if (query) summary = `Searching: ${query}`;
+                if (summary) {
+                    document.querySelectorAll('.discovery-status').forEach(s => s.innerText = summary);
+                    document.getElementById('discovery-log-status').innerText = summary;
+                }
+            } catch(e) {}
+        }
+
+        async function checkDiscoveryDone(spans) {
+            try {
+                const res = await fetch('/api/job_status?name=podcast_scraper');
+                const d = await res.json();
+                if (!d.running) {
+                    clearInterval(_logTimer);
+                    _logTimer = null;
+                    // Wait briefly for any final buffered output to reach disk, then read twice
+                    await new Promise(r => setTimeout(r, 500));
+                    await pollDiscoveryLog(true);
+                    await new Promise(r => setTimeout(r, 500));
+                    await pollDiscoveryLog(true);
+                    setDiscoveryButtons(false);
+                    spans.forEach(s => s.innerText = 'Done — results updated.');
+                    const logStatus = document.getElementById('discovery-log-status');
+                    logStatus.innerText = '✓ Complete';
+                    logStatus.style.color = 'var(--accent)';
+                    fetchData();
+                    // Auto-collapse after 8s
+                    setTimeout(() => {
+                        document.getElementById('discovery-log-panel').style.display = 'none';
+                        logStatus.style.color = '';
+                    }, 8000);
+                }
+            } catch(e) {}
+        }
+
+        function setDiscoveryButtons(disabled) {
+            document.querySelectorAll('button[onclick="runDiscovery()"]').forEach(b => {
+                b.disabled = disabled;
+                b.style.opacity = disabled ? '0.5' : '';
+                b.style.cursor = disabled ? 'not-allowed' : '';
+            });
+        }
+
+        function startDiscoveryPolling(spans) {
+            if (_logTimer) clearInterval(_logTimer);
+            if (_discoveryTimer) clearInterval(_discoveryTimer);
+            setDiscoveryButtons(true);
+            _logTimer = setInterval(async () => {
+                await pollDiscoveryLog(true);
+                await checkDiscoveryDone(spans);
+            }, 2000);
+            _discoveryTimer = setInterval(() => fetchData(), 30000);
+            // Safety stop after 45 min
+            setTimeout(() => {
+                if (_logTimer) { clearInterval(_logTimer); _logTimer = null; }
+                if (_discoveryTimer) { clearInterval(_discoveryTimer); _discoveryTimer = null; }
+                setDiscoveryButtons(false);
+                spans.forEach(s => s.innerText = 'Timed out — check log.');
+            }, 45 * 60 * 1000);
+        }
+
         async function runDiscovery() {
             const spans = document.querySelectorAll('.discovery-status');
             spans.forEach(s => s.innerText = 'Starting…');
+            setDiscoveryButtons(true);
+
+            // Snapshot current log size so we only show output from THIS run
+            try {
+                const snap = await fetch('/api/job_log?name=podcast_scraper&lines=1');
+                const sd = await snap.json();
+                _logOffset = sd.total_lines || 0;
+            } catch(e) { _logOffset = 0; }
+            _lastLogLine = _logOffset;
+
+            // Show log panel
+            const panel = document.getElementById('discovery-log-panel');
+            panel.style.display = 'block';
+            document.getElementById('discovery-log-lines').textContent = '';
+            document.getElementById('discovery-log-status').innerText = 'Starting…';
+
             try {
                 const res = await fetch('/api/run_discovery', { method: 'POST' });
                 const d = await res.json();
                 spans.forEach(s => s.innerText = d.message || 'Running…');
-                // Discovery takes minutes; refresh periodically so results appear as they land.
-                let ticks = 0;
-                const timer = setInterval(() => {
-                    fetchData();
-                    if (++ticks >= 20) { clearInterval(timer); spans.forEach(s => s.innerText = 'Finished refreshing.'); }
-                }, 15000);
+
+                if (!d.started) {
+                    document.getElementById('discovery-log-status').innerText = d.message;
+                    document.getElementById('discovery-log-lines').textContent = d.message;
+                    setDiscoveryButtons(false);
+                    return;
+                }
+
+                startDiscoveryPolling(spans);
+
             } catch (err) {
                 spans.forEach(s => s.innerText = 'Failed to start: ' + err);
+                document.getElementById('discovery-log-status').innerText = 'Error';
+                setDiscoveryButtons(false);
             }
+        }
+
+        async function checkDiscoveryOnLoad() {
+            try {
+                const res = await fetch('/api/job_status?name=podcast_scraper');
+                const d = await res.json();
+                if (d.running) {
+                    const spans = document.querySelectorAll('.discovery-status');
+                    spans.forEach(s => s.innerText = 'Discovery already running…');
+                    _logOffset = 0; _lastLogLine = 0;
+                    document.getElementById('discovery-log-panel').style.display = 'block';
+                    document.getElementById('discovery-log-status').innerText = 'Running…';
+                    startDiscoveryPolling(spans);
+                }
+            } catch(e) {}
         }
 
         function renderStats() {
@@ -775,23 +1141,85 @@ HTML = """
             }
         }
 
+        async function dismissVideo(id, btn) {
+            const row = btn.closest('tr');
+            if (row) { row.style.opacity = '0.3'; row.style.pointerEvents = 'none'; }
+            try {
+                await fetch('/api/dismiss_video', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                if (row) row.remove();
+            } catch (err) {
+                if (row) { row.style.opacity = ''; row.style.pointerEvents = ''; }
+            }
+        }
+
+        let _queueLogOffset = 0;
+        let _queuePollTimer = null;
+
+        async function pollQueueLog() {
+            try {
+                const res = await fetch(`/api/job_log?name=fetch_transcripts&lines=100&offset=${_queueLogOffset}`);
+                const d = await res.json();
+                if (!d.exists) return;
+                const lines = d.lines || [];
+                const status = document.getElementById('queue-status');
+                let total = 0, current = 0, currentTitle = '';
+                for (const line of lines) {
+                    const mTotal = line.match(/^Processing (\\d+) videos/);
+                    if (mTotal) total = parseInt(mTotal[1]);
+                    const mFetch = line.match(/^\\[(\\d+)\\/(\\d+)\\] Fetching: (.+)/);
+                    if (mFetch) {
+                        current = parseInt(mFetch[1]);
+                        total = parseInt(mFetch[2]);
+                        currentTitle = mFetch[3].trim();
+                    }
+                    const mDone = line.match(/^--- Done: (\\d+)\\/(\\d+) transcribed ---/);
+                    if (mDone) {
+                        const ok = parseInt(mDone[1]), n = parseInt(mDone[2]);
+                        status.innerText = `Processing complete — ${ok} of ${n} videos transcribed`;
+                        clearInterval(_queuePollTimer);
+                        setJobBtn('queue-btn', false);  // re-enable on completion
+                        fetchData();
+                        return;
+                    }
+                }
+                if (current && total) {
+                    const titleStr = currentTitle ? ` — ${currentTitle}` : '';
+                    status.innerText = `Processing ${current} of ${total}${titleStr}`;
+                } else if (total) {
+                    status.innerText = `Processing 0 of ${total}…`;
+                }
+            } catch (e) { /* ignore transient errors */ }
+        }
+
         async function processQueue() {
             const status = document.getElementById('queue-status');
             status.innerText = 'Starting…';
+            setJobBtn('queue-btn', true);  // disable on click (layer 1 of the guard)
+            if (_queuePollTimer) { clearInterval(_queuePollTimer); _queuePollTimer = null; }
             try {
+                // Snapshot log position before launch so we only see new output
+                try {
+                    const snap = await fetch('/api/job_log?name=fetch_transcripts&lines=1');
+                    const sd = await snap.json();
+                    _queueLogOffset = sd.total_lines || 0;
+                } catch(e) { _queueLogOffset = 0; }
+
                 const res = await fetch('/api/process_queue', { method: 'POST' });
                 const data = await res.json();
-                status.innerText = data.message || '';
-                if (data.started) {
-                    // Poll for a while so rows move out of the queue as they complete.
-                    let ticks = 0;
-                    const timer = setInterval(() => {
-                        fetchData();
-                        if (++ticks >= 15) { clearInterval(timer); }
-                    }, 4000);
+                if (!data.started) {
+                    status.innerText = data.message || '';
+                    if (!data.running) setJobBtn('queue-btn', false);  // nothing pending — re-enable
+                    return;
                 }
+                status.innerText = `Processing 0 of ${data.queued}…`;
+                _queuePollTimer = setInterval(pollQueueLog, 2000);
             } catch (err) {
                 status.innerText = 'Failed to start: ' + err;
+                setJobBtn('queue-btn', false);
             }
         }
 
@@ -860,28 +1288,189 @@ HTML = """
             }).join('');
         }
 
+        let _analyzeLogOffset = 0;
+        let _analyzePollTimer = null;
+
+        async function pollAnalyzeLog() {
+            try {
+                const res = await fetch(`/api/job_log?name=analyze_transcripts&lines=100&offset=${_analyzeLogOffset}`);
+                const d = await res.json();
+                if (!d.exists) return;
+                const lines = d.lines || [];
+                const s = document.getElementById('analyze-status');
+                let total = 0, current = 0, currentTitle = '';
+                for (const line of lines) {
+                    const mTotal = line.match(/^Analyzing (\\d+) transcript/);
+                    if (mTotal) total = parseInt(mTotal[1]);
+                    const mItem = line.match(/^\\[(\\d+)\\/(\\d+)\\] Analyzing: (.+)/);
+                    if (mItem) {
+                        current = parseInt(mItem[1]);
+                        total = parseInt(mItem[2]);
+                        currentTitle = mItem[3].trim();
+                    }
+                    const mDone = line.match(/^--- Done: (\\d+)\\/(\\d+) analyzed ---/);
+                    if (mDone) {
+                        const ok = parseInt(mDone[1]), n = parseInt(mDone[2]);
+                        s.innerText = `Analysis complete — ${ok} of ${n} transcripts analyzed`;
+                        clearInterval(_analyzePollTimer);
+                        setJobBtn('analyze-btn', false);  // re-enable on completion
+                        fetchData();
+                        return;
+                    }
+                }
+                if (current && total) {
+                    const titleStr = currentTitle ? ` — ${currentTitle}` : '';
+                    s.innerText = `Analyzing ${current} of ${total}${titleStr}`;
+                } else if (total) {
+                    s.innerText = `Analyzing 0 of ${total}…`;
+                }
+            } catch (e) { /* ignore transient errors */ }
+        }
+
         async function runAnalyze() {
             const s = document.getElementById('analyze-status');
             s.innerText = 'Starting…';
+            setJobBtn('analyze-btn', true);  // disable on click (layer 1 of the guard)
+            if (_analyzePollTimer) { clearInterval(_analyzePollTimer); _analyzePollTimer = null; }
             try {
+                try {
+                    const snap = await fetch('/api/job_log?name=analyze_transcripts&lines=1');
+                    const sd = await snap.json();
+                    _analyzeLogOffset = sd.total_lines || 0;
+                } catch(e) { _analyzeLogOffset = 0; }
+
                 const res = await fetch('/api/analyze', { method: 'POST' });
                 const d = await res.json();
-                s.innerText = d.message || '';
-                if (d.started) {
-                    let t = 0;
-                    const timer = setInterval(() => { fetchData(); if (++t >= 20) clearInterval(timer); }, 5000);
+                if (!d.started) {
+                    s.innerText = d.message || '';
+                    if (!d.running) setJobBtn('analyze-btn', false);
+                    return;
                 }
-            } catch (err) { s.innerText = 'Failed: ' + err; }
+                s.innerText = `Analyzing 0 of ${d.queued}…`;
+                _analyzePollTimer = setInterval(pollAnalyzeLog, 2000);
+            } catch (err) { s.innerText = 'Failed: ' + err; setJobBtn('analyze-btn', false); }
+        }
+
+        // ── Background-job button guard (CLAUDE.md three-layer rule) ──────────
+        // Layer 1: disable on click (in each handler). Layer 2: server-side
+        // already-running guard (returns started:false, running:true). Layer 3:
+        // on page load, re-disable any button whose job is still running.
+        function setJobBtn(id, disabled) {
+            const b = document.getElementById(id);
+            if (b) b.disabled = disabled;
+        }
+
+        function watchJobButton(statusName, btnId, onDone) {
+            setJobBtn(btnId, true);
+            const t = setInterval(async () => {
+                try {
+                    const r = await fetch('/api/job_status?name=' + statusName);
+                    const d = await r.json();
+                    if (!d.running) {
+                        clearInterval(t);
+                        setJobBtn(btnId, false);
+                        if (onDone) onDone();
+                    }
+                } catch (e) {}
+            }, 2000);
+            return t;
+        }
+
+        async function checkJobButtonsOnLoad() {
+            const jobs = [
+                ['fetch_transcripts', 'queue-btn', null],
+                ['analyze_transcripts', 'analyze-btn', () => fetchData()],
+                ['generate_digest', 'digest-btn', () => { loadDigest(); loadDigestPending(); }],
+                ['generate_report', 'report-btn', () => loadReport()],
+            ];
+            for (const [name, btn, onDone] of jobs) {
+                try {
+                    const r = await fetch('/api/job_status?name=' + name);
+                    const d = await r.json();
+                    if (d.running) watchJobButton(name, btn, onDone);
+                } catch (e) {}
+            }
         }
 
         async function generateDigest() {
             const s = document.getElementById('digest-status');
             s.innerText = 'Generating…';
+            setJobBtn('digest-btn', true);  // disable on click
             try {
-                await fetch('/api/generate_digest', { method: 'POST' });
-                setTimeout(loadDigest, 2500);
-                s.innerText = 'Done.';
-            } catch (err) { s.innerText = 'Failed: ' + err; }
+                const res = await fetch('/api/generate_digest', { method: 'POST' });
+                const d = await res.json();
+                if (d && d.started === false) {
+                    s.innerText = d.message || '';
+                    if (!d.running) setJobBtn('digest-btn', false);
+                    return;
+                }
+                s.innerText = 'Generating…';
+                // Re-enable + refresh when the digest subprocess actually finishes.
+                watchJobButton('generate_digest', 'digest-btn', () => {
+                    s.innerText = 'Done.'; loadDigest(); loadDigestPending();
+                });
+            } catch (err) { s.innerText = 'Failed: ' + err; setJobBtn('digest-btn', false); }
+        }
+
+        async function loadDigestPending() {
+            try {
+                const res = await fetch('/api/digest_pending');
+                const d = await res.json();
+                const el = document.getElementById('digest-pending');
+                if (el) el.innerText = d.count > 0 ? d.count + ' new since last digest' : 'All caught up';
+            } catch(e) {}
+        }
+
+        let _digestListOpen = false;
+
+        async function toggleDigestList(btn) {
+            _digestListOpen = !_digestListOpen;
+            document.getElementById('digest-list-panel').style.display = _digestListOpen ? '' : 'none';
+            if (btn) btn.style.background = _digestListOpen ? 'var(--accent)' : '';
+            if (_digestListOpen) await refreshDigestList();
+        }
+
+        async function refreshDigestList() {
+            const el = document.getElementById('digest-list-rows');
+            el.innerText = 'Loading…';
+            try {
+                const res = await fetch('/api/digest_list');
+                const d = await res.json();
+                const items = d.digests || [];
+                if (!items.length) { el.innerText = 'No saved digests.'; return; }
+                el.innerHTML = items.map(dg => `
+                    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+                        <span style="flex:1;font-weight:500">${dg.label}</span>
+                        <span style="color:var(--text-dim);font-size:0.8rem">${dg.size_kb} KB</span>
+                        <button class="btn btn-view" onclick="viewDigestFile('${dg.filename}')">View</button>
+                        <button class="btn" style="background:#c0392b;color:#fff;border:none" onclick="deleteDigest('${dg.filename}')">Delete</button>
+                    </div>`).join('');
+            } catch(e) { el.innerText = 'Error loading list.'; }
+        }
+
+        async function viewDigestFile(filename) {
+            const el = document.getElementById('digest-content');
+            el.innerText = 'Loading…';
+            _digestListOpen = false;
+            document.getElementById('digest-list-panel').style.display = 'none';
+            document.querySelectorAll('#digest .btn').forEach(b => b.style.background = '');
+            try {
+                const res = await fetch('/api/digest_file?name=' + encodeURIComponent(filename));
+                const d = await res.json();
+                el.innerHTML = d.markdown ? renderMd(d.markdown) : 'Empty digest.';
+            } catch(e) { el.innerText = 'Error loading digest.'; }
+        }
+
+        async function deleteDigest(filename) {
+            if (!confirm('Delete this digest? This cannot be undone.')) return;
+            try {
+                await fetch('/api/delete_digest', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({filename})
+                });
+                await refreshDigestList();
+                loadDigest();
+            } catch(e) { alert('Error deleting digest.'); }
         }
 
         function renderMd(md) {
@@ -905,6 +1494,7 @@ HTML = """
             }
         }
         loadDigest();
+        loadDigestPending();
 
         async function loadReport() {
             try {
@@ -916,19 +1506,127 @@ HTML = """
             }
         }
         loadReport();
+        loadReportChannels();
+
+        let _selectedChannels = [];
+        let _reportChannels = [];
+        let _reportCountTimer = null;
+
+        async function loadReportChannels() {
+            await refreshReportChannelList();
+        }
+
+        async function refreshReportChannelList() {
+            const date_from = document.getElementById('report-from').value;
+            const date_to   = document.getElementById('report-to').value;
+            const params = new URLSearchParams();
+            if (date_from) params.set('from', date_from);
+            if (date_to)   params.set('to', date_to);
+            try {
+                const res = await fetch('/api/report_channels_with_counts?' + params);
+                const d = await res.json();
+                const list = document.getElementById('report-channel-list');
+                if (!list) return;
+                const channels = d.channels || [];
+                if (!channels.length) {
+                    list.innerHTML = '<span style="color:var(--text-dim);font-size:0.85rem">No analyzed transcripts yet.</span>';
+                    return;
+                }
+                _reportChannels = channels;
+                const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                list.innerHTML = channels.map((ch, i) => {
+                    const sel     = _selectedChannels.includes(ch.name);
+                    const dimmed  = !sel && ch.count === 0;
+                    const bg      = sel ? '#2980b9' : 'var(--card-bg)';
+                    const border  = sel ? '#2980b9' : 'var(--border)';
+                    const color   = sel ? '#fff' : (dimmed ? 'var(--text-dim)' : 'var(--text-main)');
+                    const label   = ch.count === ch.total
+                        ? ch.count
+                        : `${ch.count}<span style="opacity:0.5">/${ch.total}</span>`;
+                    return `<div data-idx="${i}" class="report-channel-chip" style="cursor:pointer;padding:4px 10px;border-radius:14px;font-size:0.82rem;display:flex;gap:6px;align-items:center;border:1px solid ${border};background:${bg};color:${color};white-space:nowrap;opacity:${dimmed ? '0.45' : '1'}">
+                        <span>${esc(ch.name)}</span><span style="font-size:0.75rem">${label}</span>
+                    </div>`;
+                }).join('');
+            } catch(e) {}
+            updateReportCount();
+        }
+
+        function selectReportChannel(name) {
+            const i = _selectedChannels.indexOf(name);
+            if (i === -1) _selectedChannels.push(name);
+            else _selectedChannels.splice(i, 1);
+            refreshReportChannelList();
+        }
+
+        // Delegated click — robust against quotes/apostrophes in channel names.
+        document.getElementById('report-channel-list').addEventListener('click', (e) => {
+            const chip = e.target.closest('.report-channel-chip');
+            if (!chip) return;
+            const ch = _reportChannels[parseInt(chip.dataset.idx, 10)];
+            if (ch) selectReportChannel(ch.name);
+        });
+
+        async function updateReportCount() {
+            const date_from = document.getElementById('report-from').value;
+            const date_to   = document.getElementById('report-to').value;
+            const n = parseInt(document.getElementById('report-n').value) || 8;
+            const el = document.getElementById('report-source-count');
+            if (!el) return;
+            const params = new URLSearchParams();
+            if (date_from)      params.set('from', date_from);
+            if (date_to)        params.set('to', date_to);
+            _selectedChannels.forEach(c => params.append('channel', c));
+            try {
+                const res = await fetch('/api/report_source_count?' + params);
+                const d = await res.json();
+                const count = d.count || 0;
+                const capped = Math.min(count, n);
+                if (count === 0) {
+                    el.style.color = 'var(--error,#c0392b)';
+                    el.innerText = 'No sources match';
+                } else if (count > n) {
+                    el.style.color = 'var(--text-dim)';
+                    el.innerText = capped + ' of ' + count + ' sources';
+                } else {
+                    el.style.color = 'var(--success,#27ae60)';
+                    el.innerText = count + ' source' + (count === 1 ? '' : 's');
+                }
+            } catch(e) {}
+        }
+
+        function scheduleReportRefresh() {
+            clearTimeout(_reportCountTimer);
+            _reportCountTimer = setTimeout(refreshReportChannelList, 300);
+        }
+
+        document.getElementById('report-from').addEventListener('change', scheduleReportRefresh);
+        document.getElementById('report-to').addEventListener('change', scheduleReportRefresh);
+        document.getElementById('report-n').addEventListener('input', updateReportCount);
 
         async function generateReport() {
             const s = document.getElementById('report-status');
             const n = parseInt(document.getElementById('report-n').value) || 8;
-            s.innerText = 'Generating (≈20–40s)…';
+            const date_from = document.getElementById('report-from').value;
+            const date_to   = document.getElementById('report-to').value;
+            const channels  = _selectedChannels.slice();
+            s.innerText = 'Generating…';
+            setJobBtn('report-btn', true);  // disable on click
             try {
-                await fetch('/api/generate_report', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({n})});
-                let ticks = 0;
-                const timer = setInterval(() => {
-                    loadReport();
-                    if (++ticks >= 12) { clearInterval(timer); s.innerText = 'Done.'; }
-                }, 5000);
-            } catch (err) { s.innerText = 'Failed: ' + err; }
+                const res = await fetch('/api/generate_report', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({n, date_from, date_to, channels})
+                });
+                const d = await res.json();
+                if (d && d.started === false) {
+                    s.innerText = d.message || '';
+                    if (!d.running) setJobBtn('report-btn', false);
+                    return;
+                }
+                // Re-enable + reload when the report subprocess actually finishes.
+                watchJobButton('generate_report', 'report-btn', () => {
+                    s.innerText = 'Done.'; loadReport();
+                });
+            } catch (err) { s.innerText = 'Failed: ' + err; setJobBtn('report-btn', false); }
         }
 
         let activeSettings = {};
@@ -968,18 +1666,209 @@ HTML = """
         }
         applyTheme(localStorage.getItem('pt_theme') || 'light');
 
-        function openSettings() {
-            const f = ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel'];
+        let llmProvidersData = { providers: [], bulk: {}, synth: {} };
+        let llmModelCache = {};  // pid -> [model, ...]
+        let llmThinking = { bulk: 'low', synth: 'medium' };
+
+        async function openSettings() {
+            const f = ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel','enrich_recent_days','enrich_recent_hours','enrich_older_days'];
             f.forEach(k => { const el = document.getElementById('set-'+k); if (el) el.value = activeSettings[k] ?? ''; });
             document.getElementById('set-status').innerText = '';
             document.getElementById('settings-modal').classList.add('active');
+            await reloadProviders();
         }
         function closeSettings() { document.getElementById('settings-modal').classList.remove('active'); }
+
+        async function reloadProviders() {
+            try {
+                const res = await fetch('/api/llm_providers');
+                llmProvidersData = await res.json();
+                renderProviderList();
+                renderProviderSelects();
+            } catch(e) { console.error('llm_providers', e); }
+        }
+
+        function renderProviderList() {
+            const el = document.getElementById('llm-providers-list');
+            if (!llmProvidersData.providers.length) {
+                el.innerHTML = '<div style="color:var(--text-dim);font-size:0.85rem">No providers configured. Add one above.</div>';
+                return;
+            }
+            el.innerHTML = llmProvidersData.providers.map(p => `
+                <div class="llm-provider-row">
+                    <span class="prov-label">${p.label}</span>
+                    <span class="prov-base" title="${p.base}">${p.base}</span>
+                    <span class="prov-hint">${p.key_set ? p.key_hint : '⚠ no key'}</span>
+                    <button class="icon-btn" onclick="openEditProvider('${p.id}')" title="Edit">✏</button>
+                    <button class="icon-btn" onclick="testProvider('${p.id}', this)" title="Test">⚡</button>
+                    <button class="icon-btn" onclick="deleteProvider('${p.id}')" title="Delete" style="color:#e55">🗑</button>
+                </div>
+            `).join('');
+        }
+
+        function renderProviderSelects() {
+            const opts = llmProvidersData.providers.map(p =>
+                `<option value="${p.id}">${p.label}</option>`
+            ).join('');
+            ['bulk','synth'].forEach(role => {
+                const sel = document.getElementById(`sel-${role}-provider`);
+                if (!sel) return;
+                sel.innerHTML = opts;
+                const pid = (llmProvidersData[role] || {}).provider_id;
+                if (pid) sel.value = pid;
+            });
+            // Populate model dropdowns from cache or saved selection
+            ['bulk','synth'].forEach(role => {
+                const pid = document.getElementById(`sel-${role}-provider`).value;
+                const saved = (llmProvidersData[role] || {}).model;
+                const cached = llmModelCache[pid] || [];
+                populateModelSelect(role, cached, saved);
+                const thinking = (llmProvidersData[role] || {}).thinking || (role === 'bulk' ? 'low' : 'medium');
+                setThinking(role, thinking);
+            });
+        }
+
+        function populateModelSelect(role, models, current) {
+            const sel = document.getElementById(`sel-${role}-model`);
+            if (!sel) return;
+            const all = models.length ? models : (current ? [current] : []);
+            sel.innerHTML = all.map(m => `<option value="${m}" ${m===current?'selected':''}>${m}</option>`).join('');
+            if (current && !models.includes(current)) {
+                sel.innerHTML = `<option value="${current}" selected>${current}</option>` + sel.innerHTML;
+            }
+        }
+
+        function setThinking(role, level) {
+            llmThinking[role] = level;
+            document.querySelectorAll(`#${role}-thinking-btns .thinking-btn`).forEach(b => {
+                b.classList.toggle('active', b.dataset.level === level);
+            });
+        }
+
+        async function onProviderChange(role) {
+            const pid = document.getElementById(`sel-${role}-provider`).value;
+            if (llmModelCache[pid]) {
+                populateModelSelect(role, llmModelCache[pid], null);
+            } else {
+                await fetchModelsFor(role);
+            }
+        }
+
+        async function fetchModelsFor(role) {
+            const pid = document.getElementById(`sel-${role}-provider`).value;
+            if (!pid) return;
+            const statusEl = document.getElementById('llm-sel-status');
+            if (statusEl) statusEl.innerText = 'Fetching models…';
+            try {
+                const res = await fetch(`/api/llm_models?provider=${encodeURIComponent(pid)}`);
+                const d = await res.json();
+                if (d.ok && d.models.length) {
+                    llmModelCache[pid] = d.models;
+                    const cur = document.getElementById(`sel-${role}-model`).value;
+                    populateModelSelect(role, d.models, cur);
+                    if (statusEl) statusEl.innerText = `${d.models.length} models loaded`;
+                } else {
+                    if (statusEl) statusEl.innerText = d.error || 'No models returned';
+                }
+            } catch(e) {
+                if (statusEl) statusEl.innerText = 'Error: ' + e.message;
+            }
+        }
+
+        async function saveModelSelection() {
+            const s = document.getElementById('llm-sel-status');
+            const body = {
+                bulk: {
+                    provider_id: document.getElementById('sel-bulk-provider').value,
+                    model: document.getElementById('sel-bulk-model').value,
+                    thinking: llmThinking.bulk,
+                },
+                synth: {
+                    provider_id: document.getElementById('sel-synth-provider').value,
+                    model: document.getElementById('sel-synth-model').value,
+                    thinking: llmThinking.synth,
+                },
+            };
+            s.innerText = 'Saving…';
+            try {
+                const res = await fetch('/api/llm_selection', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+                const d = await res.json();
+                s.innerText = d.ok ? 'Saved.' : ('Failed: ' + (d.error || ''));
+            } catch(e) { s.innerText = 'Error: ' + e.message; }
+        }
+
+        function openAddProvider() {
+            document.getElementById('llm-prov-id').value = '';
+            document.getElementById('llm-prov-label').value = '';
+            document.getElementById('llm-prov-base').value = 'https://api.openai.com/v1';
+            document.getElementById('llm-prov-key').value = '';
+            document.getElementById('llm-prov-key-hint').innerText = '';
+            document.getElementById('llm-prov-status').innerText = '';
+            document.getElementById('llm-prov-modal-title').innerText = 'Add LLM Provider';
+            document.getElementById('llm-provider-modal').classList.add('active');
+        }
+
+        function openEditProvider(pid) {
+            const p = llmProvidersData.providers.find(x => x.id === pid);
+            if (!p) return;
+            document.getElementById('llm-prov-id').value = pid;
+            document.getElementById('llm-prov-label').value = p.label;
+            document.getElementById('llm-prov-base').value = p.base;
+            document.getElementById('llm-prov-key').value = '';
+            document.getElementById('llm-prov-key-hint').innerText = p.key_set ? `(current: ${p.key_hint}, leave blank to keep)` : '(no key set)';
+            document.getElementById('llm-prov-status').innerText = '';
+            document.getElementById('llm-prov-modal-title').innerText = 'Edit LLM Provider';
+            document.getElementById('llm-provider-modal').classList.add('active');
+        }
+
+        function closeProviderModal() { document.getElementById('llm-provider-modal').classList.remove('active'); }
+
+        async function saveProvider() {
+            const pid = document.getElementById('llm-prov-id').value;
+            const body = {
+                id: pid,
+                label: document.getElementById('llm-prov-label').value.trim(),
+                base: document.getElementById('llm-prov-base').value.trim(),
+                key: document.getElementById('llm-prov-key').value.trim(),
+            };
+            const s = document.getElementById('llm-prov-status');
+            s.innerText = 'Saving…';
+            const url = pid ? '/api/llm_providers/edit' : '/api/llm_providers/add';
+            try {
+                const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+                const d = await res.json();
+                if (d.ok) {
+                    closeProviderModal();
+                    await reloadProviders();
+                } else { s.innerText = 'Failed: ' + (d.error || ''); }
+            } catch(e) { s.innerText = 'Error: ' + e.message; }
+        }
+
+        async function deleteProvider(pid) {
+            if (!confirm('Delete this provider? Any active model selections using it will be cleared.')) return;
+            await fetch('/api/llm_providers/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: pid})});
+            await reloadProviders();
+        }
+
+        async function testProvider(pid, btn) {
+            btn.disabled = true;
+            btn.innerText = '…';
+            try {
+                const res = await fetch('/api/llm_test', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({provider_id: pid})});
+                const d = await res.json();
+                btn.innerText = d.ok ? '✓' : '✗';
+                btn.title = d.ok ? (`${d.model}: "${d.reply}"`) : ('Error: ' + d.error);
+                setTimeout(() => { btn.innerText = '⚡'; btn.disabled = false; btn.title = 'Test'; }, 3000);
+            } catch(e) {
+                btn.innerText = '✗';
+                setTimeout(() => { btn.innerText = '⚡'; btn.disabled = false; }, 3000);
+            }
+        }
 
         async function saveSettings() {
             const s = document.getElementById('set-status');
             const body = {};
-            ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel']
+            ['min_views','min_publish_date','min_duration_sec','max_duration_sec','min_days_old','max_videos_per_channel','enrich_recent_days','enrich_recent_hours','enrich_older_days']
                 .forEach(k => { body[k] = document.getElementById('set-'+k).value; });
             s.innerText = 'Saving…';
             const res = await fetch('/api/update_profile', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -1047,6 +1936,8 @@ HTML = """
 
         loadProfiles();
         fetchData();
+        checkDiscoveryOnLoad();
+        checkJobButtonsOnLoad();
     </script>
 </body>
 </html>
@@ -1059,21 +1950,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.end_headers()
             self.wfile.write(HTML.encode())
         elif p == "/api/candidates":
-            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'not_requested' ORDER BY quality_score DESC LIMIT 50"))
+            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'not_requested' AND (dismissed IS NULL OR dismissed = 0) ORDER BY quality_score DESC LIMIT 200"))
         elif p == "/api/requested":
-            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'requested' ORDER BY quality_score DESC LIMIT 50"))
+            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'requested' ORDER BY quality_score DESC LIMIT 200"))
         elif p == "/api/transcribed":
             sql = """
-                SELECT v.*, t.word_count, 
+                SELECT v.*, t.word_count,
                        (SELECT COUNT(*) FROM key_points k WHERE k.video_id = v.id) as key_point_count
                 FROM videos v
                 LEFT JOIN transcripts t ON v.id = t.video_id
                 WHERE v.transcript_status = 'obtained'
                 ORDER BY v.transcribed_date DESC
-                LIMIT 50
+                LIMIT 200
             """
             self.json(self.query(sql))
         elif p == "/api/stats":
@@ -1100,6 +1992,114 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with open(latest, encoding="utf-8") as fh:
                     md = fh.read()
             self.json({"markdown": md})
+        elif p == "/api/digest_list":
+            import re as _re
+            digest_dir = Path(profiles.load()["digest_dir"])
+            files = sorted(digest_dir.glob("digest_*.md"), reverse=True)
+            result = []
+            for f in files:
+                stem = f.stem  # e.g. "digest_2026-06-21" or "digest_2026-06-21_2"
+                date_part = stem[len("digest_"):]  # "2026-06-21" or "2026-06-21_2"
+                # Build a human label
+                m = _re.match(r"(\d{4}-\d{2}-\d{2})(?:_(\d+))?$", date_part)
+                if m:
+                    label = m.group(1) + (f" (run {m.group(2)})" if m.group(2) else "")
+                else:
+                    label = date_part
+                result.append({
+                    "filename": f.name,
+                    "label": label,
+                    "size_kb": round(f.stat().st_size / 1024, 1),
+                })
+            self.json({"digests": result})
+            return
+        elif p.startswith("/api/digest_file"):
+            import re as _re
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = (qs.get("name") or [""])[0]
+            if not _re.match(r'^digest_[\w-]+\.md$', name):
+                self.send_response(400); self.end_headers(); return
+            digest_dir = Path(profiles.load()["digest_dir"])
+            fpath = (digest_dir / name).resolve()
+            if not str(fpath).startswith(str(digest_dir.resolve())):
+                self.send_response(403); self.end_headers(); return
+            self.json({"markdown": fpath.read_text(encoding="utf-8") if fpath.exists() else ""})
+        elif p == "/api/digest_pending":
+            n = self.query(
+                "SELECT COUNT(*) AS n FROM videos v "
+                "JOIN ai_analysis a ON a.video_id=v.id "
+                "WHERE v.transcript_status='obtained' AND v.digested_at IS NULL"
+            )[0]["n"]
+            self.json({"count": n})
+            return
+        elif p.startswith("/api/report_source_count"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            date_from = (qs.get("from") or [""])[0]
+            date_to   = (qs.get("to")   or [""])[0]
+            channels  = [c for c in (qs.get("channel") or []) if c]
+            filters = [
+                "v.transcript_status='obtained'",
+                "t.video_id IS NOT NULL",
+                "a.video_id IS NOT NULL",
+            ]
+            params = []
+            if date_from:
+                filters.append("v.transcribed_date >= ?"); params.append(date_from)
+            if date_to:
+                filters.append("v.transcribed_date <= ?"); params.append(date_to)
+            if channels:
+                ph = ",".join("?" * len(channels))
+                filters.append(f"v.channel_name IN ({ph})"); params.extend(channels)
+            sql = (
+                "SELECT COUNT(*) AS n FROM videos v "
+                "JOIN transcripts t ON t.video_id=v.id "
+                "JOIN ai_analysis a ON a.video_id=v.id "
+                f"WHERE {' AND '.join(filters)}"
+            )
+            n = self.query(sql, tuple(params))[0]["n"]
+            self.json({"count": n})
+            return
+        elif p == "/api/report_channels":
+            rows = self.query(
+                "SELECT DISTINCT v.channel_name FROM videos v "
+                "JOIN transcripts t ON t.video_id=v.id "
+                "JOIN ai_analysis a ON a.video_id=v.id "
+                "WHERE v.transcript_status='obtained' "
+                "ORDER BY v.channel_name"
+            )
+            self.json({"channels": [r["channel_name"] for r in rows if r["channel_name"]]})
+            return
+        elif p.startswith("/api/report_channels_with_counts"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            date_from = (qs.get("from") or [""])[0]
+            date_to   = (qs.get("to")   or [""])[0]
+            # Always list ALL channels that have any analyzed transcripts (sorted by
+            # total desc). The filtered_count reflects only the current date window so
+            # channels outside the range show 0 rather than disappearing.
+            date_conds, params = [], []
+            if date_from:
+                date_conds.append("v.transcribed_date >= ?"); params.append(date_from)
+            if date_to:
+                date_conds.append("v.transcribed_date <= ?"); params.append(date_to)
+            # CASE counts only videos matching the date window; outer query is unfiltered
+            # so all channels always appear (channels outside the window show 0).
+            case_when = (" AND ".join(date_conds)) if date_conds else "1"
+            rows = self.query(
+                "SELECT v.channel_name, "
+                f"  SUM(CASE WHEN {case_when} THEN 1 ELSE 0 END) AS filtered_cnt, "
+                "  COUNT(*) AS total_cnt "
+                "FROM videos v "
+                "JOIN transcripts t ON t.video_id=v.id "
+                "JOIN ai_analysis a ON a.video_id=v.id "
+                "WHERE v.transcript_status='obtained' "
+                "GROUP BY v.channel_name ORDER BY total_cnt DESC, v.channel_name",
+                tuple(params)
+            )
+            self.json({"channels": [
+                {"name": r["channel_name"], "count": r["filtered_cnt"], "total": r["total_cnt"]}
+                for r in rows if r["channel_name"]
+            ]})
+            return
         elif p == "/api/report":
             md = ""
             latest = os.path.join(profiles.load()["reports_dir"], "latest.md")
@@ -1107,12 +2107,90 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with open(latest, encoding="utf-8") as fh:
                     md = fh.read()
             self.json({"markdown": md})
+        elif p.startswith("/api/job_log"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = (qs.get("name") or ["podcast_scraper"])[0]
+            n_lines = int((qs.get("lines") or ["80"])[0])
+            offset = int((qs.get("offset") or ["0"])[0])
+            log_path = profiles.HERMES / "logs" / f"{name}.log"
+            if not log_path.is_file():
+                self.json({"lines": [], "exists": False, "total_lines": 0})
+                return
+            with open(log_path, "r", errors="replace") as fh:
+                all_lines = fh.readlines()
+            total = len(all_lines)
+            if offset:
+                window = all_lines[offset:][-n_lines:]
+            else:
+                window = all_lines[-n_lines:]
+            self.json({"lines": [l.rstrip() for l in window], "exists": True,
+                       "total_lines": total})
+        elif p.startswith("/api/job_status"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = (qs.get("name") or ["podcast_scraper"])[0]
+            script_map = {
+                "podcast_scraper": SCRAPER_SCRIPT,
+                "fetch_transcripts": FETCH_SCRIPT,
+                "analyze_transcripts": ANALYZE_SCRIPT,
+                "generate_digest": DIGEST_SCRIPT,
+                "generate_report": REPORT_SCRIPT,
+            }
+            script = os.path.basename(script_map.get(name, name + ".py"))
+            try:
+                out = subprocess.run(
+                    ["pgrep", "-f", script], capture_output=True, text=True
+                )
+                running = bool(out.stdout.strip())
+            except Exception:
+                running = False
+            self.json({"running": running, "name": name})
         elif p == "/api/profiles":
             active = profiles.load()
             settings = {k: active.get(k) for k in profiles.EDITABLE_SETTINGS}
             self.json({"active": profiles.active_name(),
                        "profiles": profiles.list_profiles(),
                        "settings": settings})
+        elif p == "/api/llm_providers":
+            data = _load_providers()
+            result = []
+            for prov in data.get("providers", []):
+                key = _provider_key(prov["id"])
+                result.append({
+                    "id": prov["id"],
+                    "label": prov["label"],
+                    "base": prov["base"],
+                    "key_set": bool(key),
+                    "key_hint": ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key)),
+                })
+            self.json({
+                "providers": result,
+                "bulk": data.get("bulk", {}),
+                "synth": data.get("synth", {}),
+            })
+        elif p.startswith("/api/llm_models"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            pid = (qs.get("provider") or [""])[0]
+            data = _load_providers()
+            prov = next((pv for pv in data.get("providers", []) if pv["id"] == pid), None)
+            if not prov:
+                self.json({"ok": False, "error": "Provider not found", "models": []})
+                return
+            key = _provider_key(pid)
+            base = prov["base"].rstrip("/")
+            if not key:
+                self.json({"ok": False, "error": "No API key for this provider", "models": []})
+                return
+            try:
+                req = urllib.request.Request(
+                    f"{base}/models",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    mdata = json.loads(r.read())
+                models = sorted([m["id"] for m in mdata.get("data", []) if isinstance(m, dict) and "id" in m])
+                self.json({"ok": True, "models": models})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e), "models": []})
         else:
             self.send_error(404)
 
@@ -1163,7 +2241,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             name = body.get("name") or profiles.active_name()
             fields = {}
             for k in ("min_views", "min_duration_sec", "max_duration_sec",
-                      "min_days_old", "max_videos_per_channel"):
+                      "min_days_old", "max_videos_per_channel",
+                      "enrich_recent_days", "enrich_recent_hours", "enrich_older_days"):
                 if body.get(k) not in (None, ""):
                     try:
                         fields[k] = int(body[k])
@@ -1190,6 +2269,137 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json({"ok": False, "error": str(e), "raw": (out.stdout if 'out' in dir() else '')[:500]})
             return
 
+        if self.path == "/api/llm_providers/add":
+            label = body.get("label", "").strip()
+            base = body.get("base", "https://api.openai.com/v1").rstrip("/")
+            key = body.get("key", "").strip()
+            if not label or not key:
+                self.json({"ok": False, "error": "label and key are required"})
+                return
+            pid = _make_provider_id()
+            data = _load_providers()
+            data["providers"].append({"id": pid, "label": label, "base": base})
+            _write_env_file({f"LLM_KEY_{pid}": key})
+            _save_providers(data)
+            os.environ[f"LLM_KEY_{pid}"] = key
+            self.json({"ok": True, "id": pid})
+            return
+        if self.path == "/api/llm_providers/edit":
+            pid = body.get("id", "")
+            data = _load_providers()
+            prov = next((p for p in data["providers"] if p["id"] == pid), None)
+            if not prov:
+                self.json({"ok": False, "error": "Not found"})
+                return
+            if body.get("label"):
+                prov["label"] = body["label"].strip()
+            if body.get("base"):
+                prov["base"] = body["base"].rstrip("/")
+            if body.get("key"):
+                _write_env_file({f"LLM_KEY_{pid}": body["key"].strip()})
+                os.environ[f"LLM_KEY_{pid}"] = body["key"].strip()
+            _save_providers(data)
+            self.json({"ok": True})
+            return
+        if self.path == "/api/llm_providers/delete":
+            pid = body.get("id", "")
+            data = _load_providers()
+            data["providers"] = [p for p in data["providers"] if p["id"] != pid]
+            for role in ("bulk", "synth"):
+                if data.get(role, {}).get("provider_id") == pid:
+                    data[role] = {}
+            _save_providers(data)
+            self.json({"ok": True})
+            return
+        if self.path == "/api/llm_test":
+            pid = body.get("provider_id", "")
+            data = _load_providers()
+            prov = next((p for p in data.get("providers", []) if p["id"] == pid), None)
+            if not prov:
+                self.json({"ok": False, "error": "Provider not found"})
+                return
+            key = _provider_key(pid)
+            if not key:
+                self.json({"ok": False, "error": "No API key set"})
+                return
+            base = prov["base"].rstrip("/")
+            # Use model explicitly passed, or whichever role uses this provider, or first from /models
+            model = body.get("model", "")
+            if not model:
+                for role in ("bulk", "synth"):
+                    if data.get(role, {}).get("provider_id") == pid:
+                        model = data[role].get("model", "")
+                        break
+            if not model:
+                try:
+                    mreq = urllib.request.Request(
+                        f"{base}/models",
+                        headers={"Authorization": f"Bearer {key}"},
+                    )
+                    with urllib.request.urlopen(mreq, timeout=8) as mr:
+                        mdata = json.loads(mr.read())
+                    models = [m["id"] for m in mdata.get("data", []) if isinstance(m, dict)]
+                    model = models[0] if models else ""
+                except Exception:
+                    pass
+            if not model:
+                self.json({"ok": False, "error": "No model configured for this provider — select one in Active Model Selection first"})
+                return
+            try:
+                payload = json.dumps({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Say 'ok' in one word."}],
+                    "max_tokens": 10,
+                }).encode()
+                req = urllib.request.Request(
+                    f"{base}/chat/completions",
+                    data=payload,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    resp = json.loads(r.read())
+                reply = resp["choices"][0]["message"]["content"].strip()
+                self.json({"ok": True, "reply": reply, "model": model})
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode(errors="replace")[:300]
+                self.json({"ok": False, "error": f"HTTP {e.code}: {body_text}"})
+            except Exception as e:
+                self.json({"ok": False, "error": str(e)})
+            return
+        if self.path == "/api/llm_selection":
+            data = _load_providers()
+            bulk = body.get("bulk", {})
+            synth = body.get("synth", {})
+            if bulk:
+                data["bulk"] = bulk
+            if synth:
+                data["synth"] = synth
+            _save_providers(data)
+            # Sync active vars into .env so analyze_transcripts picks them up
+            env_updates = {}
+            if bulk.get("provider_id"):
+                bp = next((p for p in data["providers"] if p["id"] == bulk["provider_id"]), None)
+                if bp:
+                    env_updates["PODCAST_LLM_BASE"] = bp["base"]
+                    env_updates["PODCAST_LLM_MODEL"] = bulk.get("model", "")
+                    bkey = _provider_key(bulk["provider_id"])
+                    if bkey:
+                        env_updates["PODCAST_LLM_KEY"] = bkey
+            if synth.get("provider_id"):
+                sp = next((p for p in data["providers"] if p["id"] == synth["provider_id"]), None)
+                if sp:
+                    env_updates["PODCAST_SYNTH_BASE"] = sp["base"]
+                    env_updates["PODCAST_SYNTH_MODEL"] = synth.get("model", "")
+                    skey = _provider_key(synth["provider_id"])
+                    if skey:
+                        env_updates["PODCAST_SYNTH_KEY"] = skey
+            _write_env_file(env_updates)
+            for k, v in env_updates.items():
+                if v:
+                    os.environ[k] = v
+            self.json({"ok": True})
+            return
+
         # These take no id — launch a background script.
         if self.path == "/api/process_queue":
             self.spawn_job(FETCH_SCRIPT,
@@ -1203,40 +2413,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "analyze_transcripts", "transcript(s) to analyze")
             return
         if self.path == "/api/generate_digest":
-            logfile = self._job_log("generate_digest")
-            subprocess.Popen([sys.executable, DIGEST_SCRIPT, "--days=7"],
-                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            if self._job_running(DIGEST_SCRIPT):
+                self.json({"started": False, "running": True,
+                           "message": "Digest is already generating — wait for it to finish."})
+                return
+            self._spawn([DIGEST_SCRIPT], "generate_digest")
             self.json({"started": True, "message": "Generating digest…"})
             return
         if self.path == "/api/generate_report":
+            if self._job_running(REPORT_SCRIPT):
+                self.json({"started": False, "running": True,
+                           "message": "A report is already generating — wait for it to finish."})
+                return
             n = int(body.get("n") or 8)
-            logfile = self._job_log("generate_report")
-            subprocess.Popen([sys.executable, REPORT_SCRIPT, f"--n={n}"],
-                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
-            self.json({"started": True, "message": f"Generating advisor report from last {n} transcripts…"})
+            date_from = body.get("date_from") or ""
+            date_to = body.get("date_to") or ""
+            channels = body.get("channels") or ([body["channel"]] if body.get("channel") else [])
+            args = [REPORT_SCRIPT, f"--n={n}"]
+            if date_from: args.append(f"--from={date_from}")
+            if date_to: args.append(f"--to={date_to}")
+            for c in channels:
+                if c: args.append(f"--channel={c}")
+            self._spawn(args, "generate_report")
+            self.json({"started": True, "message": "Generating report…"})
             return
         if self.path == "/api/run_discovery":
+            # Guard: refuse to start if a scraper is already running
+            already = subprocess.run(
+                ["pgrep", "-f", os.path.basename(SCRAPER_SCRIPT)],
+                capture_output=True, text=True,
+            )
+            if already.stdout.strip():
+                self.json({"started": False,
+                           "message": "Discovery is already running — wait for it to finish."})
+                return
             prof = profiles.load()
             launched = []
-            # YouTube arm (queries + channels) — on unless explicitly disabled
             if prof.get("youtube_enabled", True):
-                subprocess.Popen([sys.executable, SCRAPER_SCRIPT],
-                                 stdout=self._job_log("podcast_scraper"),
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+                self._spawn([SCRAPER_SCRIPT], "podcast_scraper")
                 launched.append("video")
-            # Literature arm (queries + scholarly sources)
             if prof.get("literature", {}).get("enabled", False):
-                subprocess.Popen([sys.executable, INGEST_LIT_SCRIPT],
-                                 stdout=self._job_log("ingest_literature"),
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+                self._spawn([INGEST_LIT_SCRIPT], "ingest_literature")
                 launched.append("literature")
             self.json({"started": True,
                        "message": f"Discovery running ({' + '.join(launched) or 'video'}) in the background…"})
             return
         if self.path == "/api/suggest_terms":
-            logfile = self._job_log("suggest_terms")
-            subprocess.Popen([sys.executable, SCRAPER_SCRIPT, "--suggest-terms"],
-                             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+            if self._job_running(SCRAPER_SCRIPT):
+                self.json({"started": False, "running": True,
+                           "message": "The scraper is busy — wait for it to finish."})
+                return
+            self._spawn([SCRAPER_SCRIPT, "--suggest-terms"], "suggest_terms")
             self.json({"started": True, "message": "Generating term suggestions…"})
             return
         if self.path == "/api/promote_channel":
@@ -1261,6 +2488,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json({"ok": True})
             return
 
+        if self.path == "/api/delete_digest":
+            import re as _re
+            name = body.get("filename", "")
+            if not _re.match(r'^digest_[\w-]+\.md$', name):
+                self.json({"ok": False, "error": "invalid filename"})
+            else:
+                digest_dir = Path(profiles.load()["digest_dir"])
+                fpath = (digest_dir / name).resolve()
+                if str(fpath).startswith(str(digest_dir.resolve())) and fpath.exists():
+                    fpath.unlink()
+                remaining = sorted(digest_dir.glob("digest_*.md"), reverse=True)
+                latest = digest_dir / "latest.md"
+                if remaining:
+                    latest.write_text(remaining[0].read_text(encoding="utf-8"), encoding="utf-8")
+                elif latest.exists():
+                    latest.unlink()
+                self.json({"ok": True})
+            return
+
         video_id = body.get("id")
         if not video_id:
             self.send_error(400, "Missing ID")
@@ -1273,6 +2519,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json({"ok": True})
         elif self.path == "/api/unrequest":
             conn.execute("UPDATE videos SET transcript_status = 'not_requested' WHERE id = ?", (video_id,))
+            conn.commit()
+            self.json({"ok": True})
+        elif self.path == "/api/dismiss_video":
+            conn.execute("UPDATE videos SET dismissed = 1 WHERE id = ?", (video_id,))
+            conn.commit()
+            self.json({"ok": True})
+        elif self.path == "/api/undismiss_video":
+            conn.execute("UPDATE videos SET dismissed = 0 WHERE id = ?", (video_id,))
             conn.commit()
             self.json({"ok": True})
         else:
@@ -1316,12 +2570,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return stats
 
     def _job_log(self, name):
-        log_dir = os.path.expanduser("~/.hermes/logs")
+        log_dir = str(profiles.HERMES / "logs")
         os.makedirs(log_dir, exist_ok=True)
         return open(os.path.join(log_dir, f"{name}.log"), "a")
 
+    def _spawn(self, args, log_name, **kwargs):
+        """Launch a background Python script with unbuffered output (-u) so
+        log lines appear in the file immediately, not after the buffer fills."""
+        logfile = self._job_log(log_name)
+        subprocess.Popen([sys.executable, "-u"] + args,
+                         stdout=logfile, stderr=subprocess.STDOUT,
+                         start_new_session=True, **kwargs)
+
+    def _job_running(self, script):
+        """True if a background job for this script is already running. The
+        server-side half of the double-submit guard (CLAUDE.md): a second click
+        or page reload must not spawn a duplicate that races/corrupts shared
+        state (e.g. two writers interleaving into one log)."""
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", os.path.basename(script)],
+                capture_output=True, text=True,
+            )
+            return bool(out.stdout.strip())
+        except Exception:
+            return False
+
     def spawn_job(self, script, count_sql, name, noun):
         """Launch a background script if there's pending work. Non-blocking."""
+        if self._job_running(script):
+            self.json({"started": False, "running": True,
+                       "message": f"Already running — wait for it to finish."})
+            return
         n = self.query(count_sql)[0]["n"]
         if n == 0:
             self.json({"started": False, "queued": 0, "message": "Nothing pending."})
@@ -1329,9 +2609,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not os.path.isfile(script):
             self.json({"started": False, "queued": n, "message": f"Missing {script}"})
             return
-        logfile = self._job_log(name)
-        subprocess.Popen([sys.executable, script],
-                         stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+        self._spawn([script], name)
         self.json({"started": True, "queued": n,
                    "message": f"Processing {n} {noun} in the background."})
 

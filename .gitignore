@@ -21,3 +21,4 @@ venv/
 
 # Claude local settings (machine-specific permissions)
 .claude/settings.local.json
+.aider*

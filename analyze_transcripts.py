@@ -29,10 +29,17 @@ import profiles
 _PROFILE = profiles.load()  # active investigation profile
 DB_PATH = Path(_PROFILE["db_path"])
 ANALYSIS_FOCUS = _PROFILE.get("analysis_focus", "this topic")
-TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"
-ENV_FILE = Path.home() / ".hermes" / ".env"
+TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
+ENV_FILE = profiles.HERMES / ".env"
 
-MAX_TRANSCRIPT_CHARS = 24000  # keep prompt within a sane token budget
+# Per-video transcript chars sent to the analysis LLM. The old default (24000 ≈
+# 6k tokens) silently discarded the back ~75% of any long-form video, so key
+# points were extracted from only the first quarter — the same input-starvation
+# class as the Advisor Report's old EXCERPT_CHARS bug (LEARNINGS P9). A 3-hour
+# transcript is ~150k chars; the default below (~150k chars ≈ 38k tokens) fits a
+# 128k-context model with room for the prompt and output. Override per model with
+# PODCAST_ANALYZE_BUDGET_CHARS.
+MAX_TRANSCRIPT_CHARS = int(os.environ.get("PODCAST_ANALYZE_BUDGET_CHARS", 150_000))
 
 
 def load_env():
@@ -57,8 +64,11 @@ def llm_config():
 
 def synth_config():
     """SYNTHESIS role — stronger model for digests/advisor reports. Falls back to
-    the bulk model. (See DESIGN-multisource.md decision: LLM per stage.)"""
+    the bulk config. Reads PODCAST_SYNTH_KEY/BASE/MODEL so the synth role can use
+    a different provider entirely (set via the Settings → LLM selection UI)."""
     key, base, model = llm_config()
+    key = os.environ.get("PODCAST_SYNTH_KEY") or key
+    base = os.environ.get("PODCAST_SYNTH_BASE", base).rstrip("/")
     model = os.environ.get("PODCAST_SYNTH_MODEL", model)
     return key, base, model
 
@@ -86,7 +96,9 @@ PROMPT = """You are an analyst building a "best of" digest about {focus}. You ar
 given a VERIFIED transcript of one video, with [seconds] timestamp markers.
 
 Extract, using ONLY what the transcript actually says (never invent):
-- key_points: 4-8 of the most important, specific, actionable insights. Each has:
+- key_points: the most important, specific, actionable insights — roughly 6-15
+    depending on how much the transcript actually covers (a long, dense talk
+    should yield more; do not pad a thin one). Each has:
     - timestamp_sec: integer seconds, taken from the nearest [seconds] marker where the point is made
     - point_text: one clear sentence
     - category: one of insight | strategy | tactic | tool | stat | prediction
@@ -144,22 +156,30 @@ def call_llm(prompt, key, base, model, retries=3):
 
 
 def load_transcript(vid, full_text):
+    """Return (text, full_len) where text is capped at MAX_TRANSCRIPT_CHARS and
+    full_len is the pre-truncation length so the caller can announce any drop."""
     seg_path = TRANSCRIPTS_DIR / f"{vid}.segments.json"
     if seg_path.is_file():
         segments = json.loads(seg_path.read_text())
         text = downsample_segments(segments)
         if text:
-            return text[:MAX_TRANSCRIPT_CHARS]
+            return text[:MAX_TRANSCRIPT_CHARS], len(text)
     # Fallback: plain text without timestamps (key points get timestamp_sec 0)
-    return (full_text or "")[:MAX_TRANSCRIPT_CHARS]
+    full = full_text or ""
+    return full[:MAX_TRANSCRIPT_CHARS], len(full)
 
 
 def analyze_video(conn, row, key, base, model):
     vid = row["id"]
-    transcript = load_transcript(vid, row["full_text"])
+    transcript, full_len = load_transcript(vid, row["full_text"])
     if not transcript or len(transcript) < 100:
         print(f"  Skip {vid}: no usable transcript on disk.")
         return False
+    if len(transcript) < full_len:
+        # Never let a cap silently swallow input (LEARNINGS P9 / checklist 10).
+        print(f"  WARNING {vid}: transcript truncated to {len(transcript):,} of "
+              f"{full_len:,} chars ({100*len(transcript)//full_len}%) — raise "
+              f"PODCAST_ANALYZE_BUDGET_CHARS to analyze the whole video.")
     prompt = PROMPT.format(
         focus=ANALYSIS_FOCUS,
         title=row["video_title"] or "", channel=row["channel_name"] or "",
@@ -178,6 +198,15 @@ def analyze_video(conn, row, key, base, model):
     seo_entities = result.get("seo_entities", []) or []
     geo_signals = result.get("geo_signals", []) or []
     best_quote = result.get("best_quote", "") or ""
+
+    # A momentarily-degraded LLM result (valid JSON, but no key points / entities /
+    # quote) must NOT be written as an ai_analysis row — the default query skips
+    # already-analyzed videos, so an empty row would become permanent and never
+    # retried (LEARNINGS P6). Treat empty as a transient failure and leave the
+    # video unanalyzed so the next run picks it up again.
+    if not key_points and not seo_entities and not best_quote:
+        print(f"  Empty analysis for {vid} — leaving unanalyzed to retry next run.")
+        return False
 
     conn.execute("DELETE FROM key_points WHERE video_id=?", (vid,))
     for kp in key_points:
@@ -223,14 +252,15 @@ def analyze_all(only_id=None, force=False):
         conn.close()
         return 0
 
-    print(f"Analyzing {len(rows)} transcript(s) with {model}...")
+    total = len(rows)
+    print(f"Analyzing {total} transcript(s) with {model}...")
     done = 0
-    for row in rows:
-        print(f"Analyzing: {row['video_title']} ({row['id']})")
+    for i, row in enumerate(rows, 1):
+        print(f"[{i}/{total}] Analyzing: {row['video_title']}")
         if analyze_video(conn, row, key, base, model):
             done += 1
     conn.close()
-    print(f"Done. Analyzed {done}/{len(rows)}.")
+    print(f"--- Done: {done}/{total} analyzed ---")
     return done
 
 

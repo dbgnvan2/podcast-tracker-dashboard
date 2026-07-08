@@ -74,38 +74,54 @@ def ingest(profile_name=None):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     n_new = 0
-    for d in docs:
-        vid = d["id"]
-        score = score_paper(d, keywords)
-        cites = d["raw"].get("citations", 0) or 0
-        exists = conn.execute("SELECT 1 FROM videos WHERE id=?", (vid,)).fetchone()
-        if exists:
-            conn.execute(
-                "UPDATE videos SET views=?, citations=?, quality_score=?, last_updated_date=? WHERE id=?",
-                (cites, cites, score, now, vid))
-        else:
-            n_new += 1
-            conn.execute("""INSERT INTO videos (
-                id, channel_name, channel_url, video_title, url, publish_date,
-                duration_seconds, views, likes, comments, first_seen_date, last_updated_date,
-                prev_views, view_change, view_change_pct, transcript_keywords_score,
-                quality_score, transcript_summary, channel_id, is_new_channel,
-                discovered_via, views_per_day, source_type, source, doi, citations, venue,
-                transcript_status, transcribed_date)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (vid, d["byline"], "", d["title"], d["url"], d["published_date"],
-                 0, cites, 0, 0, now, now, 0, 0, 0, relevance(d["title"] + " " + d["text"], keywords),
-                 score, "", "", 0, "literature", 0,
-                 "literature", d["source"], d["raw"].get("doi", ""), cites, d["raw"].get("venue", ""),
-                 "obtained", today))
-        # store the abstract as the analyzable content
-        conn.execute(
-            "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
-            (vid, "", d["text"], len((d["text"] or "").split())))
-    conn.commit()
-    conn.close()
-    print(f"Ingested {len(docs)} papers ({n_new} new). They are 'obtained' — run analyze next.")
-    return len(docs)
+    failed = 0
+    try:
+        for d in docs:
+            try:
+                vid = d["id"]
+                score = score_paper(d, keywords)
+                cites = d["raw"].get("citations", 0) or 0
+                exists = conn.execute("SELECT 1 FROM videos WHERE id=?", (vid,)).fetchone()
+                if exists:
+                    # Refresh descriptive metadata too, not just the metrics — an
+                    # upstream title/venue/date correction must not leave the row
+                    # disagreeing with the refreshed abstract text (LEARNINGS P3).
+                    conn.execute(
+                        "UPDATE videos SET video_title=?, channel_name=?, url=?, "
+                        "publish_date=?, venue=?, doi=?, views=?, citations=?, "
+                        "quality_score=?, last_updated_date=? WHERE id=?",
+                        (d["title"], d["byline"], d["url"], d["published_date"],
+                         d["raw"].get("venue", ""), d["raw"].get("doi", ""),
+                         cites, cites, score, now, vid))
+                else:
+                    n_new += 1
+                    conn.execute("""INSERT INTO videos (
+                        id, channel_name, channel_url, video_title, url, publish_date,
+                        duration_seconds, views, likes, comments, first_seen_date, last_updated_date,
+                        prev_views, view_change, view_change_pct, transcript_keywords_score,
+                        quality_score, transcript_summary, channel_id, is_new_channel,
+                        discovered_via, views_per_day, source_type, source, doi, citations, venue,
+                        transcript_status, transcribed_date)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (vid, d["byline"], "", d["title"], d["url"], d["published_date"],
+                         0, cites, 0, 0, now, now, 0, 0, 0, relevance(d["title"] + " " + d["text"], keywords),
+                         score, "", "", 0, "literature", 0,
+                         "literature", d["source"], d["raw"].get("doi", ""), cites, d["raw"].get("venue", ""),
+                         "obtained", today))
+                # store the abstract as the analyzable content
+                conn.execute(
+                    "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
+                    (vid, "", d["text"], len((d["text"] or "").split())))
+            except Exception as e:
+                # Don't let one malformed doc lose the whole batch (LEARNINGS P2).
+                failed += 1
+                print(f"  Skipped a paper ({d.get('id', '?')}): {type(e).__name__}: {str(e)[:120]}")
+        conn.commit()
+    finally:
+        conn.close()
+    note = f" ({failed} skipped due to errors)" if failed else ""
+    print(f"Ingested {len(docs) - failed} papers ({n_new} new){note}. They are 'obtained' — run analyze next.")
+    return len(docs) - failed
 
 
 if __name__ == "__main__":

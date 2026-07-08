@@ -20,7 +20,7 @@ from datetime import datetime
 
 import profiles
 DB_PATH = Path(profiles.load()["db_path"])  # active investigation profile's DB
-TRANSCRIPTS_DIR = Path.home() / ".hermes" / "transcripts"  # shared (id-keyed)
+TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # yt-dlp: prefer a modern brew/standalone build; fall back to PATH.
@@ -45,12 +45,15 @@ if not YT_DLP:
 PLAYER_CLIENTS = ["android", "web"]
 MAX_429_RETRIES = 2
 BACKOFF_BASE_SEC = 30  # 30, 60
+MIN_CAPTION_CHARS = 100  # below this, treat as no usable captions
 
-# Markers meaning "captions exist but were blocked" -> retryable 'error',
-# as opposed to "genuinely no captions" -> 'not_available'.
+# Markers meaning "captions exist but were blocked / couldn't fetch right now" ->
+# retryable 'error', as opposed to "genuinely no captions" -> 'not_available'.
+# "timeout" is included: a 120s yt-dlp timeout is a transient/slow-network/IP-
+# throttle condition, NOT proof captions are absent (LEARNINGS P1).
 BLOCKED_MARKERS = (
     "429", "too many requests", "po token", "sabr",
-    "missing subtitles languages", "sign in to confirm", "rate",
+    "missing subtitles languages", "sign in to confirm", "rate", "timeout",
 )
 
 
@@ -137,12 +140,15 @@ def _run_ytdlp(vid, url):
             files = list(TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"))
             if files:
                 return 0, out
-            if "429" in out or "too many requests" in out.lower():
+            # Back off and retry on ANY transient block, not just 429 — a PO-token
+            # / SABR / rate block is equally retryable (LEARNINGS P5: the in-loop
+            # retry must use the same signal set as the status classification).
+            if any(m in out.lower() for m in BLOCKED_MARKERS):
                 wait = BACKOFF_BASE_SEC * (2 ** attempt)
-                print(f"    429 on client={client}, backoff {wait}s (attempt {attempt+1})")
+                print(f"    blocked on client={client}, backoff {wait}s (attempt {attempt+1})")
                 time.sleep(wait)
                 continue
-            break  # non-429 failure for this client; try next client
+            break  # non-transient failure for this client; try next client
     return 1, last_output
 
 
@@ -162,10 +168,12 @@ def process_queue():
         conn.close()
         return
 
-    print(f"Processing {len(videos)} videos...")
-    for v in videos:
+    total = len(videos)
+    success_count = 0
+    print(f"Processing {total} videos...")
+    for i, v in enumerate(videos, 1):
         vid, url = v["id"], v["url"]
-        print(f"Fetching: {v['video_title']} ({vid})")
+        print(f"[{i}/{total}] Fetching: {v['video_title']}")
 
         # Clear any stale vtt for this id
         for stale in TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"):
@@ -176,7 +184,7 @@ def process_queue():
 
         if found:
             text, segments = parse_vtt(found[0])
-            if len(text) > 100:
+            if len(text) > MIN_CAPTION_CHARS:
                 txt_path = TRANSCRIPTS_DIR / f"{vid}.txt"
                 txt_path.write_text(text, encoding="utf-8")
                 (TRANSCRIPTS_DIR / f"{vid}.segments.json").write_text(
@@ -190,7 +198,16 @@ def process_queue():
                     "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
                     (vid, str(txt_path), text, len(text.split())),
                 )
+                success_count += 1
                 print(f"  Success: {len(text.split())} words, {len(segments)} segments.")
+                for f in found:
+                    f.unlink()
+            elif any(m in output.lower() for m in BLOCKED_MARKERS):
+                # A short/partial caption produced DURING a block (e.g. the
+                # timedtext endpoint 429'd mid-download) is not proof captions are
+                # absent — keep it retryable (LEARNINGS P1).
+                print("  Captions truncated during a block -> error (will retry).")
+                conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
                 for f in found:
                     f.unlink()
             else:
@@ -209,6 +226,7 @@ def process_queue():
 
         conn.commit()
 
+    print(f"--- Done: {success_count}/{total} transcribed ---")
     conn.close()
 
 
