@@ -152,6 +152,15 @@ def reports_dir_for(name):
 
 def active_name():
     _seed_default()
+    # A spawned background job is pinned to the profile that launched it via the
+    # PTD_PROFILE env var, so a profile switch mid-run can't redirect the job to
+    # another profile's DB (LEARNINGS: spawned jobs read the active profile at
+    # import). The dashboard process never sets this, so it reads _active below.
+    env = os.environ.get("PTD_PROFILE")
+    if env:
+        env = slug(env)
+        if (PROFILES_DIR / f"{env}.json").exists():
+            return env
     try:
         return ACTIVE_FILE.read_text(encoding="utf-8").strip() or "seo-geo"
     except OSError:

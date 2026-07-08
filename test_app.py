@@ -624,6 +624,39 @@ class TestProfiles(unittest.TestCase):
         profiles.update("vid", {"min_views": None, "max_videos_per_channel": ""})
         self.assertEqual(profiles.load("vid")["min_views"], 2000)
 
+    def test_active_name_honors_ptd_profile_env(self):
+        """A spawned job pinned via PTD_PROFILE uses that profile, not _active —
+        so a profile switch mid-run can't redirect the job (finding #1)."""
+        import os
+        profiles.create("zone2", label="Zone 2", analysis_focus="aerobic")
+        profiles.create("stocks", label="Stocks", analysis_focus="dividends")
+        profiles.set_active("zone2")                    # dashboard's active profile
+        self.assertEqual(profiles.active_name(), "zone2")
+        orig = os.environ.get("PTD_PROFILE")
+        try:
+            os.environ["PTD_PROFILE"] = "stocks"        # child pinned at spawn time
+            self.assertEqual(profiles.active_name(), "stocks")
+            self.assertEqual(profiles.load()["analysis_focus"], "dividends")
+            self.assertEqual(profiles.load()["db_path"], profiles.db_path_for("stocks"))
+            # An unknown env profile falls back to _active (defensive).
+            os.environ["PTD_PROFILE"] = "does-not-exist"
+            self.assertEqual(profiles.active_name(), "zone2")
+        finally:
+            if orig is None:
+                os.environ.pop("PTD_PROFILE", None)
+            else:
+                os.environ["PTD_PROFILE"] = orig
+        self.assertEqual(profiles.active_name(), "zone2")   # env cleared -> _active
+
+    def test_spawn_pins_profile_env(self):
+        """The dashboard pins every spawned job to the active profile via env
+        (finding #1 wiring). Source-level guard; the behaviour it relies on is
+        covered by test_active_name_honors_ptd_profile_env."""
+        import inspect
+        src = inspect.getsource(dashboard_server.Handler._spawn)
+        self.assertIn("PTD_PROFILE", src)
+        self.assertIn("profiles.active_name()", src)
+
 
 class TestHTMLJavaScript(unittest.TestCase):
     """Catch Python-string-escape bugs that break the embedded JS at runtime."""
@@ -1205,6 +1238,17 @@ class TestSkipList(unittest.TestCase):
         self.assertTrue(skiplist.is_skipped(self.db, "HOW TO RANK IN 2026"))
         # Blank titles are ignored.
         self.assertFalse(skiplist.add_skip_title(self.db, "   "))
+
+    def test_s1a_atomic_rewrite_preserves_and_dedupes(self):
+        """Adds rewrite the whole file atomically; first occurrence keeps its
+        original casing, dupes are ignored, no torn/duplicate lines (finding #4)."""
+        sk = self.skiplist
+        sk.add_skip_title(self.db, "First Title")
+        sk.add_skip_title(self.db, "Second Title")
+        sk.add_skip_title(self.db, "  first   TITLE ")   # normalizes to #1 -> ignored
+        f = sk.skip_file_for(self.db)
+        lines = [l for l in f.read_text().splitlines() if l.strip()]
+        self.assertEqual(lines, ["First Title", "Second Title"])
 
     def test_s1a_file_is_per_profile(self):
         """Two profile DBs get independent skip files (path derives from db name)."""

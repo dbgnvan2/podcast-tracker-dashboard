@@ -2640,9 +2640,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Launch a background Python script with unbuffered output (-u) so
         log lines appear in the file immediately, not after the buffer fills."""
         logfile = self._job_log(log_name)
+        # Pin the child to the profile active NOW (spawn time). Every spawned job
+        # resolves its DB via profiles.load() at import; without this, a profile
+        # switch between click and import would silently send the job to another
+        # profile's DB and banner (LEARNINGS P3/P6). The parent never sets
+        # PTD_PROFILE, so its own per-request view is unaffected.
+        env = kwargs.pop("env", None) or os.environ.copy()
+        env["PTD_PROFILE"] = profiles.active_name()
         subprocess.Popen([sys.executable, "-u"] + args,
                          stdout=logfile, stderr=subprocess.STDOUT,
-                         start_new_session=True, **kwargs)
+                         start_new_session=True, env=env, **kwargs)
 
     def _job_running(self, script):
         """True if a background job for this script is already running. The

@@ -12,6 +12,8 @@ Tests:   test_app.py::TestSkipList
 The file stores the *original* title (one per line) for readability; matching is
 done on the normalized form, so casing/whitespace differences still match.
 """
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -53,13 +55,31 @@ def add_skip_title(db_path, title):
     n = normalize_title(title)
     if not n:
         return False
-    # Non-atomic read-then-append: safe because the only writer is the
-    # single-threaded dashboard (dismiss handler); discovery subprocesses only
-    # *read* this file. If a future path writes it concurrently, add a lock.
-    if n in load_skip_set(db_path):
-        return False
     f = skip_file_for(db_path)
+    # Re-read existing lines (preserving their original text), dedupe on the
+    # normalized form, then rewrite the whole file atomically via temp + replace.
+    # os.replace is atomic, so a concurrent reader (a discovery subprocess) never
+    # sees a torn or half-written file, and the dedupe check + write are one unit.
+    seen, lines = set(), []
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            nn = normalize_title(line)
+            if nn and nn not in seen:
+                seen.add(nn)
+                lines.append(line.strip())
+    if n in seen:
+        return False
+    lines.append((title or "").strip())
     f.parent.mkdir(parents=True, exist_ok=True)
-    with f.open("a", encoding="utf-8") as fh:
-        fh.write((title or "").strip() + "\n")
+    fd, tmp = tempfile.mkstemp(dir=str(f.parent), prefix=f.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, f)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return True

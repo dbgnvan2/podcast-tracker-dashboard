@@ -66,13 +66,6 @@
   long-form out of the window. Logged so it's not silent.
 - **Broad `except (..., Exception)`** in `_fetch_channel_tab` / `fetch_transcript`: intentional
   fault-tolerance, but swallows *all* errors including bugs. Log the swallowed exception (P2).
-- **Spawned jobs read the *active* profile at import, not the one that launched them (P3/P6).**
-  Every background job (`podcast_scraper`, `fetch_transcripts`, `analyze_transcripts`,
-  `generate_digest`) is spawned with no `--profile`/`--db` and resolves `profiles.load()` itself.
-  If the user switches the active profile between clicking a run button and the subprocess
-  importing, the job (and its `<db>_last_transcribe.json` banner) operates on the *new* profile,
-  and the intended profile's queue is silently not processed. Repo-wide architectural coupling —
-  fix by passing the resolved db/profile as argv to every spawned job as a class (P5), not one.
 - **Persistent "processed" banner depends on a Python-level exit (P15 corollary).** The banner
   file is written by `process_queue`'s `try/except`. A hard `SIGKILL`/OOM of the subprocess writes
   nothing, so the dashboard keeps showing the *previous* run's banner rather than an error. Minor
@@ -83,6 +76,25 @@
 ## Fix log
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Pattern.**
+
+### 2026-07-08 — Spawned jobs followed a mid-run profile switch (found by learning-qa review)
+- **Issue:** every background job (`podcast_scraper`, `fetch_transcripts`, `analyze_transcripts`,
+  `generate_digest`, `generate_report`, `ingest_literature`) was spawned with no profile argument
+  and resolved `profiles.load()` at import. Switching the active profile between clicking a run
+  button and the subprocess importing would silently send the job — and the new persistent
+  transcription banner — to the *wrong* profile's DB, leaving the intended queue unprocessed.
+- **Root cause:** the active profile is global shared state (`profiles/_active`); the spawn
+  contract never pinned the child to the profile that launched it (P3 narrow-scope / P6 trusting
+  a mutable global as ground truth).
+- **What would have caught it:** asking "does this background job stay scoped to the profile that
+  launched it, or to whatever is active when it happens to import?" (P3/P6). Found pre-emptively
+  by the learning-qa review of the feature-#2 diff, not by a production mixup.
+- **Fix:** the dashboard's single spawn choke point (`Handler._spawn`) now injects
+  `PTD_PROFILE=<active-at-spawn>` into every child's env; `profiles.active_name()` honors it. Fixed
+  as a **class** (P5) — one place covers all six jobs — without mutating `_active`, so the
+  dashboard's own view is unaffected. Tests: `TestProfiles::test_active_name_honors_ptd_profile_env`,
+  `::test_spawn_pins_profile_env`.
+- **Pattern:** P3/P6/P5 → checklist 1, 4, 6.
 
 ### 2026-06-03 — LLM call not hardened like the yt-dlp calls (found by review, pre-emptive)
 - **Issue:** `call_llm` (analyze/report) made a single `urlopen` with no retry; a transient
