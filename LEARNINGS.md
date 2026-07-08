@@ -66,6 +66,17 @@
   long-form out of the window. Logged so it's not silent.
 - **Broad `except (..., Exception)`** in `_fetch_channel_tab` / `fetch_transcript`: intentional
   fault-tolerance, but swallows *all* errors including bugs. Log the swallowed exception (P2).
+- **Spawned jobs read the *active* profile at import, not the one that launched them (P3/P6).**
+  Every background job (`podcast_scraper`, `fetch_transcripts`, `analyze_transcripts`,
+  `generate_digest`) is spawned with no `--profile`/`--db` and resolves `profiles.load()` itself.
+  If the user switches the active profile between clicking a run button and the subprocess
+  importing, the job (and its `<db>_last_transcribe.json` banner) operates on the *new* profile,
+  and the intended profile's queue is silently not processed. Repo-wide architectural coupling —
+  fix by passing the resolved db/profile as argv to every spawned job as a class (P5), not one.
+- **Persistent "processed" banner depends on a Python-level exit (P15 corollary).** The banner
+  file is written by `process_queue`'s `try/except`. A hard `SIGKILL`/OOM of the subprocess writes
+  nothing, so the dashboard keeps showing the *previous* run's banner rather than an error. Minor
+  edge; would need a heartbeat/"started" marker to detect a vanished subprocess.
 
 ---
 

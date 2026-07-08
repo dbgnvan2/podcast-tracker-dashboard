@@ -19,6 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 import profiles
+import runstate
 DB_PATH = Path(profiles.load()["db_path"])  # active investigation profile's DB
 TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -152,10 +153,12 @@ def _run_ytdlp(vid, url):
     return 1, last_output
 
 
-def process_queue():
+def _process_queue():
+    """Fetch transcripts for the requested queue. Returns (ok, total), or None
+    when there was nothing to do (so the caller records no run result)."""
     if not YT_DLP:
         print("Error: yt-dlp not found.")
-        return
+        return None
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -166,10 +169,12 @@ def process_queue():
     if not videos:
         print("No videos in requested queue.")
         conn.close()
-        return
+        return None
 
     total = len(videos)
     success_count = 0
+    unavailable_count = 0   # terminal: no captions (not_available)
+    error_count = 0         # retryable: blocked/429 (error) — P1, don't call this "failed"
     print(f"Processing {total} videos...")
     for i, v in enumerate(videos, 1):
         vid, url = v["id"], v["url"]
@@ -208,11 +213,13 @@ def process_queue():
                 # absent — keep it retryable (LEARNINGS P1).
                 print("  Captions truncated during a block -> error (will retry).")
                 conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
+                error_count += 1
                 for f in found:
                     f.unlink()
             else:
                 print("  Captions too short -> not_available.")
                 conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
+                unavailable_count += 1
                 for f in found:
                     f.unlink()
         else:
@@ -220,14 +227,40 @@ def process_queue():
             if any(m in lowered for m in BLOCKED_MARKERS):
                 print("  Blocked (PO token / SABR / rate limit) -> error (will retry).")
                 conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
+                error_count += 1
             else:
                 print("  No captions available -> not_available.")
                 conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
+                unavailable_count += 1
 
         conn.commit()
 
     print(f"--- Done: {success_count}/{total} transcribed ---")
     conn.close()
+    return {"ok": success_count, "total": total,
+            "unavailable": unavailable_count, "retryable": error_count}
+
+
+def process_queue():
+    """Run the queue and record the outcome for the dashboard's persistent
+    'processed' message (feature #2). A crash mid-run writes an 'error' result
+    instead of stranding a stale/blank message (P15)."""
+    try:
+        result = _process_queue()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        try:
+            runstate.write_transcribe_result(DB_PATH, ok=0, total=0,
+                                             status="error", error=str(e))
+        except Exception:
+            pass
+        raise
+    if result is not None:
+        runstate.write_transcribe_result(
+            DB_PATH, ok=result["ok"], total=result["total"],
+            unavailable=result["unavailable"], retryable=result["retryable"],
+            status="done")
 
 
 if __name__ == "__main__":

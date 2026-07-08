@@ -11,6 +11,8 @@ import urllib.request
 from pathlib import Path
 
 import profiles
+import skiplist
+import runstate
 
 ENV_FILE = profiles.HERMES / ".env"
 LLM_KEYS = ("PODCAST_LLM_KEY", "PODCAST_LLM_BASE", "PODCAST_LLM_MODEL", "PODCAST_SYNTH_MODEL")
@@ -497,6 +499,7 @@ HTML = """
         </div>
 
         <div id="requested" class="tab-content">
+            <div id="transcribe-banner" style="display:none;margin-bottom:15px;padding:10px 14px;border-radius:8px;border:1px solid var(--border);font-size:0.9rem;"></div>
             <div style="display:flex; gap:12px; align-items:center; margin-bottom:15px;">
                 <button id="queue-btn" class="btn btn-primary" onclick="processQueue()">⚙ Process Queue</button>
                 <span id="queue-status" style="color: var(--text-dim); font-size: 0.85rem;"></span>
@@ -769,13 +772,14 @@ HTML = """
         async function fetchData() {
             document.getElementById('loading').style.display = 'block';
             try {
-                const [cRes, rRes, tRes, sRes, iRes, dRes] = await Promise.all([
+                const [cRes, rRes, tRes, sRes, iRes, dRes, txRes] = await Promise.all([
                     fetch('/api/candidates').then(r => r.json()),
                     fetch('/api/requested').then(r => r.json()),
                     fetch('/api/transcribed').then(r => r.json()),
                     fetch('/api/stats').then(r => r.json()),
                     fetch('/api/intelligence').then(r => r.json()),
-                    fetch('/api/discovery').then(r => r.json())
+                    fetch('/api/discovery').then(r => r.json()),
+                    fetch('/api/transcribe_status').then(r => r.json())
                 ]);
                 data.candidates = cRes;
                 data.requested = rRes;
@@ -783,6 +787,7 @@ HTML = """
                 data.stats = sRes;
                 data.intelligence = iRes;
                 data.discovery = dRes;
+                data.transcribeStatus = txRes;
                 renderAll();
             } catch (err) {
                 console.error('Fetch error:', err);
@@ -798,6 +803,7 @@ HTML = """
             renderIntelligence();
             renderDiscovery();
             renderStats();
+            renderTranscribeBanner();
             // Surface list truncation: the endpoints cap at 200, but stats has the
             // true totals — never let a cap silently hide rows (LEARNINGS P9).
             const cc = document.getElementById('candidates-count');
@@ -828,7 +834,7 @@ HTML = """
                 if (type === 'candidates') {
                     actionHtml = `<td style="white-space:nowrap">
                         <button class="btn btn-mark" onclick="postAction('/api/request_transcribe', '${v.id}')">Transcribe</button>
-                        <button class="btn" style="background:var(--border);color:var(--text-dim);margin-left:4px" title="Hide permanently" onclick="dismissVideo('${v.id}', this)">Skip</button>
+                        <button class="btn" style="background:var(--border);color:var(--text-dim);margin-left:4px" title="Skip forever — never show this title again, even if re-uploaded" onclick="dismissVideo('${v.id}', this)">Skip</button>
                     </td>`;
                 } else if (type === 'requested') {
                     actionHtml = `<td><button class="btn btn-unreq" onclick="postAction('/api/unrequest', '${v.id}')">Remove</button></td>`;
@@ -838,8 +844,10 @@ HTML = """
 
                 let dateCol = v.publish_date || '';
                 if (type === 'transcribed') {
-                    dateCol = v.transcript_status || 'obtained';
-                    if (v.transcribed_date) dateCol += ' - ' + v.transcribed_date;
+                    // Feature #3: dedicated "Transcribed" date column — just the
+                    // date (all rows here are already status 'obtained'); older
+                    // rows with no stored date show an em-dash.
+                    dateCol = v.transcribed_date || '—';
                 } else if (v.views_per_day) {
                     dateCol = `${(v.views_per_day).toLocaleString()}/day`;
                 }
@@ -864,6 +872,41 @@ HTML = """
             document.getElementById('sort-quality').classList.toggle('active', mode === 'quality');
             document.getElementById('sort-trending').classList.toggle('active', mode === 'trending');
             renderTable('candidates', data.candidates);
+        }
+
+        function renderTranscribeBanner() {
+            // Feature #2: persistent result of the last Process Queue run. Stays
+            // visible (across reloads) until new candidates are queued, which the
+            // server clears on /api/request_transcribe.
+            const el = document.getElementById('transcribe-banner');
+            if (!el) return;
+            const st = data.transcribeStatus || {};
+            if (!st.status) { el.style.display = 'none'; return; }
+            let msg, bd;
+            if (st.status === 'error') {
+                msg = '⚠️ Last transcription run failed'
+                    + (st.error ? ': ' + st.error : '')
+                    + (st.date ? ' (' + st.date + ')' : '')
+                    + '. Queue new candidates to clear this.';
+                el.style.background = 'rgba(240,170,0,0.12)';
+                bd = 'var(--warning)';
+            } else {
+                // Keep terminal (no captions) separate from retryable (blocked) so
+                // a P1-retryable video is never presented as a permanent failure.
+                const parts = [];
+                if (st.unavailable > 0) parts.push(st.unavailable + ' had no captions');
+                if (st.retryable > 0) parts.push(st.retryable + ' blocked (can retry)');
+                msg = '✅ Last transcription: ' + (st.ok || 0) + ' of ' + (st.total || 0)
+                    + ' transcribed' + (st.date ? ' on ' + st.date : '')
+                    + (parts.length ? ' — ' + parts.join(', ') : '')
+                    + '. Queue new candidates to clear this.';
+                el.style.background = 'rgba(80,200,120,0.12)';
+                bd = 'rgba(80,200,120,0.6)';
+            }
+            el.innerHTML = msg;
+            el.style.borderColor = bd;
+            el.style.color = 'var(--text-main)';
+            el.style.display = 'block';
         }
 
         function renderDiscovery() {
@@ -1954,7 +1997,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML.encode())
         elif p == "/api/candidates":
-            self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'not_requested' AND (dismissed IS NULL OR dismissed = 0) ORDER BY quality_score DESC LIMIT 200"))
+            rows = self.query("SELECT * FROM videos WHERE transcript_status = 'not_requested' AND (dismissed IS NULL OR dismissed = 0) ORDER BY quality_score DESC LIMIT 200")
+            # Skip Forever (S1.D): drop any candidate whose title is in the skip
+            # file — a safety net for rows that slipped past the discovery guard
+            # (e.g. re-discovered under a new id before being re-dismissed).
+            skips = skiplist.load_skip_set(DB_PATH)
+            if skips:
+                rows = [r for r in rows
+                        if skiplist.normalize_title(r.get("video_title")) not in skips]
+            self.json(rows)
         elif p == "/api/requested":
             self.json(self.query("SELECT * FROM videos WHERE transcript_status = 'requested' ORDER BY quality_score DESC LIMIT 200"))
         elif p == "/api/transcribed":
@@ -1983,6 +2034,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json({"error": "no transcript", "full_text": None})
         elif p == "/api/intelligence":
             self.json(self.get_intelligence())
+        elif p == "/api/transcribe_status":
+            # Feature #2: last Process Queue outcome — persists until new work is
+            # queued. None → no active message.
+            self.json(runstate.read_transcribe_result(DB_PATH) or {})
         elif p == "/api/discovery":
             self.json(self.get_discovery())
         elif p == "/api/digest":
@@ -2516,14 +2571,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/request_transcribe":
             conn.execute("UPDATE videos SET transcript_status = 'requested' WHERE id = ?", (video_id,))
             conn.commit()
+            # Feature #2: queuing new work clears the last-run "processed" message.
+            runstate.clear_transcribe_result(DB_PATH)
             self.json({"ok": True})
         elif self.path == "/api/unrequest":
             conn.execute("UPDATE videos SET transcript_status = 'not_requested' WHERE id = ?", (video_id,))
             conn.commit()
             self.json({"ok": True})
         elif self.path == "/api/dismiss_video":
+            # Skip Forever (S1.A/S1.C): record the title so it never returns
+            # (even re-uploaded under a new id), and hide this row immediately.
+            row = conn.execute("SELECT video_title FROM videos WHERE id = ?", (video_id,)).fetchone()
             conn.execute("UPDATE videos SET dismissed = 1 WHERE id = ?", (video_id,))
             conn.commit()
+            if row and row[0]:
+                skiplist.add_skip_title(DB_PATH, row[0])
             self.json({"ok": True})
         elif self.path == "/api/undismiss_video":
             conn.execute("UPDATE videos SET dismissed = 0 WHERE id = ?", (video_id,))

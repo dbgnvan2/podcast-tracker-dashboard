@@ -664,6 +664,21 @@ class TestHTMLJavaScript(unittest.TestCase):
                       "/api/run_discovery", "/api/job_log", "/api/llm_selection"):
             self.assertIn(route, js, f"Route {route} missing from JS")
 
+    def test_feature3_transcribed_shows_clean_date(self):
+        """Feature #3: Transcribed tab shows just the date (em-dash fallback),
+        not the old 'status - date' blend."""
+        js = self._extract_js()
+        self.assertIn("dateCol = v.transcribed_date || '—'", js)
+        # The old status-prefixed format must be gone.
+        self.assertNotIn("dateCol = v.transcript_status || 'obtained'", js)
+
+    def test_feature2_transcribe_banner_wired(self):
+        """Feature #2: persistent processed-message banner is present and wired."""
+        js = self._extract_js()
+        self.assertIn("transcribe-banner", dashboard_server.HTML)
+        self.assertIn("/api/transcribe_status", js)
+        self.assertIn("renderTranscribeBanner", js)
+
 
 class TestLLMProviders(unittest.TestCase):
     """Provider CRUD: add, edit, delete, key storage, selection persistence."""
@@ -896,10 +911,75 @@ class TestAPISmoke(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsInstance(body, list)
 
+    def test_s1_skip_forever_end_to_end(self):
+        """Skip button → skip file recorded, row hidden, re-upload stays hidden.
+
+        Spec S1.A/S1.C/S1.D through the real HTTP endpoints.
+        """
+        import skiplist
+        db = dashboard_server.DB_PATH
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO videos (id, channel_name, video_title, url, views, "
+            "quality_score, transcript_status, dismissed) "
+            "VALUES ('SKIP_ORIG','C','Skip Me Please','u',5,0.8,'not_requested',0)")
+        conn.commit(); conn.close()
+
+        # Appears as a candidate first.
+        _, before = self._get("/api/candidates")
+        self.assertIn("SKIP_ORIG", [r["id"] for r in before])
+
+        # Click Skip.
+        status, body = self._post("/api/dismiss_video", {"id": "SKIP_ORIG"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+        # S1.A: title is now in the skip file. S1.C: row is dismissed + gone.
+        self.assertTrue(skiplist.is_skipped(db, "skip me please"))
+        _, after = self._get("/api/candidates")
+        self.assertNotIn("SKIP_ORIG", [r["id"] for r in after])
+
+        # S1.D "forever": a re-upload under a NEW id (not dismissed) stays hidden.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO videos (id, channel_name, video_title, url, views, "
+            "quality_score, transcript_status, dismissed) "
+            "VALUES ('SKIP_REUP','C','  skip me   please  ','u',9,0.95,'not_requested',0)")
+        conn.commit(); conn.close()
+        _, reup = self._get("/api/candidates")
+        self.assertNotIn("SKIP_REUP", [r["id"] for r in reup],
+                         "re-uploaded skipped title must not resurface")
+
     def test_stats_returns_dict(self):
         status, body = self._get("/api/stats")
         self.assertEqual(status, 200)
         self.assertIn("total", body)
+
+    def test_feature2_transcribe_status_and_clear_on_queue(self):
+        """Feature #2 through real endpoints: message persists, then clears when
+        new work is queued via /api/request_transcribe."""
+        import runstate
+        db = dashboard_server.DB_PATH
+        runstate.clear_transcribe_result(db)
+        _, empty = self._get("/api/transcribe_status")
+        self.assertFalse(empty.get("status"))
+        # A completed run's result is served — with terminal vs. retryable split
+        # kept distinct so a P1 block is never shown as a permanent failure.
+        runstate.write_transcribe_result(db, ok=3, total=5, unavailable=1, retryable=1)
+        _, got = self._get("/api/transcribe_status")
+        self.assertEqual((got["ok"], got["total"]), (3, 5))
+        self.assertEqual((got["unavailable"], got["retryable"]), (1, 1))
+        # Queuing a new candidate clears the message.
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO videos (id, channel_name, video_title, url, views, "
+                     "quality_score, transcript_status, dismissed) "
+                     "VALUES ('REQ1','C','Req Me','u',1,0.5,'not_requested',0)")
+        conn.commit(); conn.close()
+        st, _ = self._post("/api/request_transcribe", {"id": "REQ1"})
+        self.assertEqual(st, 200)
+        _, after = self._get("/api/transcribe_status")
+        self.assertFalse(after.get("status"),
+                         "queuing new work must clear the processed message")
 
     def test_profiles_returns_active(self):
         status, body = self._get("/api/profiles")
@@ -1068,6 +1148,155 @@ class TestOvernightPipeline(unittest.TestCase):
         sig = inspect.signature(generate_digest.build_digest)
         self.assertNotIn("days", sig.parameters)
         self.assertIn("force", sig.parameters)
+
+
+class TestSkipList(unittest.TestCase):
+    """Skip Forever (spec S1): title-based, permanent skipping via a per-profile file."""
+
+    def setUp(self):
+        import skiplist
+        self.skiplist = skiplist
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "podcast_test.db")
+        fresh_db(self.db)
+
+    # ── S1.D (highest-impact — the "forever" guarantee) ──────────────────────
+    def test_s1d_candidates_exclude_skipped_new_id(self):
+        """A skipped title stays hidden even when re-discovered under a NEW video id.
+
+        Spec S1.D. This is the whole point of skip-by-title: dismissing an id is
+        not enough because a re-upload gets a fresh id.
+        """
+        skiplist = self.skiplist
+        # User skips the video (title recorded; original id dismissed).
+        skiplist.add_skip_title(self.db, "AEO vs SEO: The Real Story")
+        # Later a re-upload appears under a brand-new id, NOT dismissed.
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "INSERT INTO videos (id, channel_name, video_title, url, views, "
+            "quality_score, transcript_status, dismissed) "
+            "VALUES ('NEWID999','C','aeo vs seo: the real story','u',10,0.9,'not_requested',0)")
+        conn.commit(); conn.close()
+        # The candidates filter (as the endpoint applies it) must exclude it.
+        skips = skiplist.load_skip_set(self.db)
+        rows = [{"video_title": "aeo vs seo: the real story", "id": "NEWID999"}]
+        visible = [r for r in rows
+                   if skiplist.normalize_title(r["video_title"]) not in skips]
+        self.assertEqual(visible, [], "re-uploaded skipped title must not resurface")
+
+    # ── S1.B — normalization (adversarial: look-alike titles) ───────────────
+    def test_s1b_normalize_title(self):
+        n = self.skiplist.normalize_title
+        self.assertEqual(n("  AEO  vs   SEO "), "aeo vs seo")
+        self.assertEqual(n("AEO vs SEO"), n("aeo   vs seo"))
+        # Distinct titles stay distinct — skip must not over-match.
+        self.assertNotEqual(n("AEO vs SEO"), n("AEO vs GEO"))
+        self.assertEqual(n(None), "")
+
+    # ── S1.A — persistence + dedupe (dirty-state / second call) ─────────────
+    def test_s1a_add_persists_and_dedupes(self):
+        skiplist = self.skiplist
+        self.assertTrue(skiplist.add_skip_title(self.db, "How to Rank in 2026"))
+        # Second add with different casing/spacing must NOT create a 2nd line.
+        self.assertFalse(skiplist.add_skip_title(self.db, "  how to   rank in 2026 "))
+        f = skiplist.skip_file_for(self.db)
+        lines = [l for l in f.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(skiplist.is_skipped(self.db, "HOW TO RANK IN 2026"))
+        # Blank titles are ignored.
+        self.assertFalse(skiplist.add_skip_title(self.db, "   "))
+
+    def test_s1a_file_is_per_profile(self):
+        """Two profile DBs get independent skip files (path derives from db name)."""
+        skiplist = self.skiplist
+        db2 = str(self.tmp / "podcast_other.db")
+        skiplist.add_skip_title(self.db, "Only In Profile One")
+        self.assertTrue(skiplist.is_skipped(self.db, "Only In Profile One"))
+        self.assertFalse(skiplist.is_skipped(db2, "Only In Profile One"))
+
+    def test_s1e_scraper_guards_discovery_with_skiplist(self):
+        """Discovery loop is guarded by the skip file, and reports the drop count.
+
+        Spec S1.E. The full scrape runs live yt-dlp, so this asserts the guard is
+        wired into the update loop (regression guard) rather than faking network
+        coverage (P10 honesty). The enforcing behaviour a user sees is covered
+        end-to-end by TestAPISmoke.test_s1_skip_forever_end_to_end.
+        """
+        import podcast_scraper
+        src = Path(podcast_scraper.__file__).read_text()
+        self.assertIn("skiplist.load_skip_set", src)
+        self.assertIn("skiplist.normalize_title", src)
+        self.assertIn("skiplist_dropped", src)  # count is surfaced, not silent (P2)
+
+
+class TestTranscribeRunState(unittest.TestCase):
+    """Feature #2: persistent 'processed' message — the last-run result store."""
+
+    def setUp(self):
+        import runstate
+        self.runstate = runstate
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "podcast_test.db")
+        fresh_db(self.db)
+
+    def test_write_read_clear(self):
+        rs = self.runstate
+        self.assertIsNone(rs.read_transcribe_result(self.db))
+        data = rs.write_transcribe_result(self.db, ok=5, total=7, unavailable=1, retryable=1)
+        self.assertEqual(data["status"], "done")
+        got = rs.read_transcribe_result(self.db)
+        self.assertEqual((got["ok"], got["total"]), (5, 7))
+        # Terminal vs. retryable are kept distinct (P1) — no lumped "failed".
+        self.assertEqual((got["unavailable"], got["retryable"]), (1, 1))
+        self.assertNotIn("failed", got)
+        self.assertIn("date", got)
+        rs.clear_transcribe_result(self.db)
+        self.assertIsNone(rs.read_transcribe_result(self.db))
+        rs.clear_transcribe_result(self.db)          # idempotent — no error
+
+    def test_producer_writes_result_on_completion(self):
+        """fetch_transcripts records a run result the dashboard can show (feature #2).
+
+        Mocks yt-dlp so this runs the real process_queue path without network:
+        a video with no captions => ok=0/total=1, status 'done'.
+        """
+        import fetch_transcripts as ft
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO videos (id, channel_name, video_title, url, views, "
+                     "quality_score, transcript_status) "
+                     "VALUES ('V1','C','T','http://u',1,0.5,'requested')")
+        conn.commit(); conn.close()
+        orig = (ft.DB_PATH, ft.TRANSCRIPTS_DIR, ft.YT_DLP, ft._run_ytdlp)
+        try:
+            ft.DB_PATH = Path(self.db)
+            ft.TRANSCRIPTS_DIR = self.tmp
+            ft.YT_DLP = "yt-dlp"
+            ft._run_ytdlp = lambda vid, url: (1, "no captions available for this video")
+            ft.process_queue()
+        finally:
+            ft.DB_PATH, ft.TRANSCRIPTS_DIR, ft.YT_DLP, ft._run_ytdlp = orig
+        res = self.runstate.read_transcribe_result(self.db)
+        self.assertIsNotNone(res)
+        # No captions => terminal 'unavailable', not a retryable "failure" (P1).
+        self.assertEqual((res["status"], res["total"], res["ok"]), ("done", 1, 0))
+        self.assertEqual((res["unavailable"], res["retryable"]), (1, 0))
+
+    def test_producer_writes_error_on_crash(self):
+        """A crash mid-run records an 'error' result, never a stale/blank one (P15)."""
+        import fetch_transcripts as ft
+        orig = (ft.DB_PATH, ft._process_queue)
+        try:
+            ft.DB_PATH = Path(self.db)
+            def boom():
+                raise RuntimeError("kaboom")
+            ft._process_queue = boom
+            with self.assertRaises(RuntimeError):
+                ft.process_queue()
+        finally:
+            ft.DB_PATH, ft._process_queue = orig
+        res = self.runstate.read_transcribe_result(self.db)
+        self.assertEqual(res["status"], "error")
+        self.assertIn("kaboom", res["error"])
 
 
 if __name__ == "__main__":

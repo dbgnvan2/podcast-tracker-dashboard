@@ -16,6 +16,7 @@ from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
 import profiles
+import skiplist
 
 TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
 
@@ -954,7 +955,14 @@ def main():
     ).fetchall()}
 
     new_count = 0
+    # Skip Forever (S1.E): never re-add a title the user has skipped, even if it
+    # comes back under a new video id. Surface the count — never drop silently (P2).
+    skip_set = skiplist.load_skip_set(DB_PATH)
+    skiplist_dropped = 0
     for v in enriched:
+        if skiplist.normalize_title(v["title"]) in skip_set:
+            skiplist_dropped += 1
+            continue
         cursor.execute("SELECT id FROM videos WHERE id = ?", (v["id"],))
         existing = cursor.fetchone()
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1054,6 +1062,7 @@ def main():
     print(f"  Found:          {total_to_enrich:>5} unique videos")
     print(f"  Enriched:       {fetched:>5} via yt-dlp")
     print(f"  Cached:         {skipped:>5} skipped (recently updated)")
+    print(f"  Skip list:      {skiplist_dropped:>5} dropped (title in skip file)")
     print(f"  Passed filters: {len(enriched):>5}")
     if zero_score:
         print(f"  Semantic check: {sem_updated:>5} of {len(zero_score)} zero-score titles updated")
