@@ -180,7 +180,7 @@ Re-running **Run Discovery** is always safe — it never re-processes or duplica
 - **Transcribed** (`obtained`) — stays transcribed and is **never re-queued or re-transcribed**. The fetcher only ever pulls `requested` rows.
 - **Skipped** — never reaches the DB write; filtered out by title before insert.
 
-**Re-upload guard.** Transcribe protects by video **ID**, so on its own it wouldn't stop a re-upload of an already-transcribed talk from reappearing as a fresh candidate. Discovery therefore also drops any **new** video whose **title** matches something you've already transcribed (`obtained`). The run summary reports the count as `Re-upload dup: N dropped (title already transcribed)`, so the drop is always visible, never silent.
+**Re-upload guard.** Transcribe protects by video **ID**, so on its own it wouldn't stop a re-upload of an already-transcribed talk from reappearing as a fresh candidate. Discovery therefore also drops any **new** video where **the same channel** already has an `obtained` video with that title — matched on `(channel, title)`. It is deliberately scoped to the channel: a *different* creator posting a video with the same title (e.g. "SEO in 2025") is a genuinely different video and stays visible. Each drop is both counted in the run summary (`Re-upload dup: N`) **and** logged per item with its title and URL, so a wrongful exclusion is always auditable — never silent.
 
 If you *empty* the Candidates list by hitting Skip or Transcribe on everything, the next discovery run's Candidates list will show **only genuinely new videos**.
 

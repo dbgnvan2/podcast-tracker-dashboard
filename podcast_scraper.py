@@ -554,37 +554,53 @@ def get_db_curated_channels(conn):
     return out
 
 
-def load_obtained_titles(conn):
-    """Normalized titles of videos already transcribed (transcript_status='obtained').
+def load_obtained_keys(conn):
+    """`(channel_id, normalized_title)` pairs for videos already transcribed
+    (transcript_status='obtained').
 
-    Used to drop re-uploads that reappear under a NEW video id: the transcription
-    guard is keyed by video id, so only a title-level check catches the same talk
-    re-posted under a fresh id. Returns an empty set on a not-yet-migrated DB
-    (no transcript_status column -> nothing transcribed). The caller counts and
-    reports every drop (P2 — never silent).
+    Used to drop *re-uploads*: the same channel re-posting an already-transcribed
+    talk under a NEW video id. The transcription guard is keyed by video id, so only
+    this catches a re-post. **Scoped to channel on purpose** — a *different* creator
+    publishing a same-titled talk ("SEO in 2025", "Q&A") is a genuinely different
+    video and must stay visible (P3: fixing an id-too-narrow key must not swing to a
+    title-too-broad one). Returns an empty set on a not-yet-migrated DB (no
+    transcript_status column -> nothing transcribed). Callers count and log every
+    drop (P2 — never silent).
     """
     out = set()
     try:
         rows = conn.execute(
-            "SELECT video_title FROM videos "
+            "SELECT channel_id, video_title FROM videos "
             "WHERE transcript_status = 'obtained' AND video_title IS NOT NULL"
         ).fetchall()
     except sqlite3.OperationalError:
         return out  # column not present yet -> nothing transcribed
-    for r in rows:
-        n = skiplist.normalize_title(r[0])
+    for channel_id, title in rows:
+        n = skiplist.normalize_title(title)
         if n:
-            out.add(n)
+            out.add((channel_id, n))
     return out
 
 
-def is_transcribed_reupload(title, obtained_titles, existing):
-    """True when a NEW video id (existing is None) carries the normalized title of
-    a video we've already transcribed — a re-upload to drop from Candidates. When
-    the SAME id reappears (existing is not None) it is kept, so discovery can still
-    refresh that row's view stats.
+def classify_discovered_video(existing, title, channel_id, obtained_keys):
+    """Decide discovery's action for one enriched video, *after* the skip-file check.
+
+    Returns:
+      ``"update"``   — the video id is already in the DB (refresh its stats; the
+                       UPDATE never touches transcript_status/dismissed).
+      ``"reupload"`` — a NEW id whose ``(channel_id, normalized title)`` matches a
+                       video we already transcribed (drop; the per-id transcription
+                       guard can't see a re-post under a fresh id).
+      ``"insert"``   — a genuinely new video.
+
+    ``existing`` is the DB row for this video id (None iff the id is new), so a
+    same-id refresh is always kept — only a *new* id can be a re-upload.
     """
-    return existing is None and skiplist.normalize_title(title) in obtained_titles
+    if existing is not None:
+        return "update"
+    if (channel_id, skiplist.normalize_title(title)) in obtained_keys:
+        return "reupload"
+    return "insert"
 
 
 def sync_channels(conn):
@@ -992,10 +1008,11 @@ def main():
     # comes back under a new video id. Surface the count — never drop silently (P2).
     skip_set = skiplist.load_skip_set(DB_PATH)
     skiplist_dropped = 0
-    # Re-upload guard: a talk re-posted under a NEW video id whose title we've
-    # already transcribed should not re-enter Candidates. Keyed by title because
-    # the transcript_status guard is per video id. Count drops — never silent (P2).
-    obtained_titles = load_obtained_titles(cursor)
+    # Re-upload guard: the same channel re-posting an already-transcribed talk under
+    # a NEW video id should not re-enter Candidates. Keyed by (channel, title) — a
+    # different creator's same-titled talk must stay visible. Count AND log every
+    # drop so a wrongful exclusion is auditable per item, never just an aggregate (P2).
+    obtained_keys = load_obtained_keys(cursor)
     reupload_dropped = 0
     for v in enriched:
         if skiplist.normalize_title(v["title"]) in skip_set:
@@ -1003,8 +1020,12 @@ def main():
             continue
         cursor.execute("SELECT id FROM videos WHERE id = ?", (v["id"],))
         existing = cursor.fetchone()
-        if is_transcribed_reupload(v["title"], obtained_titles, existing):
+        action = classify_discovered_video(
+            existing, v["title"], v.get("channel_id"), obtained_keys)
+        if action == "reupload":
             reupload_dropped += 1
+            print(f"    · re-upload dropped (already transcribed on this channel): "
+                  f"{v['title'][:70]}  {v.get('url', '')}", flush=True)
             continue
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1015,7 +1036,7 @@ def main():
             and v["channel_id"] not in known_channels
         ) else 0
 
-        if existing:
+        if action == "update":
             # Update with new view counts + velocity + channel metadata
             cursor.execute("""
                 UPDATE videos SET

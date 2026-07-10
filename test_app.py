@@ -1274,54 +1274,73 @@ class TestSkipList(unittest.TestCase):
 
 
 class TestTranscribedReupload(unittest.TestCase):
-    """Re-upload guard: a talk re-posted under a NEW video id whose title we've
-    already transcribed must be dropped from the next discovery run — because the
-    transcription guard is per video id, only a title check catches a re-upload."""
+    """Re-upload guard: the SAME channel re-posting an already-transcribed talk under
+    a NEW video id must be dropped from the next discovery run — the transcription
+    guard is per video id, so only a (channel, title) check catches a re-upload. A
+    DIFFERENT creator's same-titled talk must stay visible (channel-scoped)."""
+
+    C1 = "UC_channel_one"
+    C2 = "UC_channel_two"
+    TITLE = "AEO vs SEO: The Real Story"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.db = str(self.tmp / "podcast_test.db")
         fresh_db(self.db)
         self.conn = sqlite3.connect(self.db)
+        # The test SCHEMA constant is a subset; production videos has channel_id
+        # (init_db). Add it so the (channel, title) guard is exercised realistically.
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}
+        if "channel_id" not in cols:
+            self.conn.execute("ALTER TABLE videos ADD COLUMN channel_id TEXT")
+        self.conn.commit()
 
     def tearDown(self):
         self.conn.close()
 
-    def _add_obtained(self, vid, title):
+    def _add_obtained(self, vid, title, channel_id=C1):
         self.conn.execute(
-            "INSERT INTO videos (id, video_title, transcript_status) VALUES (?,?,?)",
-            (vid, title, "obtained"))
+            "INSERT INTO videos (id, channel_id, video_title, transcript_status) "
+            "VALUES (?,?,?,?)", (vid, channel_id, title, "obtained"))
         self.conn.commit()
 
-    def test_obtained_titles_normalized(self):
-        """The guard set is normalized: casing/whitespace variants still match."""
-        self._add_obtained("v1", "AEO vs SEO: The Real Story")
-        titles = podcast_scraper.load_obtained_titles(self.conn)
-        self.assertIn("aeo vs seo: the real story", titles)
+    def _classify(self, existing, title, channel_id):
+        keys = podcast_scraper.load_obtained_keys(self.conn)
+        return podcast_scraper.classify_discovered_video(existing, title, channel_id, keys)
 
-    def test_reupload_new_id_dropped(self):
-        """Highest-impact case: a re-upload under a NEW id (existing is None) with
-        the same title — even re-cased/re-spaced — is dropped."""
-        self._add_obtained("v1", "AEO vs SEO: The Real Story")
-        titles = podcast_scraper.load_obtained_titles(self.conn)
-        self.assertTrue(podcast_scraper.is_transcribed_reupload(
-            "  AEO   vs SEO: The Real Story ", titles, None))
+    def test_obtained_keys_normalized(self):
+        """The guard set is (channel_id, normalized title): casing/whitespace variants
+        of the title still match, scoped to the channel."""
+        self._add_obtained("v1", self.TITLE)
+        keys = podcast_scraper.load_obtained_keys(self.conn)
+        self.assertIn((self.C1, "aeo vs seo: the real story"), keys)
 
-    def test_same_id_refresh_not_dropped(self):
+    def test_reupload_same_channel_new_id_dropped(self):
+        """Highest-impact case: the SAME channel re-uploads under a NEW id (existing
+        is None) with the same title — even re-cased/re-spaced — is dropped."""
+        self._add_obtained("v1", self.TITLE, channel_id=self.C1)
+        self.assertEqual(
+            self._classify(None, "  AEO   vs SEO: The Real Story ", self.C1),
+            "reupload")
+
+    def test_same_title_different_channel_kept(self):
+        """Finding-1 regression: a DIFFERENT creator posting a same-titled talk is a
+        genuinely different video and must NOT be dropped (channel-scoped guard)."""
+        self._add_obtained("v1", self.TITLE, channel_id=self.C1)
+        self.assertEqual(self._classify(None, self.TITLE, self.C2), "insert")
+
+    def test_same_id_refresh_is_update_not_dropped(self):
         """Adversarial: the genuine transcribed video reappearing under its OWN id
-        (existing is not None) must NOT be dropped, or discovery could never refresh
-        its view stats."""
-        self._add_obtained("v1", "AEO vs SEO: The Real Story")
-        titles = podcast_scraper.load_obtained_titles(self.conn)
-        self.assertFalse(podcast_scraper.is_transcribed_reupload(
-            "AEO vs SEO: The Real Story", titles, ("v1",)))
+        (existing is not None) must route to 'update' (stats refresh), never dropped —
+        this is the loop's real branch decision, tested against DB-loaded keys."""
+        self._add_obtained("v1", self.TITLE, channel_id=self.C1)
+        self.assertEqual(self._classify(("v1",), self.TITLE, self.C1), "update")
 
-    def test_unrelated_new_video_not_dropped(self):
-        """A genuinely new video with a different title is kept."""
-        self._add_obtained("v1", "AEO vs SEO: The Real Story")
-        titles = podcast_scraper.load_obtained_titles(self.conn)
-        self.assertFalse(podcast_scraper.is_transcribed_reupload(
-            "A Totally Different Video", titles, None))
+    def test_unrelated_new_video_inserted(self):
+        """A genuinely new video with a different title is inserted, not dropped."""
+        self._add_obtained("v1", self.TITLE, channel_id=self.C1)
+        self.assertEqual(self._classify(None, "A Totally Different Video", self.C1),
+                         "insert")
 
     def test_missing_column_returns_empty(self):
         """On a not-yet-migrated DB (no transcript_status column) the guard degrades
@@ -1331,17 +1350,23 @@ class TestTranscribedReupload(unittest.TestCase):
         c = sqlite3.connect(bare)
         c.execute("CREATE TABLE videos (id TEXT PRIMARY KEY, video_title TEXT)")
         c.commit()
-        self.assertEqual(podcast_scraper.load_obtained_titles(c), set())
+        self.assertEqual(podcast_scraper.load_obtained_keys(c), set())
+        # And classify still returns a sane action on an empty key set.
+        self.assertEqual(
+            podcast_scraper.classify_discovered_video(None, "x", "UCx", set()), "insert")
         c.close()
 
     def test_guard_is_wired_into_discovery(self):
-        """Regression guard: the loop actually calls the guard and counts drops (P2).
-        The full scrape runs live yt-dlp, so assert wiring rather than fake network
-        coverage (P10 honesty)."""
+        """Regression guard: the loop calls classify_discovered_video, counts AND logs
+        drops (P2). The full scrape runs live yt-dlp, so the DB-write path itself is
+        integration-only — asserted as wiring rather than faked network coverage (P10
+        honesty); the decision it dispatches on is covered by the tests above."""
         src = Path(podcast_scraper.__file__).read_text()
-        self.assertIn("load_obtained_titles", src)
-        self.assertIn("is_transcribed_reupload", src)
+        self.assertIn("load_obtained_keys", src)
+        self.assertIn("classify_discovered_video", src)
         self.assertIn("reupload_dropped", src)
+        self.assertIn('action == "reupload"', src)  # drop branch present
+        self.assertIn('action == "update"', src)    # same-id refresh branch present
 
 
 class TestTranscribeRunState(unittest.TestCase):

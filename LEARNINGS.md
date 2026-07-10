@@ -27,8 +27,9 @@
 4. **Scope completeness (P3):** have all sources/tabs/fields been enumerated? (`/videos` **and**
    `/streams` **and** `/podcasts`; transcript body not just title; channel monitoring **and**
    keyword search; every literature source.) **Identity/guard keys:** does an "already-handled"
-   guard key on `id` when a re-upload gets a *new* id? Skip and the transcribed re-upload guard
-   must both match by normalized **title**, not id (P3/P5).
+   guard key on the *natural identity* of the thing? Too narrow (id, when a re-upload gets a new
+   id) and too broad (title alone, colliding across creators) are the **same P3 bug** — a
+   re-upload is the *same channel* re-posting, so key on `(channel_id, normalized_title)` (P3/P5).
 5. **Hardcoded assumptions (P4):** any literal date/year/topic-word/threshold in logic that
    belongs in a profile/config? (Grep for literal years, `min_views`, score weights, the word
    "podcast" in queries.)
@@ -91,15 +92,23 @@ Newest first. Format: **Issue → Root cause → What would have caught it → F
 - **What would have caught it:** asking "what does this guard silently let through?" and the P5
   sweep — "Skip and Transcribe are the same *class* of already-handled guard; do they match on the
   same key?" They didn't.
-- **Fix:** discovery now loads the normalized titles of all `obtained` videos
-  (`load_obtained_titles`) and drops any **new** id whose title matches
-  (`is_transcribed_reupload` — fires only when the id is new, so a same-id refresh still updates
-  stats). The drop is counted and printed (`Re-upload dup: N`), never silent (P2). The title-set
-  load degrades to empty on a not-yet-migrated DB (existing `OperationalError` idiom), so it can
-  never crash a discovery run. Tests: `TestTranscribedReupload` (new-id dropped, same-id kept,
-  unrelated kept, normalization, missing-column, wiring).
-- **Pattern:** P3 (narrow-scope id assumption) / P5 (sibling guards now consistent — both
-  title-keyed) / P2 (drop surfaced) → checklist 2, 4, 6.
+- **First fix over-corrected (caught by learning-qa review, pre-production):** the initial fix
+  keyed the guard on **title alone**. That swung from id-too-narrow to title-**too-broad**: a
+  *different* creator posting a video with a colliding generic title ("SEO in 2025", "Q&A") would
+  be silently dropped from Candidates, and the drop was only an aggregate count with no per-item
+  trace. **A too-narrow key and a too-broad key are the same P3 bug from opposite sides** — the
+  right key is the natural identity of the thing: a re-upload is the *same channel* re-posting.
+- **Final fix:** guard keyed on `(channel_id, normalized_title)` (`load_obtained_keys`), and the
+  loop's per-video decision is a single testable function `classify_discovered_video` returning
+  `"update"` (same id → refresh stats) / `"reupload"` (new id + channel+title already obtained →
+  drop) / `"insert"`. Every drop is counted (`Re-upload dup: N`) **and logged per item** (title +
+  url), so a wrongful exclusion is auditable (P2). Degrades to empty on a not-yet-migrated DB
+  (`OperationalError` idiom) — never crashes a run. Tests: `TestTranscribedReupload` — same-channel
+  new-id dropped, **different-channel same-title kept** (regression for the over-broad key),
+  same-id → `"update"` (loop's real branch), normalization, missing-column, wiring.
+- **Pattern:** P3 (narrow *and* broad scope are the same bug — key on natural identity) / P5
+  (sibling guards consistent) / P2 (drop surfaced *and* per-item logged) / P10 (test the loop's
+  actual decision fn, not a source-grep) → checklist 2, 4, 6, 10.
 
 ### 2026-07-08 — Spawned jobs followed a mid-run profile switch (found by learning-qa review)
 - **Issue:** every background job (`podcast_scraper`, `fetch_transcripts`, `analyze_transcripts`,
