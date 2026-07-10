@@ -51,6 +51,7 @@ not_requested  → requested  → obtained
 ```
 - Dashboard tabs map 1:1: Candidates=`not_requested`, Requested=`requested`, Transcribed=`obtained`.
 - `fetch_transcripts.py` processes only `requested` rows.
+- **Re-discovery is idempotent:** an existing id is `UPDATE`d for stats/score only — `transcript_status`/`dismissed` are never touched, so handled videos are not re-queued or duplicated. Discovery also drops a **new** id whose normalized title matches an `obtained` video (re-upload guard; the transcription guard is per-id, so only a title check catches a re-post) — counted and printed as `Re-upload dup: N`, never silent (P2).
 
 ### `transcripts` (0 rows) — `video_id` PK (FK→videos), `file_path`, `full_text`, `word_count`.
 ### `key_points` (0 rows) — `id` PK, `video_id`, `timestamp_sec`, `point_text`, `category`.

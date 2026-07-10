@@ -26,7 +26,9 @@
    and a `reconcile` to re-check terminal negatives.
 4. **Scope completeness (P3):** have all sources/tabs/fields been enumerated? (`/videos` **and**
    `/streams` **and** `/podcasts`; transcript body not just title; channel monitoring **and**
-   keyword search; every literature source.)
+   keyword search; every literature source.) **Identity/guard keys:** does an "already-handled"
+   guard key on `id` when a re-upload gets a *new* id? Skip and the transcribed re-upload guard
+   must both match by normalized **title**, not id (P3/P5).
 5. **Hardcoded assumptions (P4):** any literal date/year/topic-word/threshold in logic that
    belongs in a profile/config? (Grep for literal years, `min_views`, score weights, the word
    "podcast" in queries.)
@@ -76,6 +78,28 @@
 ## Fix log
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Pattern.**
+
+### 2026-07-09 — Re-uploaded transcribed talk reappeared as a fresh candidate
+- **Issue:** the "don't re-process what I've transcribed" guard was keyed only by video **id**
+  (`transcript_status='obtained'` on that row). A channel re-uploading the same talk under a *new*
+  YouTube id produced a brand-new row that discovery happily admitted to Candidates, so the user
+  would be asked to transcribe content already transcribed. (Skip, by contrast, was already
+  title-keyed and immune.)
+- **Root cause:** narrow-scope identity assumption — "the id is the video." An id-only guard
+  silently excludes the re-upload case (P3). The two "already handled" guards were also
+  inconsistent: Skip matched by title, Transcribe matched by id (P5).
+- **What would have caught it:** asking "what does this guard silently let through?" and the P5
+  sweep — "Skip and Transcribe are the same *class* of already-handled guard; do they match on the
+  same key?" They didn't.
+- **Fix:** discovery now loads the normalized titles of all `obtained` videos
+  (`load_obtained_titles`) and drops any **new** id whose title matches
+  (`is_transcribed_reupload` — fires only when the id is new, so a same-id refresh still updates
+  stats). The drop is counted and printed (`Re-upload dup: N`), never silent (P2). The title-set
+  load degrades to empty on a not-yet-migrated DB (existing `OperationalError` idiom), so it can
+  never crash a discovery run. Tests: `TestTranscribedReupload` (new-id dropped, same-id kept,
+  unrelated kept, normalization, missing-column, wiring).
+- **Pattern:** P3 (narrow-scope id assumption) / P5 (sibling guards now consistent — both
+  title-keyed) / P2 (drop surfaced) → checklist 2, 4, 6.
 
 ### 2026-07-08 — Spawned jobs followed a mid-run profile switch (found by learning-qa review)
 - **Issue:** every background job (`podcast_scraper`, `fetch_transcripts`, `analyze_transcripts`,

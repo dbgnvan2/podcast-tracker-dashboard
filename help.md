@@ -159,15 +159,30 @@ You don't need to manage this manually. If you want to force a full re-fetch, de
 
 ## Skip / Dismiss
 
-**Skip** (the button on the Candidates tab) sets `dismissed=1` on the video row. Dismissed videos:
+**Skip** (the button on the Candidates tab) sets `dismissed=1` on the video row **and records its title in a per-profile skip file**. Skipped videos:
 - Are hidden from the Candidates list.
 - Are never included in transcription, analysis, digest, or report.
-- Are not re-discovered on future runs (the scraper skips known-dismissed IDs).
+- Stay hidden on future runs **even if the same talk is re-uploaded under a new YouTube ID** — the skip is matched by normalized title, not just by ID, so a re-post can't sneak back in.
 
-There is no "un-skip" button in the UI currently. To restore a dismissed video, update it directly in the database:
+There is no "un-skip" button in the UI currently. To restore a dismissed video, clear the flag **and** remove its title from the skip file (otherwise the title match will re-hide it on the next run):
 ```bash
 sqlite3 ~/.hermes/podcast_tracker.db "UPDATE videos SET dismissed=0 WHERE id='VIDEO_ID'"
+# then delete the matching line from the profile's skip file under ~/.hermes/
 ```
+
+---
+
+## What re-discovery does to videos you've already handled
+
+Re-running **Run Discovery** is always safe — it never re-processes or duplicates anything you've acted on. For a video already in the DB, discovery only refreshes its stats (views, velocity, quality score); it never changes its `transcript_status` or `dismissed` flag. So:
+
+- **Left in Candidates** (`not_requested`) — stays a candidate; its stats refresh and its quality score is recomputed, which can re-rank it in the list. Not re-added, not duplicated.
+- **Transcribed** (`obtained`) — stays transcribed and is **never re-queued or re-transcribed**. The fetcher only ever pulls `requested` rows.
+- **Skipped** — never reaches the DB write; filtered out by title before insert.
+
+**Re-upload guard.** Transcribe protects by video **ID**, so on its own it wouldn't stop a re-upload of an already-transcribed talk from reappearing as a fresh candidate. Discovery therefore also drops any **new** video whose **title** matches something you've already transcribed (`obtained`). The run summary reports the count as `Re-upload dup: N dropped (title already transcribed)`, so the drop is always visible, never silent.
+
+If you *empty* the Candidates list by hitting Skip or Transcribe on everything, the next discovery run's Candidates list will show **only genuinely new videos**.
 
 ---
 

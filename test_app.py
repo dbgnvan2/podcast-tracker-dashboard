@@ -1273,6 +1273,77 @@ class TestSkipList(unittest.TestCase):
         self.assertIn("skiplist_dropped", src)  # count is surfaced, not silent (P2)
 
 
+class TestTranscribedReupload(unittest.TestCase):
+    """Re-upload guard: a talk re-posted under a NEW video id whose title we've
+    already transcribed must be dropped from the next discovery run — because the
+    transcription guard is per video id, only a title check catches a re-upload."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "podcast_test.db")
+        fresh_db(self.db)
+        self.conn = sqlite3.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _add_obtained(self, vid, title):
+        self.conn.execute(
+            "INSERT INTO videos (id, video_title, transcript_status) VALUES (?,?,?)",
+            (vid, title, "obtained"))
+        self.conn.commit()
+
+    def test_obtained_titles_normalized(self):
+        """The guard set is normalized: casing/whitespace variants still match."""
+        self._add_obtained("v1", "AEO vs SEO: The Real Story")
+        titles = podcast_scraper.load_obtained_titles(self.conn)
+        self.assertIn("aeo vs seo: the real story", titles)
+
+    def test_reupload_new_id_dropped(self):
+        """Highest-impact case: a re-upload under a NEW id (existing is None) with
+        the same title — even re-cased/re-spaced — is dropped."""
+        self._add_obtained("v1", "AEO vs SEO: The Real Story")
+        titles = podcast_scraper.load_obtained_titles(self.conn)
+        self.assertTrue(podcast_scraper.is_transcribed_reupload(
+            "  AEO   vs SEO: The Real Story ", titles, None))
+
+    def test_same_id_refresh_not_dropped(self):
+        """Adversarial: the genuine transcribed video reappearing under its OWN id
+        (existing is not None) must NOT be dropped, or discovery could never refresh
+        its view stats."""
+        self._add_obtained("v1", "AEO vs SEO: The Real Story")
+        titles = podcast_scraper.load_obtained_titles(self.conn)
+        self.assertFalse(podcast_scraper.is_transcribed_reupload(
+            "AEO vs SEO: The Real Story", titles, ("v1",)))
+
+    def test_unrelated_new_video_not_dropped(self):
+        """A genuinely new video with a different title is kept."""
+        self._add_obtained("v1", "AEO vs SEO: The Real Story")
+        titles = podcast_scraper.load_obtained_titles(self.conn)
+        self.assertFalse(podcast_scraper.is_transcribed_reupload(
+            "A Totally Different Video", titles, None))
+
+    def test_missing_column_returns_empty(self):
+        """On a not-yet-migrated DB (no transcript_status column) the guard degrades
+        to empty — it must never crash the discovery run (matches the existing
+        OperationalError idiom)."""
+        bare = str(self.tmp / "bare.db")
+        c = sqlite3.connect(bare)
+        c.execute("CREATE TABLE videos (id TEXT PRIMARY KEY, video_title TEXT)")
+        c.commit()
+        self.assertEqual(podcast_scraper.load_obtained_titles(c), set())
+        c.close()
+
+    def test_guard_is_wired_into_discovery(self):
+        """Regression guard: the loop actually calls the guard and counts drops (P2).
+        The full scrape runs live yt-dlp, so assert wiring rather than fake network
+        coverage (P10 honesty)."""
+        src = Path(podcast_scraper.__file__).read_text()
+        self.assertIn("load_obtained_titles", src)
+        self.assertIn("is_transcribed_reupload", src)
+        self.assertIn("reupload_dropped", src)
+
+
 class TestTranscribeRunState(unittest.TestCase):
     """Feature #2: persistent 'processed' message — the last-run result store."""
 

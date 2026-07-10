@@ -83,6 +83,7 @@ The dashboard tabs and the fetcher queue both key off this single column. Valid 
 - The dashboard's **Candidates** tab = `not_requested`; **Requested** = `requested`; **Transcribed** = `obtained`.
 - `fetch_transcripts.py` only processes rows where `transcript_status = 'requested'`.
 - Do not introduce new status values without updating: the fetcher query, all dashboard queries, and the stats counters in `get_stats()`.
+- **Re-discovery is idempotent for handled videos:** re-encountering an existing id runs an `UPDATE` that refreshes stats/score only — it never touches `transcript_status` or `dismissed`, so nothing is re-queued or re-transcribed. **Re-upload guard:** discovery drops a **new** id whose normalized title matches an `obtained` video (`load_obtained_titles` / `is_transcribed_reupload` in `podcast_scraper.py`), because the transcription guard is keyed by id and only a title check catches a re-post. The drop is counted and printed (`Re-upload dup: N`), never silent (P2). Skip is likewise title-keyed (survives re-uploads); the `obtained` guard degrades to a no-op on a not-yet-migrated DB.
 
 ---
 

@@ -554,6 +554,39 @@ def get_db_curated_channels(conn):
     return out
 
 
+def load_obtained_titles(conn):
+    """Normalized titles of videos already transcribed (transcript_status='obtained').
+
+    Used to drop re-uploads that reappear under a NEW video id: the transcription
+    guard is keyed by video id, so only a title-level check catches the same talk
+    re-posted under a fresh id. Returns an empty set on a not-yet-migrated DB
+    (no transcript_status column -> nothing transcribed). The caller counts and
+    reports every drop (P2 — never silent).
+    """
+    out = set()
+    try:
+        rows = conn.execute(
+            "SELECT video_title FROM videos "
+            "WHERE transcript_status = 'obtained' AND video_title IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out  # column not present yet -> nothing transcribed
+    for r in rows:
+        n = skiplist.normalize_title(r[0])
+        if n:
+            out.add(n)
+    return out
+
+
+def is_transcribed_reupload(title, obtained_titles, existing):
+    """True when a NEW video id (existing is None) carries the normalized title of
+    a video we've already transcribed — a re-upload to drop from Candidates. When
+    the SAME id reappears (existing is not None) it is kept, so discovery can still
+    refresh that row's view stats.
+    """
+    return existing is None and skiplist.normalize_title(title) in obtained_titles
+
+
 def sync_channels(conn):
     """Recompute the channels registry from the videos table and flag emerging
     channels worth promoting. A non-curated channel with >=2 videos and a best
@@ -959,12 +992,20 @@ def main():
     # comes back under a new video id. Surface the count — never drop silently (P2).
     skip_set = skiplist.load_skip_set(DB_PATH)
     skiplist_dropped = 0
+    # Re-upload guard: a talk re-posted under a NEW video id whose title we've
+    # already transcribed should not re-enter Candidates. Keyed by title because
+    # the transcript_status guard is per video id. Count drops — never silent (P2).
+    obtained_titles = load_obtained_titles(cursor)
+    reupload_dropped = 0
     for v in enriched:
         if skiplist.normalize_title(v["title"]) in skip_set:
             skiplist_dropped += 1
             continue
         cursor.execute("SELECT id FROM videos WHERE id = ?", (v["id"],))
         existing = cursor.fetchone()
+        if is_transcribed_reupload(v["title"], obtained_titles, existing):
+            reupload_dropped += 1
+            continue
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         # Emerging = search-discovered channel we haven't catalogued before.
@@ -1063,6 +1104,7 @@ def main():
     print(f"  Enriched:       {fetched:>5} via yt-dlp")
     print(f"  Cached:         {skipped:>5} skipped (recently updated)")
     print(f"  Skip list:      {skiplist_dropped:>5} dropped (title in skip file)")
+    print(f"  Re-upload dup:  {reupload_dropped:>5} dropped (title already transcribed)")
     print(f"  Passed filters: {len(enriched):>5}")
     if zero_score:
         print(f"  Semantic check: {sem_updated:>5} of {len(zero_score)} zero-score titles updated")
