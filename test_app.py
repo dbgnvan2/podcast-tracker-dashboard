@@ -1739,5 +1739,66 @@ class TestManualImport(unittest.TestCase):
         self.assertEqual((self.tmp / "tx" / "V1.txt").read_text(), first)  # idempotent
 
 
+class TestReconcileWidening(unittest.TestCase):
+    """Phase 5 of DESIGN-transcript-availability.md.
+
+    The widened re-check must key on PROVEN presence: re-queueing an unprobed row
+    just re-runs the same blocked fetch, and re-queueing a proven-absent row is
+    pointless by definition. The attempt cap keeps a stubborn row from looping."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "t.db")
+        fresh_db(self.db)
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE videos ADD COLUMN caption_availability TEXT")
+        conn.execute("ALTER TABLE videos ADD COLUMN fetch_attempts INTEGER DEFAULT 0")
+        rows = [
+            # id,    via,       availability, attempts
+            ("chan", "channel", "unknown", 0),   # step 3 re-queues these anyway
+            ("prov", "search", "exists", 0),     # <- the one we want
+            ("abs", "search", "none", 0),        # proven absent: nothing to recheck
+            ("unkn", "search", "unknown", 0),    # unprobed: would just re-block
+            ("cap", "search", "exists", 4),      # capped out: must not loop
+        ]
+        for vid, via, avail, att in rows:
+            conn.execute(
+                "INSERT INTO videos (id, channel_name, video_title, url, views, quality_score, "
+                "transcript_status, discovered_via, caption_availability, fetch_attempts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (vid, "C", "T", "http://u", 1, 0.5, "not_available", via, avail, att))
+        conn.commit(); conn.close()
+        self._orig = (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR)
+        dashboard_server.DB_PATH = self.db
+        dashboard_server.TRANSCRIPTS_DIR = self.tmp
+
+    def tearDown(self):
+        dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR = self._orig
+
+    def _statuses(self):
+        conn = sqlite3.connect(self.db)
+        out = {r[0]: r[1] for r in conn.execute("SELECT id, transcript_status FROM videos")}
+        conn.close()
+        return out
+
+    def test_without_the_flag_nothing_search_sourced_moves(self):
+        dashboard_server.reconcile()                     # default: curated only
+        st = self._statuses()
+        self.assertEqual(st["chan"], "not_requested")    # step 3, as before
+        self.assertEqual(st["prov"], "not_available")    # untouched
+        self.assertEqual(st["abs"], "not_available")
+        self.assertEqual(st["unkn"], "not_available")
+        self.assertEqual(st["cap"], "not_available")
+
+    def test_with_the_flag_only_proven_and_uncapped_rows_are_requeued(self):
+        dashboard_server.reconcile(include_search=True)
+        st = self._statuses()
+        self.assertEqual(st["prov"], "not_requested")    # proven to exist, untried
+        self.assertEqual(st["abs"], "not_available")     # proven absent
+        self.assertEqual(st["unkn"], "not_available")    # unprobed: not our call
+        self.assertEqual(st["cap"], "not_available")     # attempt cap respected
+        self.assertEqual(st["chan"], "not_requested")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -109,6 +109,35 @@ Newest first. Format: **Issue → Root cause → What would have caught it → F
   real decision fn) → checklist 1, 2, 3, 10.
 - **Spec:** `DESIGN-transcript-availability.md` phase 1.
 
+### 2026-09-12 — Availability vs fetchability: `not_available` meant two things, so it meant nothing
+- **Issue:** `not_available` encoded both "no caption track exists" (a property of the video) and "we are
+  blocked right now" (a property of our IP). 84 rows sat there — 50 channel / 34 search — with no way to
+  tell which a human could rescue by copying the side panel, and no re-check path at all for the 34.
+- **Root cause:** one column carried two independent facts, and no probe recorded availability on its own,
+  so a *fetch failure* silently became the *availability verdict* (P1/P6).
+- **What would have caught it:** "which two facts is this column conflating, and which one does the user
+  have to act on?" — the answer is a skip-forever decision vs a hand-grab worklist.
+- **Fix:** `caption_availability` (`unknown|exists|none`, written **only** by a probe, never inferred from
+  a failed fetch) + `transcript_source` (provenance: `ytdlp|manual_panel|manual_panel_partial|literature_abstract`).
+  `not_available` is now legal only when availability is `none`. Tier 1 availability is **free** — the
+  enrichment `--dump-json` already lists the caption tracks — and may only ever produce `exists`.
+  `ingest_manual.py` imports a user-pasted panel transcript, gated on proven availability + a ≥95% duration
+  check + no-overwrite-without-`--replace`, labelled `manual_panel(_partial)`. `reconcile
+  --include-search-unavailable` re-queues proven-exist rows, attempt-capped. Availability shortfalls are
+  announced per run and in `get_stats` (P2).
+- **Two real bugs the new tests caught:** `MM:SS` parsed as `H:MM:SS` (0:04 → 240s, which silently made
+  partial pastes look *complete* — the exact failure the gate exists to stop); and a test fixture whose
+  "complete" paste only reached 90% of duration (the gate caught the fixture, not the other way round).
+- **Spec correction worth keeping:** the spec told the importer to reuse `dedup_rolling`. That collapses
+  YouTube's *rolling* caption cues; the panel is already de-duplicated, so applying it there would delete
+  legitimately repeated words at cue boundaries. Light normalisation was reused instead, and the deviation
+  is documented in the module. **A spec is a contract, not an oracle — correct it in the open.**
+- **Pattern:** P1 (transient as permanent) / P6 (a status must be backed by an artifact *and* independent
+  evidence) / P2 (announce the shortfall) → checklist 1, 2, 3, 6.
+- **Spec:** `DESIGN-transcript-availability.md` §2 and phases 3 (Tier 1), 4, 5. Tier 2 (the calibrated
+  panel probe) is not yet built — deliberately, because an uncalibrated marker string is a guess and this
+  repo has been burned by plausible guesses.
+
 ### 2026-07-09 — Re-uploaded transcribed talk reappeared as a fresh candidate
 - **Issue:** the "don't re-process what I've transcribed" guard was keyed only by video **id**
   (`transcript_status='obtained'` on that row). A channel re-uploading the same talk under a *new*
