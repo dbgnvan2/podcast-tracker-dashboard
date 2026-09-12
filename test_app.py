@@ -1528,6 +1528,21 @@ class TestFetchClassification(unittest.TestCase):
         self.assertEqual(
             fetch_transcripts.classify_fetch_result(False, "", 50, "unknown"), "error")
 
+    def test_benign_rate_substring_is_not_a_block(self):
+        # P7 adversarial: "bitrate" contains the substring "rate" but is not a
+        # rate-limit block. With a probe proving the track absent, such output must
+        # reach the terminal 'not_available'; the old bare "rate" marker forced it
+        # to a retryable 'error' and looped to the attempt cap forever.
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(
+                False, "Downloading webpage; video bitrate 128k; no subtitles", 0, "none"),
+            "not_available")
+        # A genuine rate-limit message is still recognised as a block.
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(
+                False, "ERROR: rate limit exceeded, try again later", 0, "none"),
+            "error")
+
 
 class TestStickyBlockFlag(unittest.TestCase):
     """`_run_ytdlp` must surface a block seen on ANY attempt, not just the last

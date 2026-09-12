@@ -172,9 +172,10 @@ def main():
     # there is no caption track, this paste cannot be a real transcript of it.
     if row["caption_availability"] != "exists":
         print("Refusing: caption_availability=%s for %s." % (row["caption_availability"], vid))
-        print("  Run the availability probe first (podcast_scraper.py --probe-availability).")
         print("  A paste is only accepted when a caption track is known to exist —")
         print("  otherwise we would be inventing a transcript for a video that has none.")
+        print("  'exists' is set by a discovery run that enriches this video")
+        print("  (python3 podcast_scraper.py); there is no standalone probe command.")
         conn.close()
         return 3
 

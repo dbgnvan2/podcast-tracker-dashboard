@@ -54,7 +54,11 @@ MIN_CAPTION_CHARS = 100  # below this, treat as no usable captions
 # throttle condition, NOT proof captions are absent (LEARNINGS P1).
 BLOCKED_MARKERS = (
     "429", "too many requests", "po token", "sabr",
-    "missing subtitles languages", "sign in to confirm", "rate", "timeout",
+    "missing subtitles languages", "sign in to confirm",
+    # Phrase-anchored, not a bare "rate": "bitrate"/"sample rate"/"accurate"
+    # are not blocks, and once a probe can write 'none' a bare "rate" would
+    # force a caption-less video to loop as retryable forever (P7).
+    "rate limit", "rate-limit", "ratelimit", "timeout",
 )
 
 
