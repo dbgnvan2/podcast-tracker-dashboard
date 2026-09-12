@@ -118,9 +118,35 @@ def dedup_rolling(segments):
     return out
 
 
+def classify_fetch_result(saw_block, output, caption_chars, availability):
+    """The single verdict for one video's fetch (P10: test the loop's real
+    decision, not a source-grep).
+
+    Order matters. A transient signal must never reach a terminal negative (P1),
+    and `not_available` is only legal once the availability probe has *proven*
+    there is no caption track — an unprobed video is retryable, not dead.
+    """
+    if caption_chars >= MIN_CAPTION_CHARS:
+        return "obtained"
+    if saw_block or any(m in (output or "").lower() for m in BLOCKED_MARKERS):
+        return "error"           # blocked now: retryable — and it outranks a probe's 'none'
+    if caption_chars > 0:
+        return "error"           # short/truncated captions are not proof of absence
+    if availability == "none":
+        return "not_available"   # the only honest path to a terminal negative
+    return "error"               # unknown availability is never terminal
+
+
 def _run_ytdlp(vid, url):
-    """Try player clients; return (returncode, combined_output). Retries on 429."""
+    """Try player clients; return (returncode, combined_output, saw_block).
+
+    `saw_block` is sticky across EVERY client and attempt. Keeping only the last
+    attempt's output laundered a 429 into `not_available`: the log showed
+    "blocked on client=android, backoff 30s/60s" twice and then
+    "No captions available -> not_available", because the final client's clean
+    output decided the verdict (DESIGN-transcript-availability.md phase 1)."""
     last_output = ""
+    saw_block = False
     for client in PLAYER_CLIENTS:
         for attempt in range(MAX_429_RETRIES):
             cmd = [
@@ -135,22 +161,44 @@ def _run_ytdlp(vid, url):
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             except subprocess.TimeoutExpired:
                 last_output = "timeout"
+                saw_block = True   # a 120s timeout is throttle/slow-network, not proof of absence
                 continue
             out = (proc.stdout or "") + (proc.stderr or "")
             last_output = out
             files = list(TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"))
             if files:
-                return 0, out
+                return 0, out, saw_block
             # Back off and retry on ANY transient block, not just 429 — a PO-token
             # / SABR / rate block is equally retryable (LEARNINGS P5: the in-loop
             # retry must use the same signal set as the status classification).
             if any(m in out.lower() for m in BLOCKED_MARKERS):
+                saw_block = True
                 wait = BACKOFF_BASE_SEC * (2 ** attempt)
                 print(f"    blocked on client={client}, backoff {wait}s (attempt {attempt+1})")
                 time.sleep(wait)
                 continue
             break  # non-transient failure for this client; try next client
-    return 1, last_output
+    return 1, last_output, saw_block
+
+
+def _queue_rows(conn):
+    """The 'requested' queue, plus each video's caption availability.
+
+    Degrades to 'unknown' on a not-yet-migrated DB (the same OperationalError
+    idiom used for fetch_attempts) so a stale DB can never crash a run. 'unknown'
+    is also the safe value: by construction it can never produce a terminal
+    negative (P1)."""
+    try:
+        return conn.execute(
+            "SELECT id, url, video_title, "
+            "COALESCE(caption_availability, 'unknown') AS caption_availability "
+            "FROM videos WHERE transcript_status = 'requested'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return conn.execute(
+            "SELECT id, url, video_title, 'unknown' AS caption_availability "
+            "FROM videos WHERE transcript_status = 'requested'"
+        ).fetchall()
 
 
 def _process_queue():
@@ -162,9 +210,7 @@ def _process_queue():
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    videos = conn.execute(
-        "SELECT id, url, video_title FROM videos WHERE transcript_status = 'requested'"
-    ).fetchall()
+    videos = _queue_rows(conn)
 
     if not videos:
         print("No videos in requested queue.")
@@ -178,60 +224,58 @@ def _process_queue():
     print(f"Processing {total} videos...")
     for i, v in enumerate(videos, 1):
         vid, url = v["id"], v["url"]
+        availability = v["caption_availability"]
         print(f"[{i}/{total}] Fetching: {v['video_title']}")
 
         # Clear any stale vtt for this id
         for stale in TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"):
             stale.unlink()
 
-        rc, output = _run_ytdlp(vid, url)
+        rc, output, saw_block = _run_ytdlp(vid, url)
         found = sorted(TRANSCRIPTS_DIR.glob(f"{vid}*.vtt"))
-
+        text, segments = "", []
         if found:
             text, segments = parse_vtt(found[0])
-            if len(text) > MIN_CAPTION_CHARS:
-                txt_path = TRANSCRIPTS_DIR / f"{vid}.txt"
-                txt_path.write_text(text, encoding="utf-8")
-                (TRANSCRIPTS_DIR / f"{vid}.segments.json").write_text(
-                    json.dumps(segments), encoding="utf-8"
-                )
-                conn.execute(
-                    "UPDATE videos SET transcript_status='obtained', transcribed_date=? WHERE id=?",
-                    (datetime.now().strftime("%Y-%m-%d"), vid),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
-                    (vid, str(txt_path), text, len(text.split())),
-                )
-                success_count += 1
-                print(f"  Success: {len(text.split())} words, {len(segments)} segments.")
-                for f in found:
-                    f.unlink()
-            elif any(m in output.lower() for m in BLOCKED_MARKERS):
-                # A short/partial caption produced DURING a block (e.g. the
-                # timedtext endpoint 429'd mid-download) is not proof captions are
-                # absent — keep it retryable (LEARNINGS P1).
-                print("  Captions truncated during a block -> error (will retry).")
-                conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
-                error_count += 1
-                for f in found:
-                    f.unlink()
-            else:
-                print("  Captions too short -> not_available.")
-                conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
-                unavailable_count += 1
-                for f in found:
-                    f.unlink()
+
+        # One verdict for both branches (P5): they used to drift because the
+        # no-file branch decided from the last attempt's output alone, which is
+        # how a 429 became `not_available`.
+        blocked_now = saw_block or any(m in (output or "").lower() for m in BLOCKED_MARKERS)
+        verdict = classify_fetch_result(saw_block, output, len(text), availability)
+
+        if verdict == "obtained":
+            txt_path = TRANSCRIPTS_DIR / f"{vid}.txt"
+            txt_path.write_text(text, encoding="utf-8")
+            (TRANSCRIPTS_DIR / f"{vid}.segments.json").write_text(
+                json.dumps(segments), encoding="utf-8"
+            )
+            conn.execute(
+                "UPDATE videos SET transcript_status='obtained', transcribed_date=? WHERE id=?",
+                (datetime.now().strftime("%Y-%m-%d"), vid),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
+                (vid, str(txt_path), text, len(text.split())),
+            )
+            success_count += 1
+            print(f"  Success: {len(text.split())} words, {len(segments)} segments.")
+        elif verdict == "not_available":
+            print("  No caption track (availability=none) -> not_available.")
+            conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
+            unavailable_count += 1
         else:
-            lowered = output.lower()
-            if any(m in lowered for m in BLOCKED_MARKERS):
+            # Never terminal from a partial result or an unproven absence (P1).
+            if blocked_now:
                 print("  Blocked (PO token / SABR / rate limit) -> error (will retry).")
-                conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
-                error_count += 1
+            elif text:
+                print("  Captions too short to be usable -> error (will retry).")
             else:
-                print("  No captions available -> not_available.")
-                conn.execute("UPDATE videos SET transcript_status='not_available' WHERE id=?", (vid,))
-                unavailable_count += 1
+                print(f"  No captions found, availability={availability} (unproven) "
+                      f"-> error (will retry after a probe).")
+            conn.execute("UPDATE videos SET transcript_status='error' WHERE id=?", (vid,))
+            error_count += 1
+        for f in found:
+            f.unlink()
 
         conn.commit()
 

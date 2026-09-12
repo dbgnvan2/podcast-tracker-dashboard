@@ -1397,8 +1397,10 @@ class TestTranscribeRunState(unittest.TestCase):
     def test_producer_writes_result_on_completion(self):
         """fetch_transcripts records a run result the dashboard can show (feature #2).
 
-        Mocks yt-dlp so this runs the real process_queue path without network:
-        a video with no captions => ok=0/total=1, status 'done'.
+        Mocks yt-dlp so this runs the real process_queue path without network.
+        A clean "no captions" result with availability still UNKNOWN must be
+        retryable, never terminal (DESIGN-transcript-availability.md phase 1:
+        the documented bug was a transient block laundered into not_available).
         """
         import fetch_transcripts as ft
         conn = sqlite3.connect(self.db)
@@ -1411,15 +1413,43 @@ class TestTranscribeRunState(unittest.TestCase):
             ft.DB_PATH = Path(self.db)
             ft.TRANSCRIPTS_DIR = self.tmp
             ft.YT_DLP = "yt-dlp"
-            ft._run_ytdlp = lambda vid, url: (1, "no captions available for this video")
+            # (rc, output, saw_block) — this schema has no caption_availability
+            # column, so the queue read must degrade to 'unknown'.
+            ft._run_ytdlp = lambda vid, url: (1, "no captions available for this video", False)
             ft.process_queue()
         finally:
             ft.DB_PATH, ft.TRANSCRIPTS_DIR, ft.YT_DLP, ft._run_ytdlp = orig
         res = self.runstate.read_transcribe_result(self.db)
         self.assertIsNotNone(res)
-        # No captions => terminal 'unavailable', not a retryable "failure" (P1).
         self.assertEqual((res["status"], res["total"], res["ok"]), ("done", 1, 0))
+        # Unknown availability => retryable, NOT terminal (P1).
+        self.assertEqual((res["unavailable"], res["retryable"]), (0, 1))
+
+    def test_no_captions_with_availability_none_is_terminal(self):
+        """A PROVEN absent caption track is the only path to not_available."""
+        import fetch_transcripts as ft
+        conn = sqlite3.connect(self.db)
+        # Simulate a migrated DB (the new column), as the deployed DB will be.
+        conn.execute("ALTER TABLE videos ADD COLUMN caption_availability TEXT")
+        conn.execute("INSERT INTO videos (id, channel_name, video_title, url, views, "
+                     "quality_score, transcript_status, caption_availability) "
+                     "VALUES ('V2','C','T','http://u',1,0.5,'requested','none')")
+        conn.commit(); conn.close()
+        orig = (ft.DB_PATH, ft.TRANSCRIPTS_DIR, ft.YT_DLP, ft._run_ytdlp)
+        try:
+            ft.DB_PATH = Path(self.db)
+            ft.TRANSCRIPTS_DIR = self.tmp
+            ft.YT_DLP = "yt-dlp"
+            ft._run_ytdlp = lambda vid, url: (1, "", False)
+            ft.process_queue()
+        finally:
+            ft.DB_PATH, ft.TRANSCRIPTS_DIR, ft.YT_DLP, ft._run_ytdlp = orig
+        res = self.runstate.read_transcribe_result(self.db)
         self.assertEqual((res["unavailable"], res["retryable"]), (1, 0))
+        conn = sqlite3.connect(self.db)
+        st = conn.execute("SELECT transcript_status FROM videos WHERE id='V2'").fetchone()[0]
+        conn.close()
+        self.assertEqual(st, "not_available")
 
     def test_producer_writes_error_on_crash(self):
         """A crash mid-run records an 'error' result, never a stale/blank one (P15)."""
@@ -1437,6 +1467,127 @@ class TestTranscribeRunState(unittest.TestCase):
         res = self.runstate.read_transcribe_result(self.db)
         self.assertEqual(res["status"], "error")
         self.assertIn("kaboom", res["error"])
+
+
+class TestFetchClassification(unittest.TestCase):
+    """Phase 1 of DESIGN-transcript-availability.md.
+
+    A transient block must never reach a terminal negative (P1). Regression for
+    the 2026-09-11 audit, where `blocked on client=android, backoff 30s` twice
+    was followed by `No captions available -> not_available.`
+    """
+
+    def test_usable_captions_is_obtained(self):
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(False, "", 1500, "unknown"), "obtained")
+
+    def test_usable_captions_beat_an_earlier_block_marker(self):
+        # a later attempt succeeded, so the earlier block is history
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(True, "HTTP Error 429", 1500, "unknown"),
+            "obtained")
+
+    def test_caption_length_boundary_is_obtained(self):
+        # MIN_CAPTION_CHARS is the floor for usable captions (== is usable)
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(
+                False, "", fetch_transcripts.MIN_CAPTION_CHARS, "unknown"), "obtained")
+
+    def test_sticky_block_then_clean_output_is_error(self):
+        # THE regression: the observed sequence — blocked attempts, then a final
+        # client whose output carries no marker, and no caption file.
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(True, "no subtitles found", 0, "unknown"),
+            "error")
+
+    def test_block_marker_in_final_output_is_error(self):
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(
+                False, "ERROR: HTTP Error 429: Too Many Requests", 0, "unknown"), "error")
+
+    def test_unknown_availability_is_never_terminal(self):
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(False, "", 0, "unknown"), "error")
+
+    def test_exists_availability_with_no_result_is_error(self):
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(False, "", 0, "exists"), "error")
+
+    def test_proven_absent_track_is_not_available(self):
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(False, "", 0, "none"), "not_available")
+
+    def test_block_outranks_a_probe_saying_none(self):
+        # A block must not contribute to a terminal verdict even when the probe
+        # claims the track is absent — retry-ability wins (P1, deliberate).
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(True, "po token", 0, "none"), "error")
+
+    def test_short_captions_are_error_not_terminal(self):
+        # A truncated download is not proof the track is absent (P1)
+        self.assertEqual(
+            fetch_transcripts.classify_fetch_result(False, "", 50, "unknown"), "error")
+
+
+class TestStickyBlockFlag(unittest.TestCase):
+    """`_run_ytdlp` must surface a block seen on ANY attempt, not just the last
+    one — losing that evidence is what wrote not_available over a 429."""
+
+    class _FakeSubprocess:
+        class TimeoutExpired(Exception):
+            pass
+
+        def __init__(self, outputs):
+            self.outputs = list(outputs)
+            self.calls = []
+
+        def run(self, cmd, capture_output=True, text=True, timeout=None):
+            self.calls.append(cmd)
+            i = min(len(self.calls) - 1, len(self.outputs) - 1)
+
+            class _R:
+                pass
+
+            r = _R()
+            r.stdout = ""
+            r.stderr = self.outputs[i]
+            return r
+
+    class _FakeTime:
+        def __init__(self):
+            self.slept = []
+
+        def sleep(self, s):
+            self.slept.append(s)
+
+    def _run(self, outputs, vid="VID"):
+        tmp = Path(tempfile.mkdtemp())
+        orig = (fetch_transcripts.subprocess, fetch_transcripts.time,
+                fetch_transcripts.TRANSCRIPTS_DIR, fetch_transcripts.YT_DLP)
+        fake_sub, fake_time = self._FakeSubprocess(outputs), self._FakeTime()
+        try:
+            fetch_transcripts.subprocess = fake_sub
+            fetch_transcripts.time = fake_time
+            fetch_transcripts.TRANSCRIPTS_DIR = tmp
+            fetch_transcripts.YT_DLP = "/fake/yt-dlp"
+            return fetch_transcripts._run_ytdlp(vid, "http://u"), fake_sub, fake_time
+        finally:
+            (fetch_transcripts.subprocess, fetch_transcripts.time,
+             fetch_transcripts.TRANSCRIPTS_DIR, fetch_transcripts.YT_DLP) = orig
+
+    def test_block_on_first_attempt_stays_visible(self):
+        # attempt 1 blocked, everything after clean and empty-handed
+        (rc, output, saw_block), fake_sub, fake_time = self._run(
+            ["HTTP Error 429: Too Many Requests", "no subtitles"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(saw_block)
+        self.assertTrue(fake_time.slept)     # backed off before retrying
+        self.assertNotIn("429", output)      # ...even though the LAST output is clean
+
+    def test_clean_run_has_no_block_flag(self):
+        (rc, output, saw_block), _, fake_time = self._run(["no subtitles"])
+        self.assertFalse(saw_block)
+        self.assertEqual(fake_time.slept, [])
 
 
 if __name__ == "__main__":

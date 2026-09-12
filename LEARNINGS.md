@@ -23,7 +23,10 @@
    drops N of M items must say so.
 3. **Transient vs terminal (P1):** is a retryable failure (429, PO-token block, timeout) being
    written as a permanent negative (`not_available`, deleted)? Keep the retryable `error` path
-   and a `reconcile` to re-check terminal negatives.
+   and a `reconcile` to re-check terminal negatives. **Can a transient signal reach a terminal
+   verdict *anywhere* in the attempt ladder — not just on the final attempt?** Sticky-collect the
+   signal across every client/retry; a verdict that reads only the last attempt's output discards
+   the very evidence it needs (this is how the 2026-06-02 bug survived its own fix).
 4. **Scope completeness (P3):** have all sources/tabs/fields been enumerated? (`/videos` **and**
    `/streams` **and** `/podcasts`; transcript body not just title; channel monitoring **and**
    keyword search; every literature source.) **Identity/guard keys:** does an "already-handled"
@@ -79,6 +82,32 @@
 ## Fix log
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Pattern.**
+
+### 2026-09-12 — A 429 was laundered into the terminal `not_available` (the 2026-06-02 fix was incomplete)
+- **Issue:** `~/.hermes/logs/fetch_transcripts.log` shows, ~12 times in a row:
+  `blocked on client=android, backoff 30s (attempt 1)` / `... 60s (attempt 2)` /
+  `No captions available -> not_available.` 84 rows sat in `not_available` (50 channel / 34 search)
+  and nothing could tell a *blocked* fetch from a genuinely caption-less video — the search-sourced
+  34 had no re-check path at all (`reconcile` is scoped to `discovered_via='channel'`).
+- **Root cause:** `_run_ytdlp` kept only `last_output` — the **final** attempt's output. When the
+  last client failed without a marker string, `_process_queue`'s `else` branch wrote the terminal
+  `not_available`, discarding the blocked evidence from the earlier attempts (P1). The 2026-06-02
+  entry fixed the *classification* but not the *evidence collection*, so the same class survived.
+- **What would have caught it:** "can a transient signal reach a terminal verdict **anywhere** in
+  the attempt ladder, not just on the final attempt?" Checklist item 3 asked about the verdict, not
+  about which signals survive to reach it.
+- **Fix:** `saw_block` is now sticky across every client and attempt; one extracted verdict
+  function `classify_fetch_result(saw_block, output, caption_chars, availability)` serves both the
+  found-but-short and the no-file branches (they used to drift, P5); a timeout also sets the flag;
+  and **`not_available` is only legal when `caption_availability='none'`** — unknown availability is
+  always retryable. The queue read degrades to `'unknown'` on a not-yet-migrated DB (OperationalError
+  idiom). Tests: `TestFetchClassification` (10 — incl. the observed-sequence regression, the length
+  boundary, and block-outranks-a-probe-saying-none), `TestStickyBlockFlag` (2 — a block on attempt 1
+  stays visible when the last output is clean), `TestTranscribeRunState::test_no_captions_with_availability_none_is_terminal`,
+  and the updated `test_producer_writes_result_on_completion` (unknown ⇒ retryable, not terminal).
+- **Pattern:** P1 (transient as permanent) / P5 (sibling branches consistent) / P10 (test the loop's
+  real decision fn) → checklist 1, 2, 3, 10.
+- **Spec:** `DESIGN-transcript-availability.md` phase 1.
 
 ### 2026-07-09 — Re-uploaded transcribed talk reappeared as a fresh candidate
 - **Issue:** the "don't re-process what I've transcribed" guard was keyed only by video **id**
