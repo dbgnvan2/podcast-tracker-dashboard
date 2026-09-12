@@ -20,6 +20,7 @@ from datetime import datetime
 
 import profiles
 import runstate
+from ytdlp_clients import PLAYER_CLIENTS  # one shared client decision (P5)
 DB_PATH = Path(profiles.load()["db_path"])  # active investigation profile's DB
 TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,11 +40,11 @@ if not YT_DLP:
     YT_DLP = res.stdout.strip()
 
 # YouTube now gates auto-captions behind PO tokens for some clients and
-# rate-limits the timedtext endpoint. The android client exposes the captions;
-# browser impersonation (curl_cffi) reduces 429s. These are tried in order.
-# android exposes the captions; web is a fallback. Keep per-video backoff short —
-# an outer overnight loop handles the long IP-wide 429 cooldown.
-PLAYER_CLIENTS = ["android", "web"]
+# rate-limits the timedtext endpoint. browser impersonation (curl_cffi) reduces
+# 429s. Keep per-video backoff short — an outer overnight loop handles the long
+# IP-wide 429 cooldown. PLAYER_CLIENTS is imported from ytdlp_clients (P5): the
+# fetcher and the availability probe must share ONE client decision, or the probe
+# reads through a different client than the fetcher and under-reports captions.
 MAX_429_RETRIES = 2
 BACKOFF_BASE_SEC = 30  # 30, 60
 MIN_CAPTION_CHARS = 100  # below this, treat as no usable captions

@@ -1815,5 +1815,93 @@ class TestReconcileWidening(unittest.TestCase):
         self.assertEqual(st["chan"], "not_requested")
 
 
+class TestPlayerClients(unittest.TestCase):
+    """P5 / F1: ONE shared yt-dlp client decision, used by the fetcher AND the
+    availability probe — so the probe can't read through a different (gated) client
+    than the fetcher and under-report captions."""
+
+    def test_player_client_arg_uses_shared_list(self):
+        import ytdlp_clients
+        self.assertEqual(
+            ytdlp_clients.player_client_arg(),
+            "youtube:player_client=" + ",".join(ytdlp_clients.PLAYER_CLIENTS))
+
+    def test_player_client_arg_custom(self):
+        import ytdlp_clients
+        self.assertEqual(
+            ytdlp_clients.player_client_arg(["tv", "ios"]), "youtube:player_client=tv,ios")
+
+    def test_fetcher_shares_the_one_client_list(self):
+        import fetch_transcripts, ytdlp_clients
+        self.assertIs(fetch_transcripts.PLAYER_CLIENTS, ytdlp_clients.PLAYER_CLIENTS)
+
+    def test_get_video_details_reads_through_the_shared_client(self):
+        # F1: the availability read must use the shared selection, not a hardcoded
+        # gated client. Set a distinctive client set and assert the yt-dlp cmd uses
+        # it — mutation-proof against reverting to a hardcoded 'android'.
+        import podcast_scraper, ytdlp_clients
+        captured = {}
+
+        class _Res:
+            stdout = '{"id": "x"}'
+            stderr = ""
+
+        def fake_run(cmd, *a, **k):
+            captured["cmd"] = cmd
+            return _Res()
+
+        orig_run, orig_clients = podcast_scraper.subprocess.run, ytdlp_clients.PLAYER_CLIENTS
+        try:
+            ytdlp_clients.PLAYER_CLIENTS = ["tv", "ios"]   # distinctive, non-default
+            podcast_scraper.subprocess.run = fake_run
+            podcast_scraper.get_video_details("vid123")
+        finally:
+            podcast_scraper.subprocess.run = orig_run
+            ytdlp_clients.PLAYER_CLIENTS = orig_clients
+        cmd = captured["cmd"]
+        arg = cmd[cmd.index("--extractor-args") + 1]
+        self.assertEqual(arg, "youtube:player_client=tv,ios")
+
+
+class TestCachedAvailability(unittest.TestCase):
+    """F2: a cache hit must PRESERVE a stored caption_availability, not re-derive
+    'unknown' from a reconstructed dict that has no caption tracks."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "p.db")
+        fresh_db(self.db)
+        self.conn = sqlite3.connect(self.db)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}
+        if "caption_availability" not in cols:
+            self.conn.execute(
+                "ALTER TABLE videos ADD COLUMN caption_availability TEXT DEFAULT 'unknown'")
+        self.conn.execute("INSERT INTO videos (id, video_title, caption_availability) "
+                          "VALUES ('E','t','exists')")
+        self.conn.execute("INSERT INTO videos (id, video_title, caption_availability) "
+                          "VALUES ('U','t','unknown')")
+        self.conn.execute("INSERT INTO videos (id, video_title) VALUES ('N','t')")  # NULL
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_reads_stored_exists(self):
+        # THE F2 regression: a cached row known to have captions keeps 'exists'.
+        self.assertEqual(podcast_scraper.stored_availability(self.conn, "E"), "exists")
+
+    def test_unknown_and_null_default_to_unknown(self):
+        self.assertEqual(podcast_scraper.stored_availability(self.conn, "U"), "unknown")
+        self.assertEqual(podcast_scraper.stored_availability(self.conn, "N"), "unknown")
+
+    def test_missing_column_degrades_not_crashes(self):
+        bare = str(self.tmp / "bare.db")
+        c = sqlite3.connect(bare)
+        c.execute("CREATE TABLE videos (id TEXT PRIMARY KEY, video_title TEXT)")
+        c.commit()
+        self.assertEqual(podcast_scraper.stored_availability(c, "E"), "unknown")
+        c.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

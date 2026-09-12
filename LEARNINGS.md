@@ -83,6 +83,25 @@
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Pattern.**
 
+### 2026-09-12 — Availability probe read through the gated client; cache hits erased the signal (review, Part A)
+- **Issue:** two review findings on the availability work. (1) The Tier-1 read `get_video_details`
+  hardcoded `player_client=android` — the exact PO-token-gated client whose own comment forbids it
+  for availability, so it discards gated subs and under-reports `caption_availability` (P21/P5).
+  (2) On a cache hit the enrichment path rebuilds `details` from stored columns with **no** caption
+  tracks, so `availability_from_details` returned `unknown` every time, dropping a prior enrichment's
+  result — so the widened reconcile, keyed on `caption_availability='exists'`, rescued none of the
+  cache-fresh stranded rows it was built for (P31/P8).
+- **Root cause:** two client decisions instead of one (fetcher vs. probe), and deriving availability
+  from a reconstructed dict that structurally cannot carry it.
+- **What would have caught it:** "does the probe read through the same client as the fetcher?" (P5);
+  "on run #2 (cache hit), what does the reader see?" (P8).
+- **Fix (Part A):** `ytdlp_clients.py` is the single client decision; `get_video_details` and the
+  fetcher both use it. The cached path reads the persisted `caption_availability` (`stored_availability`)
+  instead of re-deriving `unknown`. Behavioural fix of the under-report completes at Part B, when
+  `spike_clients.py` measures and sets the non-gating client (network-dependent, outside a cooldown).
+- **Pattern:** P5 → checklist 1; P8 → checklist 8. Deferred: Phase 3 Tier-2 (so a proven `none` can
+  be written) and the Part-B measurement.
+
 ### 2026-09-12 — A 429 was laundered into the terminal `not_available` (the 2026-06-02 fix was incomplete)
 - **Issue:** `~/.hermes/logs/fetch_transcripts.log` shows, ~12 times in a row:
   `blocked on client=android, backoff 30s (attempt 1)` / `... 60s (attempt 2)` /

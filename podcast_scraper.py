@@ -17,6 +17,7 @@ from pathlib import Path
 # ── Config ──────────────────────────────────────────────────────────────────
 import profiles
 import skiplist
+import ytdlp_clients  # one shared yt-dlp client decision (P5)
 
 TRANSCRIPTS_DIR = profiles.HERMES / "transcripts"
 
@@ -245,13 +246,17 @@ def fetch_channel_videos(identifier, max_results=10):
 
 
 def get_video_details(video_id):
-    """Fetch full metadata for a single video. Uses the android client + Chrome
-    impersonation and retries on 429 — bulk runs enrich ~100+ videos rapidly and
-    a plain call gets rate-limited, silently dropping videos (e.g. premiered
-    long-form content)."""
+    """Fetch full metadata for a single video. Uses the SHARED player-client
+    selection (ytdlp_clients.PLAYER_CLIENTS, P5) + Chrome impersonation and retries
+    on 429 — bulk runs enrich ~100+ videos rapidly and a plain call gets
+    rate-limited, silently dropping videos (e.g. premiered long-form content).
+
+    The dumped JSON also feeds the Tier-1 availability read, so it MUST go through
+    the same client as the fetcher: a PO-token-gated client discards gated subs and
+    under-reports availability (LEARNINGS F1)."""
     cmd = [
         YT_DLP, "--dump-json", "--no-download",
-        "--extractor-args", "youtube:player_client=android",
+        "--extractor-args", ytdlp_clients.player_client_arg(),
         "--impersonate", "chrome", "--no-warnings",
         f"https://youtube.com/watch?v={video_id}",
     ]
@@ -448,6 +453,23 @@ def parse_ymd_via_ytdlp(date_str):
 # Tier 1 may only ever produce 'exists'. It never writes 'none': an empty dict
 # could mean "no track" or "the client hid it", and only the panel probe
 # (Tier 2, yt-dlp --write-pages) is allowed to conclude absence.
+def stored_availability(cursor, vid):
+    """The caption_availability already recorded for `vid` (default 'unknown').
+
+    Used on the cached-enrichment path (F2): a cache hit reconstructs the details
+    dict from stored columns, which carry NO caption tracks, so deriving
+    availability from it would always yield 'unknown' and silently drop the value a
+    prior live enrichment established — re-emptying the signal the widened reconcile
+    depends on. Read the persisted value instead. Degrades to 'unknown' on a
+    not-yet-migrated DB (matches the existing OperationalError idiom)."""
+    try:
+        row = cursor.execute(
+            "SELECT caption_availability FROM videos WHERE id=?", (vid,)).fetchone()
+    except sqlite3.OperationalError:
+        return "unknown"  # column not present yet
+    return (row[0] if row and row[0] else "unknown")
+
+
 def availability_from_details(details):
     """'exists' if the player response lists any usable caption track, else
     'unknown'. Any language counts — the question is 'would the side panel show a
@@ -897,9 +919,13 @@ def main():
         if not details:
             continue
 
-        # Tier 1 availability, free: the --dump-json we already fetched lists the
-        # caption tracks. Only ever yields 'exists' (see availability_from_details).
-        availability = availability_from_details(details)
+        # Tier 1 availability. On a LIVE read the --dump-json lists the caption
+        # tracks; on a CACHE hit the reconstructed dict has none, so reading it
+        # would drop a prior enrichment's result to 'unknown' — use the value
+        # already stored (F2). Only ever yields 'exists' from the live read (see
+        # availability_from_details); a proven 'none' is Tier 2 (deferred).
+        availability = (stored_availability(cursor, vid) if cached
+                        else availability_from_details(details))
 
         upload_date = parse_ymd_via_ytdlp(details.get("upload_date"))
         if not upload_date:
