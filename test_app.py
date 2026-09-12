@@ -1590,5 +1590,154 @@ class TestStickyBlockFlag(unittest.TestCase):
         self.assertEqual(fake_time.slept, [])
 
 
+class TestManualImport(unittest.TestCase):
+    """Phase 4 of DESIGN-transcript-availability.md.
+
+    A human pastes the side panel for videos whose captions exist but are
+    blocked. The panel is virtualised, so completeness must be VERIFIED, not
+    trusted — and a paste is only ever accepted when a probe has shown that a
+    caption track exists."""
+
+    def setUp(self):
+        import sys
+        import ingest_manual
+        self.sys = sys
+        self.mod = ingest_manual
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "t.db")
+        fresh_db(self.db)
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE videos ADD COLUMN duration_seconds INTEGER")
+        conn.execute("ALTER TABLE videos ADD COLUMN caption_availability TEXT")
+        conn.execute("ALTER TABLE videos ADD COLUMN transcript_source TEXT")
+        conn.commit(); conn.close()
+        self._orig = (ingest_manual.DB_PATH, ingest_manual.TRANSCRIPTS_DIR)
+        ingest_manual.DB_PATH = Path(self.db)
+        ingest_manual.TRANSCRIPTS_DIR = self.tmp / "tx"
+
+    def tearDown(self):
+        self.mod.DB_PATH, self.mod.TRANSCRIPTS_DIR = self._orig
+
+    def _add(self, vid, duration=600, availability="exists", status="requested"):
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "INSERT INTO videos (id, channel_name, video_title, url, views, quality_score, "
+            "transcript_status, duration_seconds, caption_availability, discovered_via, source_type) "
+            "VALUES (?,?,?,?,?,?,?,?,?,'search','youtube')",
+            (vid, "C", "T", "http://u", 1, 0.5, status, duration, availability))
+        conn.commit(); conn.close()
+
+    def _paste(self, body, name="p.txt"):
+        p = self.tmp / name
+        p.write_text(body)
+        return str(p)
+
+    def _run(self, *args):
+        orig = self.sys.argv
+        self.sys.argv = ["ingest_manual.py"] + list(args)
+        try:
+            return self.mod.main()
+        finally:
+            self.sys.argv = orig
+
+    def _cell(self, vid, col):
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute("SELECT %s FROM videos WHERE id=?" % col, (vid,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    # ---- parser ----------------------------------------------------------
+    def test_parses_timestamp_only_lines_and_inline_timestamps(self):
+        body = ("Intro junk\n0:00\nhello there\n0:04 today we talk\n1:02:33\nthe end\n")
+        segs = self.mod.parse_panel(body)
+        self.assertEqual([s["start"] for s in segs], [0, 4, 3753])
+        self.assertEqual([s["text"] for s in segs], ["hello there", "today we talk", "the end"])
+
+    def test_ignores_lines_before_the_first_timestamp(self):
+        segs = self.mod.parse_panel("Channel Name\n1.2K views\n0:01\nreal line\n")
+        self.assertEqual([s["text"] for s in segs], ["real line"])
+
+    def test_timestamp_conversion_mmss_and_hmmss(self):
+        # The regex yields (a, b, None) for MM:SS and (a, b, c) for H:MM:SS.
+        # Reading `a` as hours unconditionally turns 0:04 into 240s.
+        self.assertEqual(self.mod.ts_to_seconds("1", "02", "33"), 3753)
+        self.assertEqual(self.mod.ts_to_seconds("0", "04", None), 4)
+        self.assertEqual(self.mod.ts_to_seconds("10", "30", None), 630)
+
+    # ---- the availability gate ------------------------------------------
+    def test_refuses_when_availability_is_unknown(self):
+        self._add("V1", availability="unknown")
+        rc = self._run("--id=V1", "--file=" + self._paste("0:00\nhi\n"))
+        self.assertEqual(rc, 3)
+        self.assertFalse((self.tmp / "tx" / "V1.txt").exists())
+
+    def test_refuses_when_availability_is_none(self):
+        # A probe PROVED there is no caption track, so a "transcript" paste for it
+        # cannot be genuine — refusing is the anti-fabrication rule, not pedantry.
+        self._add("V1", availability="none")
+        rc = self._run("--id=V1", "--file=" + self._paste("0:00\nhi\n"))
+        self.assertEqual(rc, 3)
+
+    def test_refuses_when_no_timestamps(self):
+        self._add("V1")
+        rc = self._run("--id=V1", "--file=" + self._paste("just prose with no cues\n"))
+        self.assertEqual(rc, 3)
+
+    def test_refuses_unknown_video_id(self):
+        rc = self._run("--id=NOPE", "--file=" + self._paste("0:00\nhi\n"))
+        self.assertEqual(rc, 2)
+
+    # ---- the completeness gate ------------------------------------------
+    def test_partial_paste_is_refused_without_the_flag(self):
+        # duration 600, paste stops at 0:60 => 10% => partial
+        self._add("V1", duration=600)
+        body = "".join("%d:%02d\nline %d\n" % (i // 60, i % 60, i) for i in range(0, 61, 10))
+        rc = self._run("--id=V1", "--file=" + self._paste(body))
+        self.assertEqual(rc, 4)
+        self.assertFalse((self.tmp / "tx" / "V1.txt").exists())
+
+    def test_partial_paste_is_stored_but_labelled_when_allowed(self):
+        self._add("V1", duration=600)
+        body = "".join("%d:%02d\nline %d\n" % (i // 60, i % 60, i) for i in range(0, 61, 10))
+        rc = self._run("--id=V1", "--file=" + self._paste(body), "--allow-partial")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._cell("V1", "transcript_source"), "manual_panel_partial")
+        self.assertEqual(self._cell("V1", "transcript_status"), "obtained")
+
+    def test_complete_paste_is_labelled_manual_panel(self):
+        self._add("V1", duration=600)
+        body = "".join("%d:%02d\nline %d\n" % (i // 60, i % 60, i) for i in range(0, 601, 60))
+        rc = self._run("--id=V1", "--file=" + self._paste(body))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._cell("V1", "transcript_source"), "manual_panel")
+        self.assertEqual(self._cell("V1", "transcript_status"), "obtained")
+        self.assertTrue((self.tmp / "tx" / "V1.txt").exists())
+        self.assertTrue((self.tmp / "tx" / "V1.segments.json").exists())
+        conn = sqlite3.connect(self.db)
+        n = conn.execute("SELECT COUNT(*) FROM transcripts WHERE video_id='V1'").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+
+    def test_unverifiable_duration_is_treated_as_partial(self):
+        # No duration on the row => completeness cannot be shown => not silently complete.
+        self._add("V1", duration=0)
+        rc = self._run("--id=V1", "--file=" + self._paste("0:00\nhi\n0:05\nthere\n"))
+        self.assertEqual(rc, 4)
+
+    # ---- never destroy an existing transcript ---------------------------
+    def test_refuses_to_overwrite_without_replace_then_allows_with_it(self):
+        self._add("V1", duration=600)
+        body = "".join("%d:%02d\nline %d\n" % (i // 60, i % 60, i) for i in range(0, 601, 60))
+        f = self._paste(body)
+        self.assertEqual(self._run("--id=V1", "--file=" + f), 0)
+        first = (self.tmp / "tx" / "V1.txt").read_text()
+        self.assertEqual(self._run("--id=V1", "--file=" + f), 3)          # refused
+        self.assertEqual((self.tmp / "tx" / "V1.txt").read_text(), first)  # untouched
+        self.assertEqual(self._run("--id=V1", "--file=" + f, "--replace"), 0)
+        self.assertEqual((self.tmp / "tx" / "V1.txt").read_text(), first)  # idempotent
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

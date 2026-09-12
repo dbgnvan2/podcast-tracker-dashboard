@@ -254,10 +254,14 @@ def migrate(db=None):
     conn.close()
     print("Migration complete.")
 
-def reconcile():
+def reconcile(include_search=False):
     """Make transcript_status honest: a video is only 'obtained' if a real
     transcript row backs it. Resets fakes and removes stub transcript files.
-    Code-driven only — never hand-edit rows to paper over this."""
+    Code-driven only — never hand-edit rows to paper over this.
+
+    `include_search=True` additionally re-queues non-curated 'not_available' rows
+    whose caption track a probe has PROVEN to exist (the rows the 429-laundering
+    bug stranded). Unprobed rows are left alone on purpose — see step 4."""
     print(f"Reconciling {DB_PATH}...")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -299,6 +303,30 @@ def reconcile():
           AND id NOT IN (SELECT video_id FROM transcripts)
     """).rowcount
     print(f"  Re-queued {requeued} curated 'not_available' video(s) for recheck.")
+
+    # 4. Opt-in: widen the re-check beyond curated channels — but ONLY for rows
+    #    a probe has shown to HAVE a caption track. 'unknown' is deliberately left
+    #    alone: re-queueing an unprobed row just re-runs the same blocked fetch,
+    #    and the availability probe is the thing that resolves it (P1). The
+    #    attempt cap stops a stubborn row looping forever (P8).
+    if include_search:
+        try:
+            from overnight_pipeline import MAX_FETCH_ATTEMPTS as _max
+        except Exception:
+            _max = 4
+        try:
+            widened = conn.execute("""
+                UPDATE videos SET transcript_status = 'not_requested'
+                WHERE transcript_status = 'not_available'
+                  AND discovered_via != 'channel'
+                  AND COALESCE(fetch_attempts, 0) < ?
+                  AND id NOT IN (SELECT video_id FROM transcripts)
+                  AND caption_availability = 'exists'
+            """, (_max,)).rowcount
+            print(f"  Re-queued {widened} search-sourced 'not_available' row(s) whose "
+                  f"captions are PROVEN to exist (attempt cap {_max}).")
+        except sqlite3.OperationalError as e:
+            print(f"  Skipped the search-sourced re-queue ({e}) — run --migrate first.")
 
     conn.commit()
     conn.close()
@@ -2634,10 +2662,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             SELECT COALESCE(NULLIF(channel_name, ''), 'Unknown') as name, COUNT(*) as count 
             FROM videos GROUP BY name ORDER BY count DESC LIMIT 15
         """).fetchall()
+
+        # Availability is deliberately separate from status: it records whether a
+        # caption track EXISTS, not whether we could fetch it right now. Surfacing
+        # the 'unknown' count keeps unprobed coverage visible rather than implied (P2).
+        availability = {"cap_exists": 0, "cap_none": 0, "cap_unknown": 0}
+        try:
+            for r in conn.execute(
+                    "SELECT COALESCE(caption_availability,'unknown') AS a, COUNT(*) AS c "
+                    "FROM videos GROUP BY a").fetchall():
+                key = {"exists": "cap_exists", "none": "cap_none"}.get(r["a"], "cap_unknown")
+                availability[key] = r["c"]
+        except sqlite3.OperationalError:
+            pass  # not-yet-migrated DB: availability simply isn't known yet
         conn.close()
         
         stats = {"total": total, "channels": [dict(r) for r in channels]}
         stats.update(status_counts)
+        stats.update(availability)
         return stats
 
     def _job_log(self, name):
@@ -2747,6 +2789,9 @@ if __name__ == "__main__":
     parser.add_argument("--migrate", action="store_true", help="Run database migrations")
     parser.add_argument("--reconcile", action="store_true",
                         help="Make transcript_status honest (reset fake 'obtained', drop stub files)")
+    parser.add_argument("--include-search-unavailable", action="store_true",
+                        help="With --reconcile: also re-queue non-curated 'not_available' rows "
+                             "whose caption track a probe proved exists (attempt-capped)")
     args = parser.parse_args()
 
     if args.migrate:
@@ -2754,7 +2799,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.reconcile:
-        reconcile()
+        reconcile(include_search=args.include_search_unavailable)
         sys.exit(0)
 
     port = int(os.environ.get("PORT", 9091))
