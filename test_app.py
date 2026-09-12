@@ -1903,5 +1903,28 @@ class TestCachedAvailability(unittest.TestCase):
         c.close()
 
 
+class TestSpikeThrottleGate(unittest.TestCase):
+    """spike_clients Part-2 validity gate: abort only on TRANSIENT throttling, never
+    on persistent PO-token gating — or the A/B is permanently INVALID and Part 2
+    can never complete."""
+
+    def test_gating_markers_are_not_throttle(self):
+        import spike_clients as sc
+        for m in ("po token", "sabr", "missing subtitles languages"):
+            self.assertNotIn(m, sc.THROTTLE_MARKERS,
+                             "%s is per-client gating, not a cooldown" % m)
+
+    def test_real_throttle_markers_present(self):
+        import spike_clients as sc
+        for m in ("429", "too many requests", "rate limit", "sign in to confirm"):
+            self.assertIn(m, sc.THROTTLE_MARKERS)
+
+    def test_no_bare_rate_marker(self):
+        # bare "rate" would match "bitrate"/"accurate" (P7)
+        import spike_clients as sc
+        self.assertNotIn("rate", sc.BLOCK_MARKERS)
+        self.assertNotIn("rate", sc.THROTTLE_MARKERS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

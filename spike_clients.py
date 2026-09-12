@@ -57,8 +57,17 @@ CONFIGS = [
 # Mirrors fetch_transcripts.BLOCKED_MARKERS — one signal set, not two (P5).
 BLOCK_MARKERS = (
     "429", "too many requests", "po token", "sabr",
-    "missing subtitles languages", "sign in to confirm", "rate", "timeout",
-    "timed out",
+    "missing subtitles languages", "sign in to confirm",
+    "rate limit", "rate-limit", "ratelimit", "timeout", "timed out",
+)
+# The validity gate cares ONLY about transient throttling (a 429/IP cooldown),
+# never persistent per-client PO-token gating: "po token" / "sabr" / "missing
+# subtitles languages" appear on android/web even OUTSIDE a cooldown, so counting
+# them as "baseline blocked" would make every A/B permanently INVALID and Part 2
+# could never complete. Abort the comparison only on one of these.
+THROTTLE_MARKERS = (
+    "429", "too many requests", "rate limit", "rate-limit", "ratelimit",
+    "sign in to confirm", "timeout", "timed out",
 )
 
 SUBS_VER_RE = re.compile(r"^(en|en-)\S*$", re.I)
@@ -190,8 +199,8 @@ def main():
             r["chars"] += chars
             if marker:
                 r["blocked"] += 1
-                if label == baseline_label:
-                    baseline_blocked = True
+                if label == baseline_label and marker in THROTTLE_MARKERS:
+                    baseline_blocked = True   # transient throttle, not PO-token gating
             table.append((v["id"], label, hit, secs, marker, chars))
             print("  [%2d/%2d] %-22s %-22s %s %5.1fs %s"
                   % (i, len(order), v["id"], label,
@@ -214,8 +223,9 @@ def main():
 
     print()
     if baseline_blocked:
-        print("INVALID: the baseline (android,web) recorded a block marker, so this")
-        print("window is throttled and the comparison means nothing. Re-run later.")
+        print("INVALID: the baseline (android,web) hit a throttle marker (429 / rate")
+        print("limit / timeout), so this window is throttled and the comparison means")
+        print("nothing. Re-run later, outside the cooldown.")
     else:
         ranked.sort(reverse=True)
         rate, negavg, label, r, avg = ranked[0]
