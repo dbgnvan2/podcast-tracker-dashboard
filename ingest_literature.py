@@ -101,13 +101,13 @@ def ingest(profile_name=None):
                         prev_views, view_change, view_change_pct, transcript_keywords_score,
                         quality_score, transcript_summary, channel_id, is_new_channel,
                         discovered_via, views_per_day, source_type, source, doi, citations, venue,
-                        transcript_status, transcribed_date)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        transcript_status, transcribed_date, transcript_source)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (vid, d["byline"], "", d["title"], d["url"], d["published_date"],
                          0, cites, 0, 0, now, now, 0, 0, 0, relevance(d["title"] + " " + d["text"], keywords),
                          score, "", "", 0, "literature", 0,
                          "literature", d["source"], d["raw"].get("doi", ""), cites, d["raw"].get("venue", ""),
-                         "obtained", today))
+                         "obtained", today, "literature_abstract"))
                 # store the abstract as the analyzable content
                 conn.execute(
                     "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",

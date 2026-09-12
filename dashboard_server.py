@@ -177,6 +177,15 @@ def migrate(db=None):
         # Count fetch attempts so the overnight runner stops re-promoting a
         # stubbornly-failing 'error' row forever (see overnight_pipeline.py).
         ("fetch_attempts", "ALTER TABLE videos ADD COLUMN fetch_attempts INTEGER DEFAULT 0"),
+        # Availability vs fetchability (DESIGN-transcript-availability.md §2).
+        # 'unknown' can never produce a terminal negative, so a not-yet-probed row
+        # stays retryable; not_available becomes legal only once a probe has
+        # positively shown 'none'. transcript_source records provenance
+        # (ytdlp / manual_panel / literature_abstract) so a human-pasted or
+        # padded transcript can never masquerade as a verified fetch.
+        ("caption_availability",
+         "ALTER TABLE videos ADD COLUMN caption_availability TEXT DEFAULT 'unknown'"),
+        ("transcript_source", "ALTER TABLE videos ADD COLUMN transcript_source TEXT"),
     ]:
         if col not in columns:
             print(f"Adding '{col}' column...")

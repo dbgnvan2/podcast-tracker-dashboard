@@ -116,7 +116,9 @@ def init_db():
             source TEXT DEFAULT 'youtube',
             doi TEXT,
             citations INTEGER DEFAULT 0,
-            venue TEXT
+            venue TEXT,
+            caption_availability TEXT DEFAULT 'unknown',
+            transcript_source TEXT
         )
     """)
     conn.execute("""
@@ -428,6 +430,35 @@ def parse_ymd_via_ytdlp(date_str):
         return dt.strftime("%Y-%m-%d")
     except (ValueError, AttributeError):
         return date_str[:10] if date_str else None
+
+
+# ── Caption availability (DESIGN-transcript-availability.md §2 / phase 3) ────
+# Availability ("does a caption track exist?") is a property of the VIDEO.
+# Fetchability ("can we grab it right now?") is a property of our IP and the
+# player client. Conflating them is what made `not_available` meaningless.
+#
+# Tier 1 is free: get_video_details() already fetches --dump-json, and that dict
+# carries `subtitles` + `automatic_captions` (the same fields --list-subs prints).
+#
+# CAVEAT (why phase 2 blocks this): with a PO-token-gated client yt-dlp DISCARDS
+# gated subs ("will be discarded since they are not downloadable as-is") and
+# under-reports — regenerating the very false negatives we are removing. Read
+# this only through a client that does not gate subs.
+#
+# Tier 1 may only ever produce 'exists'. It never writes 'none': an empty dict
+# could mean "no track" or "the client hid it", and only the panel probe
+# (Tier 2, yt-dlp --write-pages) is allowed to conclude absence.
+def availability_from_details(details):
+    """'exists' if the player response lists any usable caption track, else
+    'unknown'. Any language counts — the question is 'would the side panel show a
+    transcript', not 'can we use it in English'."""
+    if not isinstance(details, dict):
+        return "unknown"
+    for key in ("subtitles", "automatic_captions"):
+        tracks = details.get(key)
+        if isinstance(tracks, dict) and any(bool(v) for v in tracks.values()):
+            return "exists"
+    return "unknown"
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -866,6 +897,10 @@ def main():
         if not details:
             continue
 
+        # Tier 1 availability, free: the --dump-json we already fetched lists the
+        # caption tracks. Only ever yields 'exists' (see availability_from_details).
+        availability = availability_from_details(details)
+
         upload_date = parse_ymd_via_ytdlp(details.get("upload_date"))
         if not upload_date:
             continue
@@ -907,6 +942,7 @@ def main():
             "comments": comments,
             "views_per_day": round(views / days_since(upload_date), 1),
             "discovered_via": "channel" if curated else "search",
+            "caption_availability": availability,
         })
 
         if not cached:
@@ -915,6 +951,12 @@ def main():
     print(f"  Enriched {total_to_enrich - skipped} videos ({skipped} used cached data).", flush=True)
     print(f"After filtering (curated bypass view/age; others views>={MIN_VIEWS}, "
           f"{MIN_DURATION_SEC//60}-{MAX_DURATION_SEC//60}min, {MIN_DAYS_OLD}+ days old): {len(enriched)}")
+    # Announce availability instead of implying coverage (P2). The remainder are
+    # 'unknown' on purpose: unknown can never become a terminal negative. A client
+    # that gates subs will under-report here (phase 2 exists to fix that).
+    _avail_exists = sum(1 for x in enriched if x.get("caption_availability") == "exists")
+    print(f"  Caption availability (Tier 1): {_avail_exists} with tracks, "
+          f"{len(enriched) - _avail_exists} unknown.", flush=True)
 
     # ── Step 3: Fetch transcripts & score (best-effort, skip if slow) ──
     mon_names, mon_ids = monitored_channels(conn)
@@ -1074,6 +1116,16 @@ def main():
                 v.get("transcript_preview", ""),
                 v["channel_id"], is_new_channel, v.get("discovered_via", "search"), v["views_per_day"],
             ))
+
+        # Availability (Tier 1) may only move unknown -> exists; a proven 'none' is
+        # never overwritten. Guarded so an un-migrated DB cannot crash a run —
+        # `python3 dashboard_server.py --migrate` adds the column.
+        if v.get("caption_availability") == "exists":
+            try:
+                cursor.execute(
+                    "UPDATE videos SET caption_availability='exists' WHERE id=?", (v["id"],))
+            except sqlite3.OperationalError:
+                pass
 
     # Calculate view change % for existing videos
     cursor.execute("""

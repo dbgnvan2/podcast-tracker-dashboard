@@ -201,6 +201,17 @@ def _queue_rows(conn):
         ).fetchall()
 
 
+def _mark_source(conn, vid, source):
+    """Record how this transcript was obtained (provenance).
+
+    Tolerates a not-yet-migrated DB (no-op) — the OperationalError idiom used
+    throughout, so an un-migrated DB can never crash a fetch run."""
+    try:
+        conn.execute("UPDATE videos SET transcript_source=? WHERE id=?", (source, vid))
+    except sqlite3.OperationalError:
+        pass
+
+
 def _process_queue():
     """Fetch transcripts for the requested queue. Returns (ok, total), or None
     when there was nothing to do (so the caller records no run result)."""
@@ -257,6 +268,7 @@ def _process_queue():
                 "INSERT OR REPLACE INTO transcripts (video_id, file_path, full_text, word_count) VALUES (?,?,?,?)",
                 (vid, str(txt_path), text, len(text.split())),
             )
+            _mark_source(conn, vid, "ytdlp")
             success_count += 1
             print(f"  Success: {len(text.split())} words, {len(segments)} segments.")
         elif verdict == "not_available":
