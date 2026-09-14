@@ -789,7 +789,9 @@ def dry_run():
 def main():
     if not ACTIVE_PROFILE.get("youtube_enabled", True):
         print(f"YouTube arm disabled for profile '{ACTIVE_PROFILE['name']}' — skipping.")
-        return
+        return {"youtube_enabled": False, "new": 0, "emerging": 0,
+                "reupload_dropped": 0, "skiplist_dropped": 0,
+                "enriched": 0, "cached": 0, "passed_filters": 0}
     conn = init_db()
     cursor = conn.cursor()
     run_date = datetime.now(timezone.utc).isoformat()
@@ -1215,6 +1217,18 @@ def main():
         for name, best, cnt in suggestions:
             print(f"    • {name} — best score {best:.2f}, {cnt} videos")
     print(f"--- Run complete ---")
+    # Return the run's counts so an orchestrator (weekly_run.py) can surface
+    # exclusions as numbers instead of parsing stdout (P2 — never silent).
+    return {
+        "youtube_enabled": True,
+        "new": new_count,
+        "emerging": emerging,
+        "reupload_dropped": reupload_dropped,
+        "skiplist_dropped": skiplist_dropped,
+        "enriched": fetched,
+        "cached": skipped,
+        "passed_filters": len(enriched),
+    }
 
 
 if __name__ == "__main__":

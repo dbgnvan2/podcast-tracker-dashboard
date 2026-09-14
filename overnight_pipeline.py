@@ -100,16 +100,18 @@ def _already_running():
     return bool(others)
 
 
-def main():
-    if _already_running():
-        print("Another overnight_pipeline.py is already running — exiting.", flush=True)
-        return
+def drain(max_hours=MAX_HOURS, db=None):
+    """Ride out the 429 cooldown: each round promote retryable 'error' rows back to
+    'requested', fetch, analyze, rebuild the digest; stop when the queue is empty or
+    `max_hours` elapses. Returns the number of rounds run.
 
-    db = get_db()
+    Shared by overnight_pipeline.main() and weekly_run.py (P5: one drain
+    implementation, not a second copy of the loop)."""
+    db = db or get_db()
     _ensure_attempts_column(db)
     start = time.time()
     rnd = 0
-    while time.time() - start < MAX_HOURS * 3600:
+    while time.time() - start < max_hours * 3600:
         rnd += 1
         promoted, capped = promote_errors(db)
         print(f"[round {rnd}] promoted {promoted} error->requested "
@@ -133,7 +135,16 @@ def main():
             break
         print(f"[round {rnd}] sleeping {ROUND_SLEEP_SEC}s before retry…", flush=True)
         time.sleep(ROUND_SLEEP_SEC)
+    return rnd
 
+
+def main():
+    if _already_running():
+        print("Another overnight_pipeline.py is already running — exiting.", flush=True)
+        return
+
+    db = get_db()
+    rnd = drain(MAX_HOURS, db)
     try:
         write_digest()
     except Exception as e:

@@ -1936,5 +1936,254 @@ class TestSpikeThrottleGate(unittest.TestCase):
         self.assertFalse(sc.baseline_invalidated(hit=False, marker=""))
 
 
+class TestWeeklyRun(unittest.TestCase):
+    """W1-W11: the weekly runner orchestrates the existing stages, pins one profile,
+    locks to one writer, and ends with an honest summary. Stages are faked (no
+    network/LLM); all patched module state is restored in tearDown."""
+
+    def setUp(self):
+        import weekly_run, dashboard_server, podcast_scraper, generate_report, overnight_pipeline
+        self.wr = weekly_run
+        self.tmp = Path(tempfile.mkdtemp())
+        # Redirect ALL profile storage to temp — never touch ~/.hermes.
+        self._pf = {k: getattr(profiles, k) for k in
+                    ("HERMES", "PROFILES_DIR", "DB_DIR", "DIGESTS_DIR", "ACTIVE_FILE", "LEGACY_DB")}
+        profiles.HERMES = self.tmp
+        profiles.PROFILES_DIR = self.tmp / "profiles"
+        profiles.DB_DIR = self.tmp / "db"
+        profiles.DIGESTS_DIR = self.tmp / "digests"
+        profiles.ACTIVE_FILE = profiles.PROFILES_DIR / "_active"
+        profiles.LEGACY_DB = self.tmp / "podcast_tracker.db"
+        self._env = os.environ.pop("PTD_PROFILE", None)
+        profiles.create("wk", label="Weekly")
+        profiles.set_active("wk")
+        self.db = profiles.db_path_for("wk")
+        fresh_db(self.db)
+        # add columns the summary/queries touch that SCHEMA may omit
+        c = sqlite3.connect(self.db)
+        for ddl in ("ALTER TABLE videos ADD COLUMN caption_availability TEXT DEFAULT 'unknown'",
+                    "ALTER TABLE videos ADD COLUMN fetch_attempts INTEGER DEFAULT 0",
+                    "CREATE TABLE IF NOT EXISTS ai_analysis (video_id TEXT PRIMARY KEY, analyzed_at TEXT)"):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        c.commit(); c.close()
+
+        # Fake every stage; record calls. counts() stays REAL (reads the temp DB).
+        self.calls = []
+        self._orig = {}
+
+        def patch(mod, name, fn):
+            self._orig[(mod, name)] = getattr(mod, name)
+            setattr(mod, name, fn)
+
+        def fake_discovery():
+            self.calls.append("discovery")
+            conn = sqlite3.connect(self.db)
+            for vid in ("A", "B"):
+                conn.execute("INSERT OR IGNORE INTO videos (id, channel_name, video_title, "
+                             "url, quality_score, transcript_status) "
+                             "VALUES (?,?,?,?,?, 'not_requested')",
+                             (vid, "Chan", f"Title {vid}", "u", 0.8))
+            conn.commit(); conn.close()
+            return {"youtube_enabled": True, "new": 2, "emerging": 0,
+                    "reupload_dropped": 1, "skiplist_dropped": 0,
+                    "enriched": 2, "cached": 0, "passed_filters": 2}
+
+        def fake_drain(max_hours=8, db=None):
+            self.calls.append(("drain", max_hours))
+            conn = sqlite3.connect(self.db)
+            conn.execute("UPDATE videos SET transcript_status='obtained' WHERE id='A'")
+            conn.execute("INSERT OR IGNORE INTO ai_analysis (video_id) VALUES ('A')")
+            conn.commit(); conn.close()
+            return 1
+
+        patch(dashboard_server, "migrate", lambda db=None: self.calls.append("migrate"))
+        patch(dashboard_server, "reconcile", lambda include_search=False: self.calls.append(("reconcile", include_search)))
+        patch(podcast_scraper, "main", fake_discovery)
+        patch(overnight_pipeline, "drain", fake_drain)
+        patch(overnight_pipeline, "write_digest", lambda: self.calls.append("digest"))
+        patch(generate_report, "build_report", lambda n=8: ("# rep", "2026-09-14"))
+        patch(generate_report, "REPORTS_DIR", self.tmp / "reports" / "wk")
+        patch(weekly_run, "_already_running", lambda: False)
+        self.mods = (dashboard_server, podcast_scraper, generate_report, overnight_pipeline)
+
+    def tearDown(self):
+        for (mod, name), val in self._orig.items():
+            setattr(mod, name, val)
+        for k, v in self._pf.items():
+            setattr(profiles, k, v)
+        if self._env is not None:
+            os.environ["PTD_PROFILE"] = self._env
+        else:
+            os.environ.pop("PTD_PROFILE", None)
+
+    # ── W1 ───────────────────────────────────────────────────────────────────
+    def test_w1_no_duplicated_pipeline_logic(self):
+        import ast
+        src = Path(self.wr.__file__).read_text()
+        tree = ast.parse(src)
+        defs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        for primitive in ("calculate_quality_score", "process_queue", "build_digest",
+                          "fetch_channel_videos", "classify_fetch_result"):
+            self.assertNotIn(primitive, defs, f"weekly_run must not redefine {primitive}")
+        imported = {n.names[0].name for n in ast.walk(tree) if isinstance(n, ast.Import)}
+        for mod in ("podcast_scraper", "overnight_pipeline", "dashboard_server", "generate_report"):
+            self.assertIn(mod, imported, f"weekly_run must reuse {mod}, not reimplement it")
+
+    # ── W2 ───────────────────────────────────────────────────────────────────
+    def test_w2_failed_stage_still_runs_outputs_and_exits_nonzero(self):
+        def boom():
+            self.calls.append("discovery"); raise RuntimeError("discovery down")
+        self.mods[1].main = boom  # setUp already saved the real main; tearDown restores it
+        rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertEqual(rc, 1, "a failed stage must exit non-zero")
+        # output stages still ran despite the discovery failure
+        self.assertIn("digest", self.calls)
+        self.assertIn("build_report_ran", self._report_marker())
+
+    def _report_marker(self):
+        # report wrote latest.md under the temp reports dir
+        rd = self.tmp / "reports" / "wk"
+        return ["build_report_ran"] if (rd / "latest.md").exists() else []
+
+    def test_w2_stage_order(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        order = [c if isinstance(c, str) else c[0] for c in self.calls]
+        self.assertEqual(order[:4], ["migrate", "reconcile", "discovery", "drain"])
+        self.assertIn("digest", order)
+
+    # ── W3 ───────────────────────────────────────────────────────────────────
+    def test_w3_pinned_profile_used_by_every_stage(self):
+        profiles.create("other", label="Other")
+        profiles.set_active("other")               # _active is 'other'
+        cfg = self.wr.resolve_profile("wk")        # pin 'wk'
+        self.assertEqual(cfg["name"], "wk")
+        self.assertEqual(cfg["db_path"], profiles.db_path_for("wk"))
+        self.assertEqual(os.environ["PTD_PROFILE"], "wk")  # set before stage imports
+
+    def test_w3_fresh_process_pins_over_active(self):
+        # The in-process test can't prove import-time pinning (modules are cached),
+        # so exercise a REAL fresh process: _active=A, --profile B, dry-run (no writes).
+        import subprocess as sp, json, sys
+        h = Path(tempfile.mkdtemp())
+        (h / "profiles").mkdir(parents=True)
+        for n in ("aa", "bb"):
+            (h / "profiles" / f"{n}.json").write_text(json.dumps({"name": n, "label": n}))
+        (h / "profiles" / "_active").write_text("aa")
+        env = dict(os.environ, HERMES_DIR=str(h))
+        env.pop("PTD_PROFILE", None)
+        out = sp.run([sys.executable, str(Path(self.wr.__file__).parent / "weekly_run.py"),
+                      "--profile", "bb", "--dry-run"],
+                     capture_output=True, text=True, env=env).stdout
+        self.assertIn("profile 'bb'", out)
+        self.assertIn(str(h / "db" / "podcast_bb.db"), out)   # B's DB, not A's
+
+    # ── W4 ───────────────────────────────────────────────────────────────────
+    def test_w4_single_instance_lock_skips_cleanly(self):
+        self.mods  # noqa
+        self.wr._already_running = lambda: True
+        rc = self.wr.main(["--profile", "wk"])
+        self.assertEqual(rc, 0, "a skipped week is not a failure")
+        self.assertEqual(self.calls, [], "no stage may run when another writer holds the DB")
+
+    # ── W5 ───────────────────────────────────────────────────────────────────
+    def test_w5_two_runs_no_state_regression(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        import overnight_pipeline
+        after1 = overnight_pipeline.counts(self.db)
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        after2 = overnight_pipeline.counts(self.db)
+        self.assertEqual(after1, after2, "a second run must not regress or duplicate state")
+
+    # ── W6 ───────────────────────────────────────────────────────────────────
+    def test_w6_max_hours_forwarded_to_drain(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "3"])
+        drain_calls = [c for c in self.calls if isinstance(c, tuple) and c[0] == "drain"]
+        self.assertEqual(drain_calls[0][1], 3.0)
+
+    def test_w6_drain_respects_zero_cap(self):
+        # The REAL drain with a 0-hour cap must not enter the loop at all.
+        import overnight_pipeline, fetch_transcripts
+        real_drain = self._orig[(overnight_pipeline, "drain")]  # real drain saved in setUp
+        called = []
+        orig_pq = fetch_transcripts.process_queue
+        fetch_transcripts.process_queue = lambda: called.append("fetch")
+        try:
+            rnds = real_drain(max_hours=0, db=self.db)
+        finally:
+            fetch_transcripts.process_queue = orig_pq
+        self.assertEqual(rnds, 0)
+        self.assertEqual(called, [], "a 0-hour cap must not fetch anything")
+
+    # ── W7 ───────────────────────────────────────────────────────────────────
+    def test_w7_summary_contract_fields_present(self):
+        import io
+        before = {"not_requested": 0}
+        after = {"not_requested": 1, "obtained": 1}
+        disc = {"new": 2, "reupload_dropped": 1, "skiplist_dropped": 0}
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        self.wr.print_summary(cfg, before, after, disc, [], 0, buf)
+        out = buf.getvalue()
+        for token in ("WEEKLY SUMMARY", cfg["db_path"], "status:", "discovered new: 2",
+                      "re-upload dups: 1", "artifacts:", "digest", "report"):
+            self.assertIn(token, out)
+
+    def test_w7_nothing_changed_one_line(self):
+        import io
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        z = {"not_requested": 5}
+        self.wr.print_summary(cfg, z, z, {"new": 0, "reupload_dropped": 0, "skiplist_dropped": 0},
+                              [], 0, buf)
+        self.assertIn("No change this week", buf.getvalue())
+
+    # ── W8 ───────────────────────────────────────────────────────────────────
+    def test_w8_exclusions_reported_as_numbers(self):
+        import io
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        self.wr.print_summary(cfg, {}, {}, {"new": 0, "reupload_dropped": 4, "skiplist_dropped": 2},
+                              [], 3, buf)
+        out = buf.getvalue()
+        self.assertIn("re-upload dups: 4", out)
+        self.assertIn("skip-list: 2", out)
+        self.assertIn("capped-out: 3", out)
+
+    # ── W9 ───────────────────────────────────────────────────────────────────
+    def test_w9_dry_run_touches_nothing(self):
+        rc = self.wr.main(["--profile", "wk", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [], "dry-run must run no stage")
+
+    # ── W10 ──────────────────────────────────────────────────────────────────
+    def test_w10_shim_has_no_logic(self):
+        sh = (Path(self.wr.__file__).parent / "weekly.sh").read_text()
+        self.assertIn('cd "$(dirname "$0")"', sh)
+        self.assertIn('exec python3 weekly_run.py "$@"', sh)
+        self.assertNotIn("scripts", sh, "shim must never reference ~/.hermes/scripts")
+
+    # ── W11 ──────────────────────────────────────────────────────────────────
+    def test_w11_writes_only_within_owned_roots(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertFalse((self.tmp / "scripts").exists(), "must never create a scripts dir")
+        # every path the run writes to is under the temp HERMES root
+        for cfg_key in ("db_path", "digest_dir", "reports_dir"):
+            self.assertTrue(str(profiles.load("wk")[cfg_key]).startswith(str(self.tmp)))
+        # weekly_run hardcodes no path — every write target is profile-derived, so a
+        # temp HERMES fully contains it. Guard against a path-shaped literal creeping
+        # into code (the docstring may mention ~/.hermes in prose; a path literal
+        # would START with ~/.hermes or /Users, or be exactly ".hermes").
+        import ast
+        for node in ast.walk(ast.parse(Path(self.wr.__file__).read_text())):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                v = node.value
+                self.assertFalse(v.startswith("~/.hermes") or v.startswith("/Users")
+                                 or v == ".hermes",
+                                 "no hardcoded path literal in weekly_run")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
