@@ -97,10 +97,33 @@ Newest first. Format: **Issue → Root cause → What would have caught it → F
   "on run #2 (cache hit), what does the reader see?" (P8).
 - **Fix (Part A):** `ytdlp_clients.py` is the single client decision; `get_video_details` and the
   fetcher both use it. The cached path reads the persisted `caption_availability` (`stored_availability`)
-  instead of re-deriving `unknown`. Behavioural fix of the under-report completes at Part B, when
-  `spike_clients.py` measures and sets the non-gating client (network-dependent, outside a cooldown).
+  instead of re-deriving `unknown`.
 - **Pattern:** P5 → checklist 1; P8 → checklist 8. Deferred: Phase 3 Tier-2 (so a proven `none` can
-  be written) and the Part-B measurement.
+  be written).
+- **Part B outcome (2026-09-14):** the F1 premise (android under-reports; switch to a non-gating
+  client) was **refuted by measurement** — see the Phase-2 entry below. android,web downloads 100%
+  on this content; tv/ios return 0%. No client switch; the P5 unification is the whole fix.
+
+### 2026-09-14 — Phase 2: player-client A/B (measured, not guessed)
+- **Why:** DESIGN-transcript-availability.md Phase 2 — a client value that has not been measured is a
+  guess. Public yt-dlp guidance said tv/ios subs are unaffected by PO-token gating and android/web
+  are; this measures whether that holds for *our* content.
+- **Method:** `spike_clients.py`, 6 configs × 12 mixed videos, ONE attempt each, round-robin,
+  yt-dlp **2026.08.19**, run outside the cooldown (2026-09-14).
+- **Result (hit rate / avg s):** `android,web` 12/12 100% / 3.94 · `android` 12/12 100% / 2.51 ·
+  `default,-web` 12/12 100% / 3.30 · `tv` 0/12 · `ios` 0/12 · `tv,ios` 0/12.
+- **Verdict:** the guidance is **refuted for this content/version** — tv/ios fetch **nothing**;
+  the android family fetches everything. **Chosen `PLAYER_CLIENTS = ["android","web"]`** (kept over
+  the tie-break winner `["android"]` for the `web` fallback's robustness in the unattended runner;
+  ~1.4s/video, both 100%). Before = after = android,web @ 100% — the historical default is confirmed.
+- **Also fixed (the gate that hid this):** the spike first flagged the run INVALID because the
+  baseline logged transient 429s on *secondary* subtitle languages while still downloading usable
+  captions. The validity gate now invalidates only when a throttle marker coincides with a baseline
+  **miss** (`baseline_invalidated(hit, marker)`), and never on PO-token gating markers. A throttle
+  that costs no caption does not bias the comparison (P24-adjacent: a "block" signal that coexists
+  with success must not be read as failure).
+- **Pattern:** P4 (measure the constant, don't guess) → checklist 5; P24 (a marker that coexists
+  with success isn't a failure). Deferred: Phase 3 Tier-2.
 
 ### 2026-09-12 — A 429 was laundered into the terminal `not_available` (the 2026-06-02 fix was incomplete)
 - **Issue:** `~/.hermes/logs/fetch_transcripts.log` shows, ~12 times in a row:

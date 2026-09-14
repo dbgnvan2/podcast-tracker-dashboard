@@ -1925,6 +1925,16 @@ class TestSpikeThrottleGate(unittest.TestCase):
         self.assertNotIn("rate", sc.BLOCK_MARKERS)
         self.assertNotIn("rate", sc.THROTTLE_MARKERS)
 
+    def test_baseline_invalid_only_when_throttle_cost_a_caption(self):
+        # A 429 on a still-successful fetch (secondary sub language) must NOT
+        # invalidate the A/B; only a throttle that turned into a MISS does.
+        import spike_clients as sc
+        self.assertFalse(sc.baseline_invalidated(hit=True, marker="429"))
+        self.assertTrue(sc.baseline_invalidated(hit=False, marker="429"))
+        # PO-token gating is not throttling, even on a miss.
+        self.assertFalse(sc.baseline_invalidated(hit=False, marker="po token"))
+        self.assertFalse(sc.baseline_invalidated(hit=False, marker=""))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

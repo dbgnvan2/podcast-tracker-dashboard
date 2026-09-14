@@ -9,12 +9,15 @@ Purpose: One client decision, shared by the transcript fetcher and the caption
 Spec:    DESIGN-transcript-availability.md#phase-2
 Tests:   test_app.py::TestPlayerClients
 
-The VALUE below is **provisional** — `["android", "web"]`, the historical pair.
-`spike_clients.py` measures which client set actually returns captions on live
-videos (network-dependent, run outside a 429 cooldown); the winner is recorded in
-DESIGN-transcript-availability.md / LEARNINGS.md and set here. A client value that
-has not been measured is a guess (that doc is explicit) — change PLAYER_CLIENTS
-only from a committed measurement, never by intuition.
+The VALUE below is **measured**, not a guess. `spike_clients.py` (Part 2 of
+DESIGN-transcript-availability.md) A/B'd six client sets on 12 videos with yt-dlp
+2026.08.19 (2026-09-14): android,web / android / default,-web each hit **100%**;
+tv / ios / tv,ios hit **0%** — refuting the maintainer-guidance hypothesis that
+tv/ios are the non-gated fix for *this* content. So android does NOT under-report
+here; it downloads everything. We keep `["android","web"]` rather than the
+tie-break winner `["android"]` for the `web` fallback's robustness in an
+unattended runner (~1.4s/video cost, both 100%). Re-measure with spike_clients.py
+before changing it, only outside a 429 cooldown. See LEARNINGS.md (Phase-2 result).
 """
 
 # Ordered client preference. yt-dlp's `player_client` extractor arg accepts a

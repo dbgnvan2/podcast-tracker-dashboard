@@ -70,6 +70,18 @@ THROTTLE_MARKERS = (
     "sign in to confirm", "timeout", "timed out",
 )
 
+
+def baseline_invalidated(hit, marker):
+    """True only when a THROTTLE actually COST the baseline a caption.
+
+    A throttle marker on an attempt that still produced a usable caption (e.g. a
+    429 on a secondary subtitle language while the primary downloaded fine) does
+    not bias the comparison — the baseline got its captions. A cooldown that
+    invalidates the A/B shows up as a baseline MISS. PO-token gating markers are
+    not throttling and never invalidate (see THROTTLE_MARKERS)."""
+    return (not hit) and (marker in THROTTLE_MARKERS)
+
+
 SUBS_VER_RE = re.compile(r"^(en|en-)\S*$", re.I)
 
 
@@ -199,8 +211,8 @@ def main():
             r["chars"] += chars
             if marker:
                 r["blocked"] += 1
-                if label == baseline_label and marker in THROTTLE_MARKERS:
-                    baseline_blocked = True   # transient throttle, not PO-token gating
+            if label == baseline_label and baseline_invalidated(hit, marker):
+                baseline_blocked = True   # throttled AND lost a caption — comparison biased
             table.append((v["id"], label, hit, secs, marker, chars))
             print("  [%2d/%2d] %-22s %-22s %s %5.1fs %s"
                   % (i, len(order), v["id"], label,
@@ -223,9 +235,9 @@ def main():
 
     print()
     if baseline_blocked:
-        print("INVALID: the baseline (android,web) hit a throttle marker (429 / rate")
-        print("limit / timeout), so this window is throttled and the comparison means")
-        print("nothing. Re-run later, outside the cooldown.")
+        print("INVALID: the baseline (android,web) was throttled INTO A MISS (429 /")
+        print("rate limit / timeout cost it a caption), so this window is throttled")
+        print("and the comparison means nothing. Re-run later, outside the cooldown.")
     else:
         ranked.sort(reverse=True)
         rate, negavg, label, r, avg = ranked[0]

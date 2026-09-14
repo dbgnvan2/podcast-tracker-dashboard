@@ -153,6 +153,11 @@ final client whose output carries no marker) classifies `error`, not `not_availa
 
 ## 4. Phase 2 — measure the clients before believing them
 
+> **DONE (2026-09-14, yt-dlp 2026.08.19).** Measured with `spike_clients.py`. The hypothesis below
+> was **refuted for our content**: `tv`/`ios`/`tv,ios` returned **0/12**; `android,web` / `android` /
+> `default,-web` each returned **12/12 (100%)**. Chosen `PLAYER_CLIENTS = ["android","web"]` (kept over
+> the faster `["android"]` for the web fallback). Full table + rationale in `LEARNINGS.md` (Phase-2 entry).
+
 **Files:** new `spike_clients.py` (throwaway, in the spirit of `spike_multisource.py`);
 `LEARNINGS.md` fix-log entry.
 
