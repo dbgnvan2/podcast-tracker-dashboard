@@ -23,6 +23,80 @@ import podcast_scraper
 import profiles
 
 
+# ── Real-data guard (P28/P34) ────────────────────────────────────────────────
+# A test once ran the real reconcile() against the real ~/.hermes/transcripts and
+# deleted every .txt file. Two layers: (1) refuse any delete under the real
+# HERMES root while the suite runs, so the damage cannot happen; (2) fingerprint
+# the real transcripts dir and fail the run if it changed anyway (a write, or a
+# delete through a path this guard does not wrap).
+import shutil
+
+REAL_HERMES = profiles.HERMES.resolve()   # captured before any test redirects it
+REAL_TRANSCRIPTS = REAL_HERMES / "transcripts"
+
+
+def _under_real_hermes(path):
+    try:
+        return Path(os.path.abspath(os.fspath(path))).resolve().is_relative_to(REAL_HERMES)
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _guard(fn, label):
+    def wrapped(path, *a, **k):
+        if _under_real_hermes(path):
+            raise PermissionError(f"test suite refused {label} under real {REAL_HERMES}: {path}")
+        return fn(path, *a, **k)
+    return wrapped
+
+
+_REAL_FS = {"os.remove": os.remove, "os.unlink": os.unlink,
+            "Path.unlink": Path.unlink, "shutil.rmtree": shutil.rmtree}
+
+
+def _fingerprint(d):
+    if not d.is_dir():
+        return {}
+    return {f.name: (f.stat().st_size, f.stat().st_mtime_ns) for f in d.iterdir() if f.is_file()}
+
+
+def setUpModule():
+    global _BASELINE
+    _BASELINE = _fingerprint(REAL_TRANSCRIPTS)
+    os.remove = _guard(_REAL_FS["os.remove"], "os.remove")
+    os.unlink = _guard(_REAL_FS["os.unlink"], "os.unlink")
+    Path.unlink = _guard(_REAL_FS["Path.unlink"], "Path.unlink")
+    shutil.rmtree = _guard(_REAL_FS["shutil.rmtree"], "shutil.rmtree")
+
+
+def tearDownModule():
+    os.remove, os.unlink = _REAL_FS["os.remove"], _REAL_FS["os.unlink"]
+    Path.unlink, shutil.rmtree = _REAL_FS["Path.unlink"], _REAL_FS["shutil.rmtree"]
+    after = _fingerprint(REAL_TRANSCRIPTS)
+    if after != _BASELINE:
+        gone = sorted(set(_BASELINE) - set(after))
+        changed = sorted(k for k in after if _BASELINE.get(k) != after[k])
+        raise AssertionError(f"test suite changed the REAL transcripts dir {REAL_TRANSCRIPTS}: "
+                             f"removed {gone[:10]} ({len(gone)}), added/changed {changed[:10]} "
+                             f"({len(changed)})")
+
+
+class TestRealDataGuard(unittest.TestCase):
+    def test_delete_under_real_hermes_is_refused(self):
+        target = REAL_TRANSCRIPTS / "__guard_probe_does_not_exist__.txt"
+        for fn in (os.remove, os.unlink, Path.unlink):
+            with self.assertRaises(PermissionError):
+                fn(target)
+        with self.assertRaises(PermissionError):
+            shutil.rmtree(REAL_TRANSCRIPTS)
+
+    def test_delete_in_temp_is_allowed(self):
+        f = Path(tempfile.mkdtemp()) / "x.txt"
+        f.write_text("x")
+        os.remove(f)
+        self.assertFalse(f.exists())
+
+
 SCHEMA = """
 CREATE TABLE videos (id TEXT PRIMARY KEY, channel_name TEXT, video_title TEXT,
     url TEXT, views INTEGER, quality_score REAL, transcript_status TEXT,
@@ -255,10 +329,19 @@ class TestReconcile(unittest.TestCase):
         conn.commit(); conn.close()
         Path(self.tmp, "stub.txt").write_text("junk")        # unbacked -> removed
         Path(self.tmp, "real.txt").write_text("real text")   # backed -> kept
+        self._orig = (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR,
+                      dashboard_server._profile_db_paths)
         dashboard_server.DB_PATH = self.db
         dashboard_server.TRANSCRIPTS_DIR = self.tmp
+        self.other_dbs = []
+        dashboard_server._profile_db_paths = lambda: list(self.other_dbs)
+
+    def tearDown(self):
+        (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR,
+         dashboard_server._profile_db_paths) = self._orig
 
     def test_reconcile(self):
+        self.assertFalse(_under_real_hermes(dashboard_server.TRANSCRIPTS_DIR))
         dashboard_server.reconcile()
         conn = sqlite3.connect(self.db)
         fake = conn.execute("SELECT transcript_status FROM videos WHERE id='fake'").fetchone()[0]
@@ -268,6 +351,28 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(real, "obtained")    # kept
         self.assertFalse(Path(self.tmp, "stub.txt").exists())
         self.assertTrue(Path(self.tmp, "real.txt").exists())
+
+    def test_reconcile_keeps_files_backed_by_another_profile(self):
+        # The transcripts dir is shared: a file only ANOTHER profile's DB backs
+        # must survive reconciling this profile (the bug that wiped 28 files).
+        other = os.path.join(self.tmp, "other.db")
+        fresh_db(other)
+        c = sqlite3.connect(other)
+        c.execute("INSERT INTO transcripts VALUES ('theirs','f','their text',2)")
+        c.commit(); c.close()
+        Path(self.tmp, "theirs.txt").write_text("their text")
+        self.other_dbs = [self.db, other]
+        dashboard_server.reconcile()
+        self.assertTrue(Path(self.tmp, "theirs.txt").exists(), "another profile's transcript deleted")
+        self.assertFalse(Path(self.tmp, "stub.txt").exists(), "a true stub is still removed")
+
+    def test_reconcile_deletes_nothing_if_a_profile_db_is_unreadable(self):
+        bad = os.path.join(self.tmp, "corrupt.db")
+        Path(bad).write_text("this is not a sqlite database")
+        self.other_dbs = [bad]
+        dashboard_server.reconcile()
+        self.assertTrue(Path(self.tmp, "stub.txt").exists(),
+                        "absence can't be proven over an unreadable DB, so nothing is deleted")
 
 
 class TestEmergingDiscovery(unittest.TestCase):
@@ -1785,12 +1890,15 @@ class TestReconcileWidening(unittest.TestCase):
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (vid, "C", "T", "http://u", 1, 0.5, "not_available", via, avail, att))
         conn.commit(); conn.close()
-        self._orig = (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR)
+        self._orig = (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR,
+                      dashboard_server._profile_db_paths)
         dashboard_server.DB_PATH = self.db
         dashboard_server.TRANSCRIPTS_DIR = self.tmp
+        dashboard_server._profile_db_paths = lambda: []
 
     def tearDown(self):
-        dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR = self._orig
+        (dashboard_server.DB_PATH, dashboard_server.TRANSCRIPTS_DIR,
+         dashboard_server._profile_db_paths) = self._orig
 
     def _statuses(self):
         conn = sqlite3.connect(self.db)
@@ -2057,6 +2165,9 @@ class TestWeeklyRun(unittest.TestCase):
         patch(generate_report, "build_report", lambda n=8: ("# rep", "2026-09-14"))
         # Pin every import-frozen stage path to the temp 'wk' profile, as a fresh
         # cron process would have them (weekly_run refuses to run otherwise, F1).
+        # reconcile deletes from TRANSCRIPTS_DIR: never let it see the real one.
+        (self.tmp / "transcripts").mkdir()
+        patch(dashboard_server, "TRANSCRIPTS_DIR", str(self.tmp / "transcripts"))
         wk = profiles.load("wk")
         for mod_name, attr, key in weekly_run.PIN_ATTRS:
             mod = __import__(mod_name)
@@ -2154,6 +2265,10 @@ class TestWeeklyRun(unittest.TestCase):
 
     def test_w3_f1_real_reconcile_writes_only_the_given_db(self):
         real_reconcile = self._orig[(self.mods[0], "reconcile")]
+        # reconcile deletes from TRANSCRIPTS_DIR; prove it is not the real one
+        # regardless of what the real dir currently holds (P34).
+        self.assertFalse(_under_real_hermes(self.mods[0].TRANSCRIPTS_DIR),
+                         "real reconcile must never run against the real transcripts dir")
         other = self.tmp / "db" / "podcast_other.db"
         fresh_db(other)
         for path in (self.db, other):

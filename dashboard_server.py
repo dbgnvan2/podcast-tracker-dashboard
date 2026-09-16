@@ -254,6 +254,11 @@ def migrate(db=None):
     conn.close()
     print("Migration complete.")
 
+def _profile_db_paths():
+    """Every investigation profile's DB path (the shared transcripts dir's owners)."""
+    return [profiles.db_path_for(p["name"]) for p in profiles.list_profiles()]
+
+
 def reconcile(include_search=False, db=None):
     """Make transcript_status honest: a video is only 'obtained' if a real
     transcript row backs it. Resets fakes and removes stub transcript files.
@@ -284,10 +289,31 @@ def reconcile(include_search=False, db=None):
         )
     print(f"  Reset {len(orphan_obtained)} fake 'obtained' video(s) -> 'requested'.")
 
-    # 2. Remove transcript files that have no backing transcripts row (stubs).
+    # 2. Remove transcript files that NO profile's DB backs (stubs). The transcripts
+    #    directory is shared by every profile, so "unbacked" is an absence claim
+    #    over ALL profile DBs — deciding it from this DB alone deleted every other
+    #    profile's transcripts (P31). If any profile DB can't be read, the
+    #    population is incomplete, so nothing is deleted and the skip is reported.
     backed = {r["video_id"] for r in conn.execute("SELECT video_id FROM transcripts")}
+    unread = []
+    for other in _profile_db_paths():
+        if os.path.abspath(str(other)) == os.path.abspath(str(target)):
+            continue
+        if not os.path.exists(other):
+            continue  # a profile that never created its DB backs no files
+        try:
+            oc = sqlite3.connect(f"file:{other}?mode=ro", uri=True)
+            try:
+                backed |= {r[0] for r in oc.execute("SELECT video_id FROM transcripts")}
+            finally:
+                oc.close()
+        except sqlite3.Error as e:
+            unread.append(f"{other} ({e})")
     removed = 0
-    if os.path.isdir(TRANSCRIPTS_DIR):
+    if unread:
+        print(f"  Skipped stub-file removal: could not read {len(unread)} profile DB(s), "
+              f"so absence can't be proven: {'; '.join(unread)}")
+    elif os.path.isdir(TRANSCRIPTS_DIR):
         for fname in os.listdir(TRANSCRIPTS_DIR):
             if not fname.endswith(".txt"):
                 continue
@@ -295,7 +321,7 @@ def reconcile(include_search=False, db=None):
             if vid not in backed:
                 os.remove(os.path.join(TRANSCRIPTS_DIR, fname))
                 removed += 1
-    print(f"  Removed {removed} unbacked transcript file(s).")
+        print(f"  Removed {removed} transcript file(s) backed by no profile's DB.")
 
     # 3. Curated-channel videos marked 'not_available' are suspect: YouTube blocks
     #    (PO token / 429) are transient and were sometimes mis-recorded as "no
