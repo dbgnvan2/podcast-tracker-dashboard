@@ -325,4 +325,5 @@ def process_queue():
 
 
 if __name__ == "__main__":
-    process_queue()
+    import dblock  # one writer per profile DB (queues behind a weekly/overnight run)
+    dblock.run_locked(DB_PATH, "fetch_transcripts", process_queue)

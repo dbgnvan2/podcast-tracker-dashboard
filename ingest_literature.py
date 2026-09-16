@@ -131,4 +131,6 @@ if __name__ == "__main__":
             prof = a.split("=", 1)[1]
         elif a == "--profile" and sys.argv.index(a) + 1 < len(sys.argv):
             prof = sys.argv[sys.argv.index(a) + 1]
-    ingest(prof)
+    import dblock  # one writer per profile DB (queues behind a weekly/overnight run)
+    dblock.run_locked(profiles.load(prof)["db_path"], "ingest_literature",
+                      lambda: ingest(prof))

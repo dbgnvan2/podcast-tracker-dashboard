@@ -270,4 +270,6 @@ if __name__ == "__main__":
     for a in sys.argv[1:]:
         if a.startswith("--id="):
             only = a.split("=", 1)[1]
-    analyze_all(only_id=only, force=force)
+    import dblock  # one writer per profile DB (queues behind a weekly/overnight run)
+    dblock.run_locked(DB_PATH, "analyze_transcripts",
+                      lambda: analyze_all(only_id=only, force=force))

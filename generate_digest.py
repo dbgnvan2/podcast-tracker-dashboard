@@ -148,4 +148,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import dblock  # writes digested_at: one writer per profile DB
+    dblock.run_locked(DB_PATH, "generate_digest", main)

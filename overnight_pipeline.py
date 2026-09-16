@@ -137,18 +137,23 @@ def main():
     # holds THIS profile's DB; a run on a different profile is unaffected.
     ok, holder = dblock.acquire(db, "overnight_pipeline")
     if not ok:
-        print(f"Another pipeline run (pid {holder}) is writing {db} — exiting.", flush=True)
-        return
+        print(f"Another pipeline writer is using {db} ({holder}) — exiting.", flush=True)
+        return 0
+    failed = []  # QA gate #2 F7: a failed analyze/digest must not exit 0
     try:
-        rnd = drain(MAX_HOURS, db)
+        rnd = drain(MAX_HOURS, db, failures=failed)
         try:
             write_digest()
         except Exception as e:
             print(f"  final digest error: {e}", flush=True)
+            failed.append("final digest")
         print(f"Pipeline finished after {rnd} round(s). Final status: {counts(db)}", flush=True)
+        if failed:
+            print(f"FAILED: {', '.join(failed)}", flush=True)
     finally:
         dblock.release(db)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

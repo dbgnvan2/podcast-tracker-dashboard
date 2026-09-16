@@ -1245,23 +1245,7 @@ def main():
     )
 
 
-if __name__ == "__main__":
-    # --profile NAME selects an investigation profile for this run.
-    prof_name = None
-    for a in sys.argv[1:]:
-        if a.startswith("--profile="):
-            prof_name = a.split("=", 1)[1]
-    if "--profile" in sys.argv:
-        i = sys.argv.index("--profile")
-        if i + 1 < len(sys.argv):
-            prof_name = sys.argv[i + 1]
-    if prof_name:
-        apply_profile(prof_name)
-
-    add_id = None
-    for a in sys.argv[1:]:
-        if a.startswith("--add="):
-            add_id = a.split("=", 1)[1]
+def _cli_dispatch(add_id):
     if add_id:
         c = init_db()
         add_video(c, add_id)
@@ -1287,3 +1271,31 @@ if __name__ == "__main__":
         print(f"Suggested {len(added)} new search term(s): {added}")
     else:
         main()
+
+
+if __name__ == "__main__":
+    # --profile NAME selects an investigation profile for this run.
+    prof_name = None
+    for a in sys.argv[1:]:
+        if a.startswith("--profile="):
+            prof_name = a.split("=", 1)[1]
+    if "--profile" in sys.argv:
+        i = sys.argv.index("--profile")
+        if i + 1 < len(sys.argv):
+            prof_name = sys.argv[i + 1]
+    if prof_name:
+        apply_profile(prof_name)
+
+    add_id = None
+    for a in sys.argv[1:]:
+        if a.startswith("--add="):
+            add_id = a.split("=", 1)[1]
+
+    def _cli():
+        _cli_dispatch(add_id)
+
+    if "--test" in sys.argv:
+        _cli()  # dry run: reads only, no lock
+    else:
+        import dblock  # one writer per profile DB (queues behind a weekly/overnight run)
+        dblock.run_locked(DB_PATH, "podcast_scraper", _cli)

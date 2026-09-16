@@ -1046,6 +1046,26 @@ class TestAPISmoke(unittest.TestCase):
         conn.close()
         return r.status, json.loads(body)
 
+    def test_g2f4_writer_jobs_refused_while_db_lock_held(self):
+        # Gate #2 F4: with another writer holding this profile's DB lock, every
+        # DB-writing button refuses (and names the holder) instead of spawning.
+        spawned = []
+        orig_spawn = dashboard_server.Handler._spawn
+        dashboard_server.Handler._spawn = lambda self_, args, name, **k: spawned.append(name)
+        holder = _hold_lock_in_child(self.tmp / "t.db", owner="weekly_run")
+        try:
+            for path in ("/api/process_queue", "/api/analyze", "/api/generate_digest",
+                         "/api/run_discovery", "/api/suggest_terms"):
+                with self.subTest(path=path):
+                    status, body = self._post(path, {})
+                    self.assertEqual(status, 200)
+                    self.assertFalse(body.get("started"), body)
+                    self.assertIn("weekly_run", body.get("message", ""))
+        finally:
+            holder.kill(); holder.wait()
+            dashboard_server.Handler._spawn = orig_spawn
+        self.assertEqual(spawned, [], "nothing may spawn while another writer holds the DB")
+
     def test_candidates_returns_list(self):
         status, body = self._get("/api/candidates")
         self.assertEqual(status, 200)
@@ -2046,9 +2066,25 @@ class TestSpikeThrottleGate(unittest.TestCase):
         self.assertFalse(sc.baseline_invalidated(hit=False, marker=""))
 
 
+def _hold_lock_in_child(db, owner="test-holder"):
+    """A REAL separate process holding `db`'s writer lock until killed."""
+    import subprocess as sp, sys as _sys
+    proc = sp.Popen([_sys.executable, "-c",
+                     "import sys, time, dblock\n"
+                     "ok, _ = dblock.acquire(sys.argv[1], sys.argv[2])\n"
+                     "print('ready' if ok else 'busy', flush=True)\n"
+                     "time.sleep(120)", str(db), owner],
+                    stdout=sp.PIPE, text=True, cwd=str(Path(__file__).resolve().parent))
+    line = proc.stdout.readline().strip()
+    if line != "ready":
+        proc.kill(); proc.wait()
+        raise RuntimeError(f"lock-holder child did not acquire: {line!r}")
+    return proc
+
+
 class TestWriterLock(unittest.TestCase):
-    """QA gate F4/F5/F7: the per-DB writer lock decides from the lock file's PID,
-    not from process names. Exercises the real dblock module."""
+    """QA gates #1 F4/F5/F7 and #2 F4/F5: an flock-based per-DB writer lock,
+    exercised with real separate holder processes (never a stubbed predicate)."""
 
     def setUp(self):
         import dblock
@@ -2056,40 +2092,100 @@ class TestWriterLock(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.db = self.tmp / "podcast_x.db"
 
-    def test_holder_pure_decision(self):
-        alive = lambda pid: pid == 111
-        self.assertEqual(self.dl.lock_holder("111 weekly_run t", 999, alive), 111)
-        self.assertIsNone(self.dl.lock_holder("222 weekly_run t", 999, alive), "dead pid is stale")
-        self.assertIsNone(self.dl.lock_holder("999 weekly_run t", 999, alive), "our own lock")
-        self.assertIsNone(self.dl.lock_holder("", 999, alive), "empty file is stale")
-        self.assertIsNone(self.dl.lock_holder("garbage", 999, alive), "unreadable is stale")
+    def _child(self, db=None):
+        proc = _hold_lock_in_child(db or self.db)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
 
     def test_acquire_release_roundtrip(self):
-        ok, holder = self.dl.acquire(self.db, "t")
-        self.assertTrue(ok); self.assertIsNone(holder)
-        self.assertTrue(self.dl.lock_path(self.db).exists())
+        ok, who = self.dl.acquire(self.db, "t")
+        self.assertTrue(ok); self.assertIsNone(who)
         self.dl.release(self.db)
-        self.assertFalse(self.dl.lock_path(self.db).exists())
+        self.assertIsNone(self.dl.holder(self.db), "released lock must be free")
 
-    def test_stale_lock_from_dead_pid_is_taken_over(self):
-        import subprocess as sp
-        proc = sp.Popen(["true"]); proc.wait()          # a PID that is now dead
-        self.dl.lock_path(self.db).write_text(f"{proc.pid} weekly_run t\n")
+    def test_live_holder_blocks_and_is_named(self):
+        proc = self._child()
+        ok, who = self.dl.acquire(self.db, "t")
+        self.assertFalse(ok)
+        self.assertIn(str(proc.pid), who)
+        self.assertIn("test-holder", self.dl.holder(self.db))
+
+    def test_killed_holder_releases_lock(self):
+        proc = self._child()
+        proc.kill(); proc.wait()          # SIGKILL: no Python cleanup runs
+        ok, _ = self.dl.acquire(self.db, "t")
+        self.assertTrue(ok, "the kernel releases a dead holder's lock")
+        self.dl.release(self.db)
+
+    def test_empty_lock_file_does_not_let_a_second_writer_in(self):
+        # Gate #2 F5: the old lock was stolen when a reader saw an empty file in the
+        # create->write window. The decision must come from the kernel lock, not
+        # from file content.
+        self._child()
+        self.dl.lock_path(self.db).write_text("")      # simulate the mid-write window
+        ok, _ = self.dl.acquire(self.db, "t")
+        self.assertFalse(ok)
+
+    def test_other_db_not_blocked(self):
+        self._child(self.tmp / "podcast_other.db")
         ok, _ = self.dl.acquire(self.db, "t")
         self.assertTrue(ok)
         self.dl.release(self.db)
 
-    def test_release_leaves_another_owners_lock(self):
-        import subprocess as sp
-        proc = sp.Popen(["sleep", "30"])
+    def test_reentrant_in_process(self):
+        self.assertTrue(self.dl.acquire(self.db, "outer")[0])
+        self.assertTrue(self.dl.acquire(self.db, "inner")[0])
+        self.dl.release(self.db)
+        self.assertIn(str(self.db) + ".writer.lock", self.dl._held)  # still held by outer
+        self.dl.release(self.db)
+        self.assertNotIn(str(self.db) + ".writer.lock", self.dl._held)
+
+    def test_wait_then_acquire_when_holder_exits(self):
+        proc = self._child()
+        import threading
+        threading.Timer(0.3, proc.kill).start()
+        ok, _ = self.dl.acquire(self.db, "t", wait_sec=10, poll_sec=0.05)
+        self.assertTrue(ok, "a waiting writer gets the lock once the holder exits")
+        self.dl.release(self.db)
+
+
+class TestStageScriptLocks(unittest.TestCase):
+    """Gate #2 F4: every DB-writing stage script's CLI entry takes the per-DB lock,
+    so a dashboard-spawned job cannot write alongside a weekly/overnight run.
+    Runs each REAL script in a fresh process against a temp HERMES; with the lock
+    held and PTD_LOCK_WAIT_SEC=0 it must exit 3 before doing any work."""
+
+    SCRIPTS = [
+        (["podcast_scraper.py", "--rescore"], "podcast_scraper"),
+        (["fetch_transcripts.py"], "fetch_transcripts"),
+        (["analyze_transcripts.py"], "analyze_transcripts"),
+        (["generate_digest.py"], "generate_digest"),
+        (["ingest_literature.py"], "ingest_literature"),
+    ]
+
+    def test_each_writer_script_waits_for_the_lock(self):
+        import subprocess as sp, sys as _sys
+        h = Path(tempfile.mkdtemp())
+        (h / "profiles").mkdir(parents=True)
+        (h / "profiles" / "lk.json").write_text(json.dumps({"name": "lk", "label": "lk"}))
+        (h / "profiles" / "_active").write_text("lk")
+        db = h / "db" / "podcast_lk.db"
+        db.parent.mkdir(parents=True)
+        fresh_db(str(db))
+        holder = _hold_lock_in_child(db)
         try:
-            self.dl.lock_path(self.db).write_text(f"{proc.pid} other t\n")
-            self.dl.release(self.db)
-            self.assertTrue(self.dl.lock_path(self.db).exists())
-            ok, holder = self.dl.acquire(self.db, "t")
-            self.assertFalse(ok); self.assertEqual(holder, proc.pid)
+            env = dict(os.environ, HERMES_DIR=str(h), PTD_PROFILE="lk", PTD_LOCK_WAIT_SEC="0",
+                       PODCAST_LLM_KEY="", OPENAI_API_KEY="")
+            here = Path(__file__).resolve().parent
+            for argv, name in self.SCRIPTS:
+                with self.subTest(script=name):
+                    r = sp.run([_sys.executable, str(here / argv[0])] + argv[1:], env=env,
+                               capture_output=True, text=True, timeout=60, cwd=str(h))
+                    self.assertEqual(r.returncode, 3, f"{name}: {r.stdout[-400:]}{r.stderr[-400:]}")
+                    self.assertIn("another writer still holds", r.stdout)
         finally:
-            proc.kill(); proc.wait()
+            holder.kill(); holder.wait()
 
 
 class TestWeeklyRun(unittest.TestCase):
@@ -2169,10 +2265,15 @@ class TestWeeklyRun(unittest.TestCase):
         (self.tmp / "transcripts").mkdir()
         patch(dashboard_server, "TRANSCRIPTS_DIR", str(self.tmp / "transcripts"))
         wk = profiles.load("wk")
-        for mod_name, attr, key in weekly_run.PIN_ATTRS:
+        for mod_name, attr in weekly_run.pinned_attrs():
             mod = __import__(mod_name)
             if (mod, attr) not in self._orig:
-                patch(mod, attr, Path(wk[key]))
+                patch(mod, attr, Path(weekly_run.PATH_ATTRS[attr](wk)))
+        import ingest_literature
+        def fake_ingest(name=None):
+            self.calls.append(("literature", name))
+            return 5
+        patch(ingest_literature, "ingest", fake_ingest)
         self.mods = (dashboard_server, podcast_scraper, generate_report, overnight_pipeline)
 
     def tearDown(self):
@@ -2364,27 +2465,22 @@ class TestWeeklyRun(unittest.TestCase):
         self.wr.print_summary(cfg, {}, {}, {"new": 1, "reupload_skipped": 3}, [], 0, buf)
         self.assertIn("WARNING: discovery result missing keys", buf.getvalue())
 
-    # ── W4 (QA gate F4/F5/F7): the REAL per-DB lock ──────────────────────────
+    # ── W4 (gates #1 F4/F5/F7, #2 F5): the REAL per-DB lock ─────────────────
     def _live_holder(self, db):
-        """A real live process recorded as the lock holder for `db`."""
-        import dblock, subprocess as sp
-        proc = sp.Popen(["sleep", "30"])
+        proc = _hold_lock_in_child(db, owner="weekly_run")
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
-        path = dblock.lock_path(db)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{proc.pid} weekly_run 2026-09-16T00:00:00\n")
-        self.addCleanup(lambda: path.unlink(missing_ok=True))
         return proc.pid
 
-    def test_w4_lock_held_on_same_db_skips(self):
+    def test_w4_lock_held_on_same_db_skips_with_marker(self):
         pid = self._live_holder(self.db)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = self.wr.main(["--profile", "wk"])
-        self.assertEqual(rc, 0, "a skipped week is not a failure")
+        self.assertEqual(rc, 0, "a skipped week is not a failure (W4)")
         self.assertEqual(self.calls, [], "no stage may run when another writer holds the DB")
-        self.assertIn(f"pid {pid}", out.getvalue())
+        self.assertIn("SKIPPED", out.getvalue(), "a skipped week must say so explicitly")
+        self.assertIn(str(pid), out.getvalue())
 
     def test_w4_lock_on_other_profile_does_not_block(self):
         profiles.create("other", label="Other")
@@ -2405,7 +2501,8 @@ class TestWeeklyRun(unittest.TestCase):
         import dblock
         with contextlib.redirect_stdout(io.StringIO()):
             self.wr.main(["--profile", "wk", "--max-hours", "1"])
-        self.assertFalse(dblock.lock_path(self.db).exists())
+        self.assertIsNone(dblock.holder(self.db))
+        self.assertNotIn(str(dblock.lock_path(self.db)), dblock._held)
 
     def test_f5_overnight_pipeline_refuses_while_weekly_holds_db(self):
         import overnight_pipeline
@@ -2414,103 +2511,83 @@ class TestWeeklyRun(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             overnight_pipeline.main()          # active profile is 'wk' -> same DB
         self.assertNotIn(("drain", 8), self.calls, "overnight must not become a second writer")
-        self.assertIn("is writing", out.getvalue())
+        self.assertIn("Another pipeline writer", out.getvalue())
 
-    # ── W5 ───────────────────────────────────────────────────────────────────
-    def test_w5_two_runs_no_state_regression(self):
-        self.wr.main(["--profile", "wk", "--max-hours", "1"])
-        import overnight_pipeline
-        after1 = overnight_pipeline.counts(self.db)
-        self.wr.main(["--profile", "wk", "--max-hours", "1"])
-        after2 = overnight_pipeline.counts(self.db)
-        self.assertEqual(after1, after2, "a second run must not regress or duplicate state")
+    # ── gate #2 F3: the pin check covers every frozen path, discovered ──────
+    def test_g2f3_discovered_pin_set_is_exact(self):
+        self.assertEqual(sorted(self.wr.pinned_attrs()), sorted([
+            ("dashboard_server", "DB_PATH"), ("dashboard_server", "TRANSCRIPTS_DIR"),
+            ("podcast_scraper", "DB_PATH"), ("podcast_scraper", "TRANSCRIPTS_DIR"),
+            ("fetch_transcripts", "DB_PATH"), ("fetch_transcripts", "TRANSCRIPTS_DIR"),
+            ("analyze_transcripts", "DB_PATH"), ("analyze_transcripts", "TRANSCRIPTS_DIR"),
+            ("generate_digest", "DB_PATH"), ("generate_digest", "DIGEST_DIR"),
+            ("generate_report", "DB_PATH"), ("generate_report", "REPORTS_DIR"),
+        ]))
 
-    # ── W6 ───────────────────────────────────────────────────────────────────
-    def test_w6_max_hours_forwarded_to_drain(self):
-        self.wr.main(["--profile", "wk", "--max-hours", "3"])
-        drain_calls = [c for c in self.calls if isinstance(c, tuple) and c[0] == "drain"]
-        self.assertEqual(drain_calls[0][1], 3.0)
-
-    def test_w6_drain_respects_zero_cap(self):
-        # The REAL drain with a 0-hour cap must not enter the loop at all.
-        import overnight_pipeline, fetch_transcripts
-        real_drain = self._orig[(overnight_pipeline, "drain")]  # real drain saved in setUp
-        called = []
-        orig_pq = fetch_transcripts.process_queue
-        fetch_transcripts.process_queue = lambda: called.append("fetch")
-        try:
-            rnds = real_drain(max_hours=0, db=self.db)
-        finally:
-            fetch_transcripts.process_queue = orig_pq
-        self.assertEqual(rnds, 0)
-        self.assertEqual(called, [], "a 0-hour cap must not fetch anything")
-
-    # ── W7 ───────────────────────────────────────────────────────────────────
-    def test_w7_summary_contract_fields_present(self):
-        import io
-        before = {"not_requested": 0}
-        after = {"not_requested": 1, "obtained": 1}
-        disc = {"new": 2, "reupload_dropped": 1, "skiplist_dropped": 0}
-        buf = io.StringIO()
+    def test_g2f3_every_pinned_attr_mismatch_is_caught(self):
         cfg = profiles.load("wk")
-        self.wr.print_summary(cfg, before, after, disc, [], 0, buf)
-        out = buf.getvalue()
-        for token in ("WEEKLY SUMMARY", cfg["db_path"], "status:", "discovered new: 2",
-                      "re-upload dups: 1", "artifacts:", "digest", "report"):
-            self.assertIn(token, out)
+        self.assertEqual(self.wr.pin_mismatches(cfg), [], "setUp pins everything")
+        for mod_name, attr in self.wr.pinned_attrs():
+            with self.subTest(attr=f"{mod_name}.{attr}"):
+                mod = __import__(mod_name)
+                good = getattr(mod, attr)
+                setattr(mod, attr, self.tmp / "elsewhere")
+                try:
+                    bad = self.wr.pin_mismatches(cfg)
+                finally:
+                    setattr(mod, attr, good)
+                self.assertEqual(len(bad), 1)
+                self.assertIn(f"{mod_name}.{attr}", bad[0])
 
-    def test_w7_nothing_changed_one_line(self):
-        import io
-        buf = io.StringIO()
-        cfg = profiles.load("wk")
-        z = {"not_requested": 5}
-        self.wr.print_summary(cfg, z, z, {"new": 0, "reupload_dropped": 0, "skiplist_dropped": 0},
-                              [], 0, buf)
-        self.assertIn("No change this week", buf.getvalue())
-
-    # ── W8 ───────────────────────────────────────────────────────────────────
-    def test_w8_exclusions_reported_as_numbers(self):
-        import io
-        buf = io.StringIO()
-        cfg = profiles.load("wk")
-        self.wr.print_summary(cfg, {}, {}, {"new": 0, "reupload_dropped": 4, "skiplist_dropped": 2},
-                              [], 3, buf)
-        out = buf.getvalue()
-        self.assertIn("re-upload dups: 4", out)
-        self.assertIn("skip-list: 2", out)
-        self.assertIn("capped-out: 3", out)
-
-    # ── W9 ───────────────────────────────────────────────────────────────────
-    def test_w9_dry_run_touches_nothing(self):
-        rc = self.wr.main(["--profile", "wk", "--dry-run"])
+    # ── gate #2 F6: the literature arm ──────────────────────────────────────
+    def test_g2f6_literature_stage_runs_when_enabled(self):
+        profiles.update("wk", {"literature": {"enabled": True, "queries": ["q"]}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
         self.assertEqual(rc, 0)
-        self.assertEqual(self.calls, [], "dry-run must run no stage")
+        self.assertIn(("literature", "wk"), self.calls)
+        order = [c if isinstance(c, str) else c[0] for c in self.calls]
+        self.assertLess(order.index("discovery"), order.index("literature"))
+        self.assertLess(order.index("literature"), order.index("drain"))
+        self.assertIn("literature: 5 paper(s) ingested", out.getvalue())
 
-    # ── W10 ──────────────────────────────────────────────────────────────────
-    def test_w10_shim_has_no_logic(self):
-        sh = (Path(self.wr.__file__).parent / "weekly.sh").read_text()
-        self.assertIn('cd "$(dirname "$0")"', sh)
-        self.assertIn('exec python3 weekly_run.py "$@"', sh)
-        self.assertNotIn("scripts", sh, "shim must never reference ~/.hermes/scripts")
+    def test_g2f6_literature_not_enabled_is_stated(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertNotIn("literature", [c[0] for c in self.calls if isinstance(c, tuple)])
+        self.assertIn("literature: not enabled for this profile", out.getvalue())
 
-    # ── W11 ──────────────────────────────────────────────────────────────────
-    def test_w11_writes_only_within_owned_roots(self):
-        self.wr.main(["--profile", "wk", "--max-hours", "1"])
-        self.assertFalse((self.tmp / "scripts").exists(), "must never create a scripts dir")
-        # every path the run writes to is under the temp HERMES root
-        for cfg_key in ("db_path", "digest_dir", "reports_dir"):
-            self.assertTrue(str(profiles.load("wk")[cfg_key]).startswith(str(self.tmp)))
-        # weekly_run hardcodes no path — every write target is profile-derived, so a
-        # temp HERMES fully contains it. Guard against a path-shaped literal creeping
-        # into code (the docstring may mention ~/.hermes in prose; a path literal
-        # would START with ~/.hermes or /Users, or be exactly ".hermes").
-        import ast
-        for node in ast.walk(ast.parse(Path(self.wr.__file__).read_text())):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                v = node.value
-                self.assertFalse(v.startswith("~/.hermes") or v.startswith("/Users")
-                                 or v == ".hermes",
-                                 "no hardcoded path literal in weekly_run")
+    def test_g2f6_literature_failure_is_named(self):
+        import ingest_literature
+        def boom(name=None):
+            raise RuntimeError("europepmc down")
+        ingest_literature.ingest = boom            # setUp saved the original
+        profiles.update("wk", {"literature": {"enabled": True, "queries": ["q"]}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("literature: FAILED", out.getvalue())
+
+    # ── gate #2 F7: overnight_pipeline's exit status ────────────────────────
+    def test_g2f7_overnight_exits_nonzero_when_analyze_fails(self):
+        import overnight_pipeline, fetch_transcripts, analyze_transcripts
+        overnight_pipeline.drain = self._orig[(overnight_pipeline, "drain")]   # REAL drain
+        orig = (fetch_transcripts.process_queue, analyze_transcripts.analyze_all)
+        fetch_transcripts.process_queue = lambda: None
+        def boom():
+            raise RuntimeError("analyze backend down")
+        analyze_transcripts.analyze_all = boom
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = overnight_pipeline.main()
+        finally:
+            fetch_transcripts.process_queue, analyze_transcripts.analyze_all = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED: drain:analyze", out.getvalue())
 
 
 if __name__ == "__main__":

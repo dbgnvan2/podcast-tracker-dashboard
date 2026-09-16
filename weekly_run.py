@@ -9,8 +9,8 @@ Purpose: the repo-native entry point a Hermes cron job (no_agent mode) calls on 
 Spec:    session task W1-W11 (weekly runner).
 Tests:   test_app.py::TestWeeklyRun
 
-Stage order (W2): migrate -> reconcile -> discovery -> drain(fetch/analyze/digest)
--> advisor report. Every stage is guarded; a failure is recorded and named but the
+Stage order (W2): migrate -> reconcile -> discovery -> literature (if the profile
+enables it) -> drain(fetch/analyze/digest) -> advisor report. Every stage is guarded; a failure is recorded and named but the
 output stages still run, and the process exits non-zero if anything failed — a
 failure must never look like a clean run.
 
@@ -28,7 +28,7 @@ import dblock
 import profiles  # safe to import early: it resolves the profile lazily, honoring PTD_PROFILE
 
 REPORT_N = 8  # advisor-report window (last N analyzed sources)
-STAGE_PLAN = ["migrate", "reconcile", "discovery",
+STAGE_PLAN = ["migrate", "reconcile", "discovery", "literature (if enabled)",
               "drain (fetch+analyze+digest)", "report"]
 
 
@@ -36,18 +36,29 @@ STAGE_PLAN = ["migrate", "reconcile", "discovery",
 # podcast_scraper.DISCOVERY_RESULT_KEYS (test-pinned, QA gate F6).
 SUMMARY_DISC_KEYS = ("new", "reupload_dropped", "skiplist_dropped")
 
-# (module name, attribute, profile config key) — every import-time path a stage
-# module freezes. All must equal the pinned profile before any stage writes.
-PIN_ATTRS = [
-    ("dashboard_server", "DB_PATH", "db_path"),
-    ("podcast_scraper", "DB_PATH", "db_path"),
-    ("fetch_transcripts", "DB_PATH", "db_path"),
-    ("analyze_transcripts", "DB_PATH", "db_path"),
-    ("generate_digest", "DB_PATH", "db_path"),
-    ("generate_digest", "DIGEST_DIR", "digest_dir"),
-    ("generate_report", "DB_PATH", "db_path"),
-    ("generate_report", "REPORTS_DIR", "reports_dir"),
-]
+# Every stage module this runner calls, and the import-frozen path attributes they
+# may define, each mapped to what it must equal for the pinned profile. The
+# (module, attribute) pairs actually checked are DISCOVERED from the modules, so a
+# new frozen path in a stage module is checked without editing a list; the exact
+# discovered set is test-pinned (QA gate #2 F3).
+STAGE_MODULES = ("dashboard_server", "podcast_scraper", "fetch_transcripts",
+                 "analyze_transcripts", "generate_digest", "generate_report",
+                 "ingest_literature", "overnight_pipeline")
+PATH_ATTRS = {
+    "DB_PATH": lambda cfg: cfg["db_path"],
+    "DIGEST_DIR": lambda cfg: cfg["digest_dir"],
+    "REPORTS_DIR": lambda cfg: cfg["reports_dir"],
+    "TRANSCRIPTS_DIR": lambda cfg: profiles.HERMES / "transcripts",
+}
+
+
+def pinned_attrs():
+    """[(module name, attribute)] for every PATH_ATTRS name a stage module defines."""
+    out = []
+    for mod_name in STAGE_MODULES:
+        mod = sys.modules.get(mod_name) or __import__(mod_name)
+        out += [(mod_name, a) for a in PATH_ATTRS if hasattr(mod, a)]
+    return out
 
 
 # ── profile pin check (W3, QA gate F1) ───────────────────────────────────────
@@ -59,11 +70,11 @@ def pin_mismatches(cfg):
     imported them earlier would silently write another profile's DB — so check,
     and refuse to run on any mismatch."""
     bad = []
-    for mod_name, attr, key in PIN_ATTRS:
-        mod = sys.modules.get(mod_name) or __import__(mod_name)
-        have = getattr(mod, attr, None)
-        if have is None or Path(have) != Path(cfg[key]):
-            bad.append(f"{mod_name}.{attr}={have} (pinned {cfg[key]})")
+    for mod_name, attr in pinned_attrs():
+        want = PATH_ATTRS[attr](cfg)
+        have = getattr(sys.modules[mod_name], attr)
+        if have is None or Path(have) != Path(want):
+            bad.append(f"{mod_name}.{attr}={have} (pinned {want})")
     return bad
 
 
@@ -124,7 +135,7 @@ def _status_line(before, after):
     return ", ".join(f"{k} {before.get(k,0)}→{after.get(k,0)}" for k in keys) or "(empty)"
 
 
-def print_summary(cfg, before, after, disc, failed, capped, out):
+def print_summary(cfg, before, after, disc, failed, capped, out, literature=None):
     """The summary contract (W7): stdout ENDS with this compact, chat-ready block.
 
     `before`/`after` are None when the count query failed; they print as n/a,
@@ -159,6 +170,8 @@ def print_summary(cfg, before, after, disc, failed, capped, out):
     print(f"  errors (retryable): {errors}   capped-out: {capped}", file=out)
     print(f"  excluded — re-upload dups: {reupload}   skip-list: {skipdrop}   "
           f"captions unproven: {unproven}", file=out)
+    if literature is not None:
+        print(f"  literature: {literature}", file=out)
     picks = _top_picks(db, 3)
     if picks:
         print("  top digest picks:", file=out)
@@ -210,7 +223,13 @@ def main(argv=None):
     db = cfg["db_path"]
     ok, holder = dblock.acquire(db, "weekly_run")  # W4: one writer per DB
     if not ok:
-        print(f"already running — skipped: pid {holder} is writing {db}")
+        # Exit 0 per W4 (a skipped week is not a failure), but never a silent one:
+        # the chat delivery shows an explicit SKIPPED summary (QA gate #2 F5).
+        print("\n" + "═" * 64)
+        print(f"WEEKLY SUMMARY — profile '{cfg['name']}' — SKIPPED")
+        print(f"  already running — another writer holds {db}: {holder}")
+        print("  Nothing was run this week.")
+        print("═" * 64)
         return 0
     try:
         return _run(cfg, args)
@@ -224,6 +243,7 @@ def _run(cfg, args):
     import podcast_scraper
     import generate_report
     import overnight_pipeline
+    import ingest_literature
 
     bad = pin_mismatches(cfg)
     if bad:
@@ -253,6 +273,13 @@ def _run(cfg, args):
 
     stage("reconcile", lambda: dashboard_server.reconcile(include_search=True, db=db))
     disc = stage("discovery", podcast_scraper.main) or {}
+    # The literature arm, when the profile enables it (QA gate #2 F6) — the same
+    # arm the dashboard's Run Discovery launches. Its outcome is always printed.
+    if cfg.get("literature", {}).get("enabled", False):
+        n_lit = stage("literature", lambda: ingest_literature.ingest(cfg["name"]))
+        literature = f"{n_lit} paper(s) ingested" if n_lit is not None else "FAILED"
+    else:
+        literature = "not enabled for this profile"
     stage("drain", lambda: overnight_pipeline.drain(max_hours=args.max_hours, db=db,
                                                     failures=failed))
     # Output stages run regardless of earlier failures (W2): a bad discovery must
@@ -265,7 +292,8 @@ def _run(cfg, args):
                          "AND COALESCE(fetch_attempts,0) >= ?",
                      (overnight_pipeline.MAX_FETCH_ATTEMPTS,))
     try:
-        print_summary(cfg, before, after, disc, failed, capped, sys.stdout)
+        print_summary(cfg, before, after, disc, failed, capped, sys.stdout,
+                      literature=literature)
     except Exception as e:
         failed.append("summary")
         print_degraded_summary(cfg, failed, e, sys.stdout)

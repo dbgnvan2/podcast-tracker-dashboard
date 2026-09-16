@@ -13,6 +13,7 @@ from pathlib import Path
 import profiles
 import skiplist
 import runstate
+import dblock
 
 ENV_FILE = profiles.HERMES / ".env"
 LLM_KEYS = ("PODCAST_LLM_KEY", "PODCAST_LLM_BASE", "PODCAST_LLM_MODEL", "PODCAST_SYNTH_MODEL")
@@ -2535,6 +2536,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "analyze_transcripts", "transcript(s) to analyze")
             return
         if self.path == "/api/generate_digest":
+            busy = self._writer_busy()
+            if busy:
+                self.json(busy)
+                return
             if self._job_running(DIGEST_SCRIPT):
                 self.json({"started": False, "running": True,
                            "message": "Digest is already generating — wait for it to finish."})
@@ -2560,6 +2565,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json({"started": True, "message": "Generating report…"})
             return
         if self.path == "/api/run_discovery":
+            busy = self._writer_busy()
+            if busy:
+                self.json(busy)
+                return
             # Guard: refuse to start if a scraper is already running
             already = subprocess.run(
                 ["pgrep", "-f", os.path.basename(SCRAPER_SCRIPT)],
@@ -2581,6 +2590,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "message": f"Discovery running ({' + '.join(launched) or 'video'}) in the background…"})
             return
         if self.path == "/api/suggest_terms":
+            busy = self._writer_busy()
+            if busy:
+                self.json(busy)
+                return
             if self._job_running(SCRAPER_SCRIPT):
                 self.json({"started": False, "running": True,
                            "message": "The scraper is busy — wait for it to finish."})
@@ -2746,8 +2759,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def _writer_busy(self):
+        """JSON-ready refusal if another pipeline writer (weekly/overnight run or a
+        stage script) holds this profile's DB lock, else None. The spawned script
+        would only queue behind it, so say so now instead (QA gate #2 F4). The
+        pgrep check in _job_running stays: it is the per-button double-submit
+        guard, a different question from "is anything writing this DB"."""
+        who = dblock.holder(DB_PATH)
+        if who is None:
+            return None
+        return {"started": False, "running": True,
+                "message": f"Another pipeline run is writing this profile's database "
+                           f"({who}) — try again when it finishes."}
+
     def spawn_job(self, script, count_sql, name, noun):
         """Launch a background script if there's pending work. Non-blocking."""
+        busy = self._writer_busy()
+        if busy:
+            self.json(busy)
+            return
         if self._job_running(script):
             self.json({"started": False, "running": True,
                        "message": f"Already running — wait for it to finish."})
