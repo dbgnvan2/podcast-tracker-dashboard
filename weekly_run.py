@@ -22,9 +22,9 @@ import os
 import sys
 import argparse
 import sqlite3
-import subprocess
 from pathlib import Path
 
+import dblock
 import profiles  # safe to import early: it resolves the profile lazily, honoring PTD_PROFILE
 
 REPORT_N = 8  # advisor-report window (last N analyzed sources)
@@ -32,23 +32,39 @@ STAGE_PLAN = ["migrate", "reconcile", "discovery",
               "drain (fetch+analyze+digest)", "report"]
 
 
-# ── single-instance lock (W4) ────────────────────────────────────────────────
-def _pids(pattern):
-    try:
-        out = subprocess.run(["pgrep", "-f", pattern],
-                             capture_output=True, text=True).stdout.split()
-    except FileNotFoundError:
-        return []  # no pgrep (non-mac/linux) — best effort, don't block
-    return [int(p) for p in out if p]
+# The discovery-result keys the summary reads. Must be a subset of
+# podcast_scraper.DISCOVERY_RESULT_KEYS (test-pinned, QA gate F6).
+SUMMARY_DISC_KEYS = ("new", "reupload_dropped", "skiplist_dropped")
+
+# (module name, attribute, profile config key) — every import-time path a stage
+# module freezes. All must equal the pinned profile before any stage writes.
+PIN_ATTRS = [
+    ("dashboard_server", "DB_PATH", "db_path"),
+    ("podcast_scraper", "DB_PATH", "db_path"),
+    ("fetch_transcripts", "DB_PATH", "db_path"),
+    ("analyze_transcripts", "DB_PATH", "db_path"),
+    ("generate_digest", "DB_PATH", "db_path"),
+    ("generate_digest", "DIGEST_DIR", "digest_dir"),
+    ("generate_report", "DB_PATH", "db_path"),
+    ("generate_report", "REPORTS_DIR", "reports_dir"),
+]
 
 
-def _already_running():
-    """Refuse to start if another weekly_run.py OR overnight_pipeline.py is live —
-    two writers interleave status writes and race the 429 cooldown. Best-effort,
-    matching the repo's existing pgrep idiom (it does not parse the target DB)."""
-    others = [p for p in (_pids("weekly_run.py") + _pids("overnight_pipeline.py"))
-              if p != os.getpid()]
-    return bool(others)
+# ── profile pin check (W3, QA gate F1) ───────────────────────────────────────
+def pin_mismatches(cfg):
+    """Every stage module path that does NOT match the pinned profile.
+
+    Stage modules resolve their DB/dirs at import. In a fresh process (the cron
+    path) PTD_PROFILE is set first, so they match. An in-process caller that
+    imported them earlier would silently write another profile's DB — so check,
+    and refuse to run on any mismatch."""
+    bad = []
+    for mod_name, attr, key in PIN_ATTRS:
+        mod = sys.modules.get(mod_name) or __import__(mod_name)
+        have = getattr(mod, attr, None)
+        if have is None or Path(have) != Path(cfg[key]):
+            bad.append(f"{mod_name}.{attr}={have} (pinned {cfg[key]})")
+    return bad
 
 
 # ── profile pinning (W3) ─────────────────────────────────────────────────────
@@ -109,10 +125,17 @@ def _status_line(before, after):
 
 
 def print_summary(cfg, before, after, disc, failed, capped, out):
-    """The summary contract (W7): stdout ENDS with this compact, chat-ready block."""
+    """The summary contract (W7): stdout ENDS with this compact, chat-ready block.
+
+    `before`/`after` are None when the count query failed; they print as n/a,
+    never as a zero that reads like a quiet week."""
     db = cfg["db_path"]
+    counts_ok = before is not None and after is not None
+    before = before or {}
+    after = after or {}
+    missing = [k for k in SUMMARY_DISC_KEYS if disc and k not in disc]
     new_disc = int(disc.get("new", 0))
-    newly_obtained = after.get("obtained", 0) - before.get("obtained", 0)
+    newly_obtained = (after.get("obtained", 0) - before.get("obtained", 0)) if counts_ok else "n/a"
     analyzed = _scalar(db, "SELECT COUNT(*) FROM ai_analysis")
     errors = after.get("error", 0)
     reupload = int(disc.get("reupload_dropped", 0))
@@ -120,7 +143,8 @@ def print_summary(cfg, before, after, disc, failed, capped, out):
     unproven = _scalar(db, "SELECT COUNT(*) FROM videos "
                            "WHERE COALESCE(caption_availability,'unknown') != 'exists'")
 
-    changed = (new_disc or newly_obtained or reupload or skipdrop or failed)
+    changed = (new_disc or (counts_ok and newly_obtained) or reupload or skipdrop
+               or failed or not counts_ok)
 
     print("\n" + "═" * 64, file=out)
     print(f"WEEKLY SUMMARY — profile '{cfg['name']}'", file=out)
@@ -128,7 +152,8 @@ def print_summary(cfg, before, after, disc, failed, capped, out):
     if not changed:
         print("  No change this week: nothing newly discovered, transcribed, or dropped.",
               file=out)
-    print(f"  status: {_status_line(before, after)}", file=out)
+    status = _status_line(before, after) if counts_ok else "n/a (count query failed)"
+    print(f"  status: {status}", file=out)
     print(f"  discovered new: {new_disc}   newly transcribed: {newly_obtained}   "
           f"analyzed (total): {analyzed}", file=out)
     print(f"  errors (retryable): {errors}   capped-out: {capped}", file=out)
@@ -145,8 +170,22 @@ def print_summary(cfg, before, after, disc, failed, capped, out):
     dd = Path(cfg["digest_dir"]); rd = Path(cfg["reports_dir"])
     print(f"  artifacts: digest {dd/'latest.md'}", file=out)
     print(f"             report {rd/'latest.md'}", file=out)
+    if missing:
+        print(f"  WARNING: discovery result missing keys {missing} — counts above are unreliable",
+              file=out)
     if failed:
         print(f"  FAILED stages: {', '.join(failed)}", file=out)
+    print("═" * 64, file=out)
+
+
+def print_degraded_summary(cfg, failed, err, out):
+    """Last-resort summary when the full one cannot be built (QA gate F3): a failed
+    week must still be reported as failed, not as a traceback."""
+    print("\n" + "═" * 64, file=out)
+    print(f"WEEKLY SUMMARY — profile '{cfg['name']}' (DEGRADED)", file=out)
+    print(f"  db: {cfg['db_path']}", file=out)
+    print(f"  summary unavailable: {type(err).__name__}: {err}", file=out)
+    print(f"  FAILED stages: {', '.join(failed) or '(none before summary)'}", file=out)
     print("═" * 64, file=out)
 
 
@@ -168,15 +207,31 @@ def main(argv=None):
         print(f"max_hours={args.max_hours}; nothing written.")
         return 0
 
-    if _already_running():  # W4
-        print("already running — skipped")
+    db = cfg["db_path"]
+    ok, holder = dblock.acquire(db, "weekly_run")  # W4: one writer per DB
+    if not ok:
+        print(f"already running — skipped: pid {holder} is writing {db}")
         return 0
+    try:
+        return _run(cfg, args)
+    finally:
+        dblock.release(db)
 
+
+def _run(cfg, args):
     # Deferred imports AFTER pinning (W3) — each resolves its DB/dirs from PTD_PROFILE.
     import dashboard_server
     import podcast_scraper
     import generate_report
     import overnight_pipeline
+
+    bad = pin_mismatches(cfg)
+    if bad:
+        print("weekly_run: stage modules are not pinned to this profile — refusing to write:",
+              file=sys.stderr)
+        for b in bad:
+            print(f"  {b}", file=sys.stderr)
+        return 2
 
     db = cfg["db_path"]
     failed = []
@@ -194,21 +249,26 @@ def main(argv=None):
 
     # migrate must run first so `before` counts see the full schema.
     stage("migrate", lambda: dashboard_server.migrate(db=db))
-    before = overnight_pipeline.counts(db)
+    before = stage("counts-before", lambda: overnight_pipeline.counts(db))
 
-    stage("reconcile", lambda: dashboard_server.reconcile(include_search=True))
+    stage("reconcile", lambda: dashboard_server.reconcile(include_search=True, db=db))
     disc = stage("discovery", podcast_scraper.main) or {}
-    stage("drain", lambda: overnight_pipeline.drain(max_hours=args.max_hours, db=db))
+    stage("drain", lambda: overnight_pipeline.drain(max_hours=args.max_hours, db=db,
+                                                    failures=failed))
     # Output stages run regardless of earlier failures (W2): a bad discovery must
     # never cost the week's digest.
     stage("digest", overnight_pipeline.write_digest)
     stage("report", lambda: _write_report(generate_report))
 
-    after = overnight_pipeline.counts(db)
+    after = stage("counts-after", lambda: overnight_pipeline.counts(db))
     capped = _scalar(db, "SELECT COUNT(*) FROM videos WHERE transcript_status='error' "
                          "AND COALESCE(fetch_attempts,0) >= ?",
                      (overnight_pipeline.MAX_FETCH_ATTEMPTS,))
-    print_summary(cfg, before, after, disc, failed, capped, sys.stdout)
+    try:
+        print_summary(cfg, before, after, disc, failed, capped, sys.stdout)
+    except Exception as e:
+        failed.append("summary")
+        print_degraded_summary(cfg, failed, e, sys.stdout)
 
     if failed:
         return 1  # a failure must never look like a clean run (W2)

@@ -254,16 +254,20 @@ def migrate(db=None):
     conn.close()
     print("Migration complete.")
 
-def reconcile(include_search=False):
+def reconcile(include_search=False, db=None):
     """Make transcript_status honest: a video is only 'obtained' if a real
     transcript row backs it. Resets fakes and removes stub transcript files.
     Code-driven only — never hand-edit rows to paper over this.
 
     `include_search=True` additionally re-queues non-curated 'not_available' rows
     whose caption track a probe has PROVEN to exist (the rows the 429-laundering
-    bug stranded). Unprobed rows are left alone on purpose — see step 4."""
-    print(f"Reconciling {DB_PATH}...")
-    conn = sqlite3.connect(DB_PATH)
+    bug stranded). Unprobed rows are left alone on purpose — see step 4.
+
+    `db` targets a specific profile DB (weekly_run pins it, like migrate(db=));
+    default is the active profile's DB."""
+    target = db or DB_PATH
+    print(f"Reconciling {target}...")
+    conn = sqlite3.connect(target)
     conn.row_factory = sqlite3.Row
 
     # 1. 'obtained' videos with no transcripts row are not really transcribed.

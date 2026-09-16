@@ -12,13 +12,13 @@ import os
 import sys
 import time
 import sqlite3
-import subprocess
 from pathlib import Path
 
 import fetch_transcripts
 import analyze_transcripts
 import generate_digest
 import profiles
+import dblock
 
 MAX_HOURS = 8
 ROUND_SLEEP_SEC = 1200  # 20 min between rounds to let the 429 cooldown pass
@@ -85,25 +85,14 @@ def write_digest():
     generate_digest.mark_digested(ids, day)
 
 
-def _already_running():
-    """Refuse to start a second overnight pipeline against the same DB — two
-    concurrent runners interleave status writes and race the 429 cooldown."""
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", "overnight_pipeline.py"],
-            capture_output=True, text=True,
-        ).stdout.split()
-    except FileNotFoundError:
-        return False  # no pgrep (non-mac/linux) — best effort, don't block
-    # Exclude our own PID.
-    others = [pid for pid in out if pid and int(pid) != os.getpid()]
-    return bool(others)
-
-
-def drain(max_hours=MAX_HOURS, db=None):
+def drain(max_hours=MAX_HOURS, db=None, failures=None):
     """Ride out the 429 cooldown: each round promote retryable 'error' rows back to
     'requested', fetch, analyze, rebuild the digest; stop when the queue is empty or
     `max_hours` elapses. Returns the number of rounds run.
+
+    Analyze/digest errors are caught so one bad round doesn't end the drain, but
+    each is appended to `failures` (when given) as "drain:analyze"/"drain:digest",
+    so an orchestrator can report the run as failed instead of clean (QA gate F2).
 
     Shared by overnight_pipeline.main() and weekly_run.py (P5: one drain
     implementation, not a second copy of the loop)."""
@@ -122,10 +111,14 @@ def drain(max_hours=MAX_HOURS, db=None):
             analyze_transcripts.analyze_all()
         except Exception as e:
             print(f"  analyze error: {e}", flush=True)
+            if failures is not None and "drain:analyze" not in failures:
+                failures.append("drain:analyze")
         try:
             write_digest()
         except Exception as e:
             print(f"  digest error: {e}", flush=True)
+            if failures is not None and "drain:digest" not in failures:
+                failures.append("drain:digest")
 
         st = counts(db)
         remaining = st.get("requested", 0)  # promotable errors are now 'requested'
@@ -139,17 +132,22 @@ def drain(max_hours=MAX_HOURS, db=None):
 
 
 def main():
-    if _already_running():
-        print("Another overnight_pipeline.py is already running — exiting.", flush=True)
-        return
-
     db = get_db()
-    rnd = drain(MAX_HOURS, db)
+    # One writer per DB: blocks while weekly_run.py (or another overnight run)
+    # holds THIS profile's DB; a run on a different profile is unaffected.
+    ok, holder = dblock.acquire(db, "overnight_pipeline")
+    if not ok:
+        print(f"Another pipeline run (pid {holder}) is writing {db} — exiting.", flush=True)
+        return
     try:
-        write_digest()
-    except Exception as e:
-        print(f"  final digest error: {e}", flush=True)
-    print(f"Pipeline finished after {rnd} round(s). Final status: {counts(db)}", flush=True)
+        rnd = drain(MAX_HOURS, db)
+        try:
+            write_digest()
+        except Exception as e:
+            print(f"  final digest error: {e}", flush=True)
+        print(f"Pipeline finished after {rnd} round(s). Final status: {counts(db)}", flush=True)
+    finally:
+        dblock.release(db)
 
 
 if __name__ == "__main__":

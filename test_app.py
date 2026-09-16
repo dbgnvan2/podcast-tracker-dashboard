@@ -6,8 +6,10 @@ tests are offline and free; real LLM connectivity is verified separately.
 
 Run: python3 test_app.py
 """
+import io
 import os
 import json
+import contextlib
 import sqlite3
 import tempfile
 import unittest
@@ -1936,6 +1938,52 @@ class TestSpikeThrottleGate(unittest.TestCase):
         self.assertFalse(sc.baseline_invalidated(hit=False, marker=""))
 
 
+class TestWriterLock(unittest.TestCase):
+    """QA gate F4/F5/F7: the per-DB writer lock decides from the lock file's PID,
+    not from process names. Exercises the real dblock module."""
+
+    def setUp(self):
+        import dblock
+        self.dl = dblock
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "podcast_x.db"
+
+    def test_holder_pure_decision(self):
+        alive = lambda pid: pid == 111
+        self.assertEqual(self.dl.lock_holder("111 weekly_run t", 999, alive), 111)
+        self.assertIsNone(self.dl.lock_holder("222 weekly_run t", 999, alive), "dead pid is stale")
+        self.assertIsNone(self.dl.lock_holder("999 weekly_run t", 999, alive), "our own lock")
+        self.assertIsNone(self.dl.lock_holder("", 999, alive), "empty file is stale")
+        self.assertIsNone(self.dl.lock_holder("garbage", 999, alive), "unreadable is stale")
+
+    def test_acquire_release_roundtrip(self):
+        ok, holder = self.dl.acquire(self.db, "t")
+        self.assertTrue(ok); self.assertIsNone(holder)
+        self.assertTrue(self.dl.lock_path(self.db).exists())
+        self.dl.release(self.db)
+        self.assertFalse(self.dl.lock_path(self.db).exists())
+
+    def test_stale_lock_from_dead_pid_is_taken_over(self):
+        import subprocess as sp
+        proc = sp.Popen(["true"]); proc.wait()          # a PID that is now dead
+        self.dl.lock_path(self.db).write_text(f"{proc.pid} weekly_run t\n")
+        ok, _ = self.dl.acquire(self.db, "t")
+        self.assertTrue(ok)
+        self.dl.release(self.db)
+
+    def test_release_leaves_another_owners_lock(self):
+        import subprocess as sp
+        proc = sp.Popen(["sleep", "30"])
+        try:
+            self.dl.lock_path(self.db).write_text(f"{proc.pid} other t\n")
+            self.dl.release(self.db)
+            self.assertTrue(self.dl.lock_path(self.db).exists())
+            ok, holder = self.dl.acquire(self.db, "t")
+            self.assertFalse(ok); self.assertEqual(holder, proc.pid)
+        finally:
+            proc.kill(); proc.wait()
+
+
 class TestWeeklyRun(unittest.TestCase):
     """W1-W11: the weekly runner orchestrates the existing stages, pins one profile,
     locks to one writer, and ends with an honest summary. Stages are faked (no
@@ -1987,11 +2035,12 @@ class TestWeeklyRun(unittest.TestCase):
                              "VALUES (?,?,?,?,?, 'not_requested')",
                              (vid, "Chan", f"Title {vid}", "u", 0.8))
             conn.commit(); conn.close()
-            return {"youtube_enabled": True, "new": 2, "emerging": 0,
-                    "reupload_dropped": 1, "skiplist_dropped": 0,
-                    "enriched": 2, "cached": 0, "passed_filters": 2}
+            # Built through the producer's own contract, not a hand-typed dict (F6).
+            return podcast_scraper.discovery_result(
+                youtube_enabled=True, new=2, emerging=0, reupload_dropped=1,
+                skiplist_dropped=0, enriched=2, cached=0, passed_filters=2)
 
-        def fake_drain(max_hours=8, db=None):
+        def fake_drain(max_hours=8, db=None, failures=None):
             self.calls.append(("drain", max_hours))
             conn = sqlite3.connect(self.db)
             conn.execute("UPDATE videos SET transcript_status='obtained' WHERE id='A'")
@@ -2000,13 +2049,19 @@ class TestWeeklyRun(unittest.TestCase):
             return 1
 
         patch(dashboard_server, "migrate", lambda db=None: self.calls.append("migrate"))
-        patch(dashboard_server, "reconcile", lambda include_search=False: self.calls.append(("reconcile", include_search)))
+        patch(dashboard_server, "reconcile",
+              lambda include_search=False, db=None: self.calls.append(("reconcile", include_search, db)))
         patch(podcast_scraper, "main", fake_discovery)
         patch(overnight_pipeline, "drain", fake_drain)
         patch(overnight_pipeline, "write_digest", lambda: self.calls.append("digest"))
         patch(generate_report, "build_report", lambda n=8: ("# rep", "2026-09-14"))
-        patch(generate_report, "REPORTS_DIR", self.tmp / "reports" / "wk")
-        patch(weekly_run, "_already_running", lambda: False)
+        # Pin every import-frozen stage path to the temp 'wk' profile, as a fresh
+        # cron process would have them (weekly_run refuses to run otherwise, F1).
+        wk = profiles.load("wk")
+        for mod_name, attr, key in weekly_run.PIN_ATTRS:
+            mod = __import__(mod_name)
+            if (mod, attr) not in self._orig:
+                patch(mod, attr, Path(wk[key]))
         self.mods = (dashboard_server, podcast_scraper, generate_report, overnight_pipeline)
 
     def tearDown(self):
@@ -2080,13 +2135,171 @@ class TestWeeklyRun(unittest.TestCase):
         self.assertIn("profile 'bb'", out)
         self.assertIn(str(h / "db" / "podcast_bb.db"), out)   # B's DB, not A's
 
-    # ── W4 ───────────────────────────────────────────────────────────────────
-    def test_w4_single_instance_lock_skips_cleanly(self):
-        self.mods  # noqa
-        self.wr._already_running = lambda: True
-        rc = self.wr.main(["--profile", "wk"])
+    # ── W3 / QA gate F1 ──────────────────────────────────────────────────────
+    def test_w3_f1_reconcile_receives_pinned_db(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        rec = [c for c in self.calls if isinstance(c, tuple) and c[0] == "reconcile"]
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(Path(rec[0][2]), Path(self.db), "reconcile must get the pinned DB")
+
+    def test_w3_f1_unpinned_stage_module_refuses_to_write(self):
+        import fetch_transcripts
+        fetch_transcripts.DB_PATH = self.tmp / "db" / "podcast_other.db"  # setUp saved it; tearDown restores
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+            rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.calls, [], "no stage may run against a mismatched DB")
+        self.assertIn("fetch_transcripts.DB_PATH", buf.getvalue())
+
+    def test_w3_f1_real_reconcile_writes_only_the_given_db(self):
+        real_reconcile = self._orig[(self.mods[0], "reconcile")]
+        other = self.tmp / "db" / "podcast_other.db"
+        fresh_db(other)
+        for path in (self.db, other):
+            c = sqlite3.connect(path)
+            c.execute("INSERT INTO videos (id, channel_name, video_title, url, quality_score, "
+                      "transcript_status) VALUES ('X','c','t','u',0.5,'obtained')")
+            c.commit(); c.close()
+        self.mods[0].DB_PATH = str(other)   # setUp saved it; the "active" DB differs from the target
+        with contextlib.redirect_stdout(io.StringIO()):
+            real_reconcile(db=str(self.db))
+        st = lambda p: sqlite3.connect(p).execute(
+            "SELECT transcript_status FROM videos WHERE id='X'").fetchone()[0]
+        self.assertEqual(st(self.db), "requested", "target DB reconciled")
+        self.assertEqual(st(other), "obtained", "the non-target DB must be untouched")
+
+    # ── W2 / QA gate F2, F3 ──────────────────────────────────────────────────
+    def test_w2_f2_analyze_failure_inside_drain_exits_nonzero(self):
+        import overnight_pipeline, fetch_transcripts, analyze_transcripts
+        overnight_pipeline.drain = self._orig[(overnight_pipeline, "drain")]  # the REAL drain
+        orig_pq, orig_an = fetch_transcripts.process_queue, analyze_transcripts.analyze_all
+        fetch_transcripts.process_queue = lambda: None
+        def boom():
+            raise RuntimeError("analyze backend down")
+        analyze_transcripts.analyze_all = boom
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        finally:
+            fetch_transcripts.process_queue, analyze_transcripts.analyze_all = orig_pq, orig_an
+        self.assertEqual(rc, 1, "an analyze failure inside drain must not exit 0")
+        self.assertIn("FAILED stages: drain:analyze", out.getvalue())
+
+    def test_w2_f3_count_failure_still_runs_outputs_and_summary(self):
+        import overnight_pipeline
+        def locked(db=None):
+            raise sqlite3.OperationalError("database is locked")
+        self._orig.setdefault((overnight_pipeline, "counts"), overnight_pipeline.counts)
+        overnight_pipeline.counts = locked
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        text = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("digest", self.calls)
+        self.assertTrue((self.tmp / "reports" / "wk" / "latest.md").exists())
+        self.assertIn("WEEKLY SUMMARY", text)
+        self.assertIn("status: n/a (count query failed)", text)
+        self.assertIn("counts-before", text)
+
+    def test_w2_f3_summary_crash_prints_degraded_summary(self):
+        orig = self.wr.print_summary
+        def crash(*a, **k):
+            raise ValueError("bad row")
+        self.wr.print_summary = crash
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        finally:
+            self.wr.print_summary = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("(DEGRADED)", out.getvalue())
+        self.assertIn("summary unavailable: ValueError: bad row", out.getvalue())
+
+    # ── F6: the discovery-result contract ───────────────────────────────────
+    def test_f6_summary_keys_are_in_the_producer_contract(self):
+        import podcast_scraper
+        self.assertTrue(set(self.wr.SUMMARY_DISC_KEYS) <= set(podcast_scraper.DISCOVERY_RESULT_KEYS))
+
+    def test_f6_builder_rejects_renamed_key(self):
+        import podcast_scraper
+        good = {k: 0 for k in podcast_scraper.DISCOVERY_RESULT_KEYS}
+        podcast_scraper.discovery_result(**good)
+        bad = dict(good); bad["reupload_skipped"] = bad.pop("reupload_dropped")
+        with self.assertRaises(ValueError):
+            podcast_scraper.discovery_result(**bad)
+
+    def test_f6_real_main_disabled_path_returns_contract_keys(self):
+        import podcast_scraper
+        orig = podcast_scraper.ACTIVE_PROFILE
+        podcast_scraper.ACTIVE_PROFILE = dict(orig or {}, name="wk", youtube_enabled=False)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                r = self._orig[(podcast_scraper, "main")]()
+        finally:
+            podcast_scraper.ACTIVE_PROFILE = orig
+        self.assertEqual(set(r), set(podcast_scraper.DISCOVERY_RESULT_KEYS))
+
+    def test_f6_missing_key_is_flagged_in_summary(self):
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        self.wr.print_summary(cfg, {}, {}, {"new": 1, "reupload_skipped": 3}, [], 0, buf)
+        self.assertIn("WARNING: discovery result missing keys", buf.getvalue())
+
+    # ── W4 (QA gate F4/F5/F7): the REAL per-DB lock ──────────────────────────
+    def _live_holder(self, db):
+        """A real live process recorded as the lock holder for `db`."""
+        import dblock, subprocess as sp
+        proc = sp.Popen(["sleep", "30"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        path = dblock.lock_path(db)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{proc.pid} weekly_run 2026-09-16T00:00:00\n")
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return proc.pid
+
+    def test_w4_lock_held_on_same_db_skips(self):
+        pid = self._live_holder(self.db)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.wr.main(["--profile", "wk"])
         self.assertEqual(rc, 0, "a skipped week is not a failure")
         self.assertEqual(self.calls, [], "no stage may run when another writer holds the DB")
+        self.assertIn(f"pid {pid}", out.getvalue())
+
+    def test_w4_lock_on_other_profile_does_not_block(self):
+        profiles.create("other", label="Other")
+        self._live_holder(profiles.db_path_for("other"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertIn("migrate", self.calls, "a run on a different DB must not be blocked")
+
+    def test_w4_argv_mention_does_not_block(self):
+        import subprocess as sp, sys as _sys
+        decoy = sp.Popen([_sys.executable, "-c", "import time; time.sleep(30)", "weekly_run.py"])
+        self.addCleanup(decoy.wait); self.addCleanup(decoy.kill)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertIn("migrate", self.calls)
+
+    def test_w4_lock_released_after_run(self):
+        import dblock
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertFalse(dblock.lock_path(self.db).exists())
+
+    def test_f5_overnight_pipeline_refuses_while_weekly_holds_db(self):
+        import overnight_pipeline
+        self._live_holder(self.db)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            overnight_pipeline.main()          # active profile is 'wk' -> same DB
+        self.assertNotIn(("drain", 8), self.calls, "overnight must not become a second writer")
+        self.assertIn("is writing", out.getvalue())
 
     # ── W5 ───────────────────────────────────────────────────────────────────
     def test_w5_two_runs_no_state_regression(self):

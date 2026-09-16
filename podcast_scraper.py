@@ -29,6 +29,20 @@ MIN_VIEWS = MIN_DURATION_SEC = MAX_DURATION_SEC = MIN_DAYS_OLD = MIN_PUBLISH_DAT
 MAX_VIDEOS_PER_QUERY = MAX_VIDEOS_PER_CHANNEL = MAX_RESULTS_TO_RETURN = None
 ANALYSIS_FOCUS = DIGEST_TITLE = ACTIVE_PROFILE = None
 
+# The keys main() returns — the contract weekly_run.py's summary reads (QA gate F6).
+# Build every return through discovery_result() so a renamed key fails loudly
+# instead of the summary printing a silent 0 for an exclusion count (P2/P19).
+DISCOVERY_RESULT_KEYS = ("youtube_enabled", "new", "emerging", "reupload_dropped",
+                         "skiplist_dropped", "enriched", "cached", "passed_filters")
+
+
+def discovery_result(**counts):
+    """Build main()'s return dict; raises if the keys differ from the contract."""
+    if set(counts) != set(DISCOVERY_RESULT_KEYS):
+        raise ValueError(f"discovery result keys {sorted(counts)} != contract "
+                         f"{sorted(DISCOVERY_RESULT_KEYS)}")
+    return dict(counts)
+
 
 def apply_profile(name=None):
     """Load an investigation profile into the module globals used throughout."""
@@ -789,9 +803,9 @@ def dry_run():
 def main():
     if not ACTIVE_PROFILE.get("youtube_enabled", True):
         print(f"YouTube arm disabled for profile '{ACTIVE_PROFILE['name']}' — skipping.")
-        return {"youtube_enabled": False, "new": 0, "emerging": 0,
-                "reupload_dropped": 0, "skiplist_dropped": 0,
-                "enriched": 0, "cached": 0, "passed_filters": 0}
+        return discovery_result(youtube_enabled=False, new=0, emerging=0,
+                                reupload_dropped=0, skiplist_dropped=0,
+                                enriched=0, cached=0, passed_filters=0)
     conn = init_db()
     cursor = conn.cursor()
     run_date = datetime.now(timezone.utc).isoformat()
@@ -1219,16 +1233,16 @@ def main():
     print(f"--- Run complete ---")
     # Return the run's counts so an orchestrator (weekly_run.py) can surface
     # exclusions as numbers instead of parsing stdout (P2 — never silent).
-    return {
-        "youtube_enabled": True,
-        "new": new_count,
-        "emerging": emerging,
-        "reupload_dropped": reupload_dropped,
-        "skiplist_dropped": skiplist_dropped,
-        "enriched": fetched,
-        "cached": skipped,
-        "passed_filters": len(enriched),
-    }
+    return discovery_result(
+        youtube_enabled=True,
+        new=new_count,
+        emerging=emerging,
+        reupload_dropped=reupload_dropped,
+        skiplist_dropped=skiplist_dropped,
+        enriched=fetched,
+        cached=skipped,
+        passed_filters=len(enriched),
+    )
 
 
 if __name__ == "__main__":
