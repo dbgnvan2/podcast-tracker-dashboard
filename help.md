@@ -200,4 +200,10 @@ If you *empty* the Candidates list by hitting Skip or Transcribe on everything, 
 
 **The digest or report file is empty / shows an error** — Check the job log (visible in the dashboard after clicking Generate) for Python errors. Common causes: database locked by another process, LLM key expired, or a write permission issue on the digest/reports directory.
 
+**"Another pipeline run is writing this profile's database"** — A weekly or overnight run (or another stage job) holds this profile's writer lock, so the button refuses rather than write alongside it. The message names the holder (PID, which runner, start time). Wait for it to finish; other profiles are not affected.
+
+**Weekly summary says SKIPPED** — The weekly run found another writer holding that profile's database and ran nothing. It will run normally next time; nothing was changed.
+
+**`WARNING: database migration failed` when starting with `./run.sh`** — The dashboard still starts, but its schema may be out of date, so some pages can error or show missing data. The lines after the warning give the reason. Fix that (often a locked or unreadable database file) and run `python3 dashboard_server.py --migrate`.
+
 **Tests failing after a schema change** — Run `python3 test_app.py` from the project directory. If you see column count mismatches in INSERT statements, the `SCHEMA` constant in `test_app.py` may be out of sync with the migration in `dashboard_server.py`.

@@ -56,6 +56,17 @@
 12. **Background worker guard (P15):** does every background thread/subprocess that writes a
     shared status wrap its body in `try/except` and write an `error` status before exiting, so a
     crash can't leave the UI stuck on "running"?
+13. **Shared-directory deletes (P31):** does anything delete from `~/.hermes/transcripts/` (or
+    another dir shared across profiles)? "Unbacked" is an absence claim over **every** profile DB on
+    disk — decide it over all of them, and delete nothing if one can't be read.
+14. **Tests vs real data (P28/P34):** does a test call a real function that writes or deletes
+    (`reconcile`, `migrate`, a stage `main`)? Is every path it touches redirected, including
+    module-level dirs like `TRANSCRIPTS_DIR`? The suite's real-data guard is a backstop, not the fix.
+15. **One writer per DB:** does a new entry point write the DB? It takes `dblock` (or is added to
+    the named exemptions in `dblock.py`), and anything that skips or waits says so visibly.
+16. **Test edits that remove tests (P27/P29):** when rewriting a block of tests, diff the test
+    names before and after (`comm -23` of `def test_` lists). A rising count can hide deletions.
+    Run mutation checks with `python3 -B` — a stale `.pyc` produced a false "survived" here.
 
 > Pattern definitions (P1–P16) and the reasoning behind each item: `~/.claude/standards/learnings.md`.
 
@@ -72,6 +83,18 @@
   long-form out of the window. Logged so it's not silent.
 - **Broad `except (..., Exception)`** in `_fetch_channel_tab` / `fetch_transcript`: intentional
   fault-tolerance, but swallows *all* errors including bugs. Log the swallowed exception (P2).
+- **Deferred low findings from the 2026-09-16/17 weekly-runner gates** (`docs/cycles/`):
+  - gate-1 F8 / gate-2 F9: `weekly_run._scalar`/`_has_column`/`_top_picks` turn a failed query
+    into `0`/`False`/`[]`, so `analyzed (total)`, `captions unproven`, etc. can print a false zero.
+  - gate-1 F9: `weekly_run`'s `capped-out` count re-copies `promote_errors`' predicate instead of
+    using the producer's number.
+  - gate-2 F8: the "discovery result missing keys" warning cannot fire when `disc == {}`.
+  - gate-3 F4: the test suite's real-data guard refuses deletes but only detects writes, and only
+    under the transcripts dir.
+  - gate-5 F1: `test_g4f1_failed_migration_is_shown` asserts the WARNING header, not the reason
+    lines run.sh prints after it (assert `unable to open database file`).
+  - Dashboard in-request single-row writes and profile-switch `migrate()` run without the writer
+    lock by design (see `dblock.py`); last-writer-wins with a running stage.
 - **Persistent "processed" banner depends on a Python-level exit (P15 corollary).** The banner
   file is written by `process_queue`'s `try/except`. A hard `SIGKILL`/OOM of the subprocess writes
   nothing, so the dashboard keeps showing the *previous* run's banner rather than an error. Minor
@@ -82,6 +105,53 @@
 ## Fix log
 
 Newest first. Format: **Issue → Root cause → What would have caught it → Fix → Pattern.**
+
+### 2026-09-16 — A test deleted every real transcript `.txt`; `reconcile` deleted other profiles' transcripts
+- **Issue:** a new test (`test_w3_f1_real_reconcile_writes_only_the_given_db`, commit `d01881c`)
+  ran the real `reconcile()` with a temp DB but the real `~/.hermes/transcripts`. `reconcile`
+  deletes every `.txt` its DB doesn't back, so each suite run deleted all 28 real transcript files
+  (16 seo-geo, 5 harness-engineering, 7 zone2-training). The run reported "160 tests OK". Found by
+  the independent Hermes gate (gate-2 F1), not by the author.
+- **Root cause:** two layers. (1) The test redirected `DB_PATH` but not the module-level
+  `TRANSCRIPTS_DIR`. (2) `reconcile` itself decided "unbacked" from **one** profile's DB over a
+  directory **every** profile shares — so `--reconcile` or a weekly run on profile B deleted
+  profile A's transcripts in production too (gate-2 F2).
+- **What would have caught it:** a suite-level guard on the real data dir (P28/P34); asking "which
+  population is this absence claim over?" for any delete (P31).
+- **Recovery:** each file's text was still in `transcripts.full_text` (the fetcher/importer write
+  the same string to both). Restored from the DB, only where the file was missing; all 28 verified
+  byte-identical. `.segments.json`, key points and analysis were untouched.
+- **Fix:** `9c13303` — `reconcile` deletes only files no profile DB backs, and nothing if any DB is
+  unreadable; `d3a5cfb` enumerates the DBs from disk (`db/*.db` + legacy), not profile JSONs.
+  `test_app.py` refuses deletes under the real HERMES root and fails the run if the real
+  transcripts dir changed.
+- **Pattern:** P28/P34 (test reached real data), P31 (absence over a narrowed population) →
+  checklist 13, 14.
+
+### 2026-09-16 — Weekly runner: pgrep lock, unpinned reconcile, swallowed drain errors (gate-1, 7de637b)
+- **Issue:** the first gate on `weekly_run.py` rejected it: `reconcile` couldn't be given the pinned
+  DB; analyze/digest errors inside `drain()` were printed and swallowed, so the runner exited 0;
+  a locked DB during the before/after counts raised out of `main()` with no summary; the one-writer
+  guard was `pgrep -f <script name>` (matched any argv mentioning the name, ignored which DB, and
+  `overnight_pipeline` never checked for `weekly_run`); the scraper's result keys were pinned only
+  by hand-typed test dicts; the lock test stubbed the predicate it was meant to verify.
+- **Root cause:** the guard was keyed on process names, not on the resource (the DB); failure
+  handling covered stage calls but not the calls inside or between them.
+- **Fix:** `d01881c` then `e076c2f` — `dblock.py` flock per DB, taken by both runners and every
+  DB-writing stage script's CLI entry, with the dashboard refusing matching buttons; `pin_mismatches`
+  discovers every import-frozen path on the stage modules and refuses to run on a mismatch;
+  `drain(failures=)`; guarded counts + degraded summary; `discovery_result()` key contract; literature
+  arm added to the weekly run; `overnight_pipeline` exits 1 on failure. `efd9eb8` — `--migrate`
+  runs unlocked (named exemption) and `run.sh` shows a failed migration.
+- **Pattern:** P5 (a lock for two of the writers is not a lock), P13, P15/P24 (exit code must reflect
+  sub-stage failure), P27 (test stubbing the thing under test) → checklist 15.
+
+### 2026-09-16 — A test rewrite deleted nine spec tests; the count went up
+- **Issue:** rewriting the lock tests in `e076c2f` sliced from the W4 lock tests to the end of
+  `TestWeeklyRun`, deleting the nine W5–W11 tests. The commit reported 164 → 166 tests. Found by
+  gate-3 F1.
+- **Fix:** `d3a5cfb` restored them verbatim and added `test_spec_every_w_criterion_has_a_test`.
+- **Pattern:** P27/P29 — a count is not coverage → checklist 16.
 
 ### 2026-09-12 — Availability probe read through the gated client; cache hits erased the signal (review, Part A)
 - **Issue:** two review findings on the availability work. (1) The Tier-1 read `get_video_details`

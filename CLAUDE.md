@@ -48,6 +48,9 @@ podcast-tracker-dashboard/
 ├── sources/                    # Source-adapter seam (DESIGN-multisource.md): base.py + scholarly.py (EuropePMC)
 ├── spike_multisource.py        # Phase-1 spike: cited briefing across sources (papers now; video docs slot in identically)
 ├── overnight_pipeline.py       # Patient runner: fetch → analyze → digest, loops past 429 cooldown
+├── weekly_run.py               # Weekly runner: migrate → reconcile → discovery → literature → drain → report, one pinned profile, honest summary + exit code
+├── weekly.sh                   # Thin shim a scheduler calls: exec python3 weekly_run.py "$@"
+├── dblock.py                   # Per-DB writer lock (flock on <db>.writer.lock) — one pipeline writer per profile DB
 ├── dashboard_server.py         # Stdlib HTTP server + inline SPA + JSON API + --migrate/--reconcile
 ├── run.sh                      # Launch dashboard + open browser (GUI-first entry point)
 ├── test_app.py                 # Test suite (temp DBs, mocked LLM) — run: python3 test_app.py
@@ -104,9 +107,10 @@ discover (scrape) → score → mark for transcription → fetch verified transc
 - **Weekly digest** (`generate_digest.py`) and **cited advisor report** (`generate_report.py`).
 - **Dashboard** — Candidates / Requested / Transcribed / Intelligence / Digest / Report / Discovery / Stats tabs; every action is a button (Run Discovery, Process Queue, Analyze, Generate Digest/Report, promote channel, accept term). Profile selector + create/test in the header.
 - **Investigation profiles** — swappable topic packages, one DB each (`profiles.py`).
+- **Weekly runner** (`weekly_run.py` / `weekly.sh`) — runs every stage against one pinned profile (`--profile NAME`), takes the per-DB writer lock, and ends with a chat-ready summary; exits non-zero if any stage (including analyze/digest inside the drain) failed, prints an explicit SKIPPED summary when another writer holds the DB.
 
 ### Not yet built
-- **Cron/launchd automation** — a scheduled weekly run (discover → fetch → analyze → digest/report). Currently triggered manually or via the dashboard buttons.
+- **Scheduling** — `weekly.sh` exists but nothing calls it yet. The Hermes cron entry in `~/.hermes/cron/jobs.json` still points at the old `podcast_scraper.sh` and is disabled; point it at `weekly.sh --profile NAME` and enable it.
 - **Export** — a "Download .md" / print-friendly / PDF export of the digest and advisor report.
 
 ### Discovery model (two complementary arms — keep BOTH)
@@ -132,9 +136,10 @@ A profile may have a **`literature` arm** (queries + scholarly `sources`) alongs
 1. **Stdlib-only Python.** Our own code uses only the Python stdlib — no web framework, no ORM, no frontend build step. External *tools* (the `yt-dlp` binary, `curl_cffi` in its env) and an LLM API are fine; adding a new **Python package** dependency to our code is not — stop and ask first.
 2. **One DB per profile — never hardcode the path.** All search criteria and the DB path come from the active investigation profile. Resolve the DB via `profiles.load()["db_path"]` (the dashboard refreshes it per request). The default `seo-geo` profile maps to the legacy `~/.hermes/podcast_tracker.db`; others to `~/.hermes/db/podcast_<name>.db`.
 3. **Schema changes go through `dashboard_server.py:migrate()`.** It is additive and idempotent (`ALTER TABLE ... ADD COLUMN`, `CREATE TABLE IF NOT EXISTS`) and accepts a target DB (`migrate(db)`), so it self-creates a fresh profile's schema. Never write a destructive migration — DBs hold real, non-reproducible scrape history. Run via `python3 dashboard_server.py --migrate`. The scraper's `init_db()` mirrors the schema so it's self-sufficient.
-4. **Never delete or overwrite a database or the transcripts directory.** They live in `~/.hermes/` and are the only copy.
+4. **Never delete or overwrite a database or the transcripts directory.** They live in `~/.hermes/` and are the only copy. The transcripts directory is **shared by every profile**: anything that deletes from it must prove no profile DB on disk (`db/*.db` + the legacy DB) backs the file, and delete nothing if any DB can't be read (`dashboard_server._profile_db_paths`). **Tests must never touch the real `~/.hermes`** — `test_app.py` refuses deletes under it and fails the run if the real transcripts dir changes; any test that runs `reconcile()` must redirect `TRANSCRIPTS_DIR`.
 5. **`transcript_status` is the contract** between the scripts (see state machine above).
 6. **SQL safety:** all user/POST-driven queries use parameterized statements (`?`). Keep it that way — never string-format video ids into SQL.
+7. **One pipeline writer per profile DB.** `weekly_run`, `overnight_pipeline`, and the CLI entries of the stage scripts (scraper except `--test`, fetch, analyze, digest, literature ingest, `dashboard_server.py --reconcile`) take `dblock`'s flock on `<db>.writer.lock`; the dashboard refuses the matching buttons while it is held. Named exemptions are listed in `dblock.py`'s docstring (report files, in-request single-row writes, `--migrate`). A new DB-writing entry point must take the lock or be added to that list.
 
 ---
 
@@ -193,9 +198,15 @@ python3 generate_digest.py --days=7
 python3 generate_report.py --n=8
 
 # Patient overnight runner: fetch → analyze → digest, looping past 429 cooldown
-python3 overnight_pipeline.py
+python3 overnight_pipeline.py             # exits 1 if analyze/digest failed
 
-# Dashboard (GUI-first launcher: migrates, starts server, opens browser)
+# Weekly runner (what a scheduler calls): every stage, one pinned profile, one summary
+./weekly.sh --profile seo-geo             # --dry-run prints the plan; --max-hours N caps the drain
+# A stage script started while another run holds the DB lock waits (PTD_LOCK_WAIT_SEC,
+# default 7200) then exits 3.
+
+# Dashboard (GUI-first launcher: migrates — printing a WARNING if migration fails —
+# starts server, opens browser)
 ./run.sh
 # or: python3 dashboard_server.py   → http://localhost:9091
 ```
