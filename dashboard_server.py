@@ -2863,18 +2863,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.migrate:
-        # No wait: run.sh migrates on every dashboard launch, and must not hang for
-        # hours behind a weekly run. Skipping is honest and loud (exit 3); the
-        # weekly runner migrates its own DB, and --migrate can be re-run after.
-        ok, who = dblock.acquire(DB_PATH, "dashboard --migrate")
-        if not ok:
-            print(f"Migration skipped: another pipeline writer holds {DB_PATH} ({who}). "
-                  f"Run --migrate again when it finishes.")
-            sys.exit(dblock.EXIT_LOCK_TIMEOUT)
-        try:
-            migrate()
-        finally:
-            dblock.release(DB_PATH)
+        # Deliberately NOT under the writer lock (named exemption in dblock.py):
+        # migrate() is additive, idempotent DDL, the dashboard already runs it
+        # unlocked on profile switch/create, and run.sh calls it on every launch —
+        # a lock would only add a way for it to be skipped (QA gate #4 F1). A real
+        # failure (e.g. "database is locked" past the busy timeout) raises and
+        # exits non-zero, and run.sh shows it.
+        migrate()
         sys.exit(0)
 
     if args.reconcile:

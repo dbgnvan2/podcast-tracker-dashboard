@@ -19,7 +19,7 @@ in-process, so a nested acquire in the same process succeeds.
 
 Who takes it: weekly_run, overnight_pipeline, the CLI entries of podcast_scraper
 (except --test), fetch_transcripts, analyze_transcripts, generate_digest,
-ingest_literature, and `dashboard_server.py --migrate/--reconcile`.
+ingest_literature, and `dashboard_server.py --reconcile`.
 
 Named exemptions (deliberately unlocked):
   - generate_report.py writes report files only, no DB rows.
@@ -30,6 +30,9 @@ Named exemptions (deliberately unlocked):
     change a row a running stage also reads (e.g. un-requesting a video mid-fetch),
     which is the same last-writer-wins behaviour the dashboard has always had.
     Blocking them would freeze the UI for the length of a weekly run.
+  - `dashboard_server.py --migrate` (run by run.sh on every launch): additive,
+    idempotent DDL, same as the profile-switch migrate. Locking it only let it be
+    skipped silently behind run.sh's launch (QA gate #4 F1).
 """
 import fcntl
 import os

@@ -2108,6 +2108,49 @@ def _hold_lock_in_child(db, owner="test-holder"):
     return proc
 
 
+class TestRunShMigrate(unittest.TestCase):
+    """Gate #4 F1: run.sh (the GUI launcher) must show a failed migration instead of
+    discarding it. Runs the REAL run.sh up to its migrate step (PTD_RUNSH_MIGRATE_ONLY)
+    against a temp HERMES, with `open`/`curl` shimmed so it can never open a browser,
+    and a hard timeout that kills the process group if it ever starts a server (P34)."""
+
+    def _run(self, break_db):
+        import subprocess as sp, signal, socket
+        h = Path(tempfile.mkdtemp())
+        if break_db:
+            (h / "podcast_tracker.db").mkdir()      # seo-geo DB path is a directory: sqlite fails
+        shim = h / "bin"
+        shim.mkdir()
+        for tool in ("open", "curl"):
+            (shim / tool).write_text("#!/bin/sh\nexit 1\n")
+            (shim / tool).chmod(0o755)
+        with socket.socket() as sock:                # a free port, so no live dashboard answers
+            sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
+        env = dict(os.environ, HERMES_DIR=str(h), PORT=str(port), PTD_RUNSH_MIGRATE_ONLY="1",
+                   PATH=f"{shim}:{os.environ.get('PATH', '')}")
+        env.pop("PTD_PROFILE", None)
+        run_sh = Path(__file__).resolve().parent / "run.sh"
+        proc = sp.Popen(["bash", str(run_sh)], env=env, stdout=sp.PIPE, stderr=sp.STDOUT,
+                        text=True, start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=60)
+        except sp.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            self.fail("run.sh did not stop after the migrate step")
+        return proc.returncode, out
+
+    def test_g4f1_failed_migration_is_shown(self):
+        rc, out = self._run(break_db=True)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARNING: database migration failed", out)
+
+    def test_g4f1_clean_migration_prints_no_warning(self):
+        rc, out = self._run(break_db=False)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("WARNING", out)
+
+
 class TestWriterLock(unittest.TestCase):
     """QA gates #1 F4/F5/F7 and #2 F4/F5: an flock-based per-DB writer lock,
     exercised with real separate holder processes (never a stubbed predicate)."""
@@ -2211,12 +2254,12 @@ class TestStageScriptLocks(unittest.TestCase):
                                capture_output=True, text=True, timeout=60, cwd=str(h))
                     self.assertEqual(r.returncode, 3, f"{name}: {r.stdout[-400:]}{r.stderr[-400:]}")
                     self.assertIn("another writer still holds", r.stdout)
-            # --migrate does not wait (run.sh calls it on every launch) but must
-            # skip loudly rather than migrate alongside another writer (gate #3 F3).
+            # --migrate is a named exemption (gate #4 F1): additive DDL, run by run.sh
+            # on every launch, so it must RUN (not skip) while another writer holds.
             r = sp.run([_sys.executable, str(here / "dashboard_server.py"), "--migrate"],
                        env=env, capture_output=True, text=True, timeout=60, cwd=str(h))
-            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
-            self.assertIn("Migration skipped", r.stdout)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("Migration complete", r.stdout)
         finally:
             holder.kill(); holder.wait()
 

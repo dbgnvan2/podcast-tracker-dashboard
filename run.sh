@@ -25,8 +25,14 @@ if port_busy "$PORT"; then
     echo "Port ${base} busy — using ${PORT} instead."
 fi
 
-# Ensure the DB schema is up to date (safe/idempotent).
-python3 dashboard_server.py --migrate >/dev/null 2>&1 || true
+# Ensure the DB schema is up to date (safe/idempotent). Keep launching if it
+# fails, but never silently: show why, or the dashboard runs on a stale schema.
+if ! migrate_out=$(python3 dashboard_server.py --migrate 2>&1); then
+    echo "WARNING: database migration failed — the dashboard may show errors or missing data:"
+    printf '%s\n' "$migrate_out" | tail -5
+fi
+# Test hook: stop after the migrate step (never set in normal use).
+if [ -n "${PTD_RUNSH_MIGRATE_ONLY:-}" ]; then exit 0; fi
 
 echo "Starting Podcast Tracker dashboard on ${URL}"
 PORT="$PORT" python3 dashboard_server.py &
