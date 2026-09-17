@@ -16,6 +16,20 @@ diagnostics only — nothing decides from it. The file itself is never deleted
 
 Re-entrant within one process: weekly_run holds the lock and calls stage functions
 in-process, so a nested acquire in the same process succeeds.
+
+Who takes it: weekly_run, overnight_pipeline, the CLI entries of podcast_scraper
+(except --test), fetch_transcripts, analyze_transcripts, generate_digest,
+ingest_literature, and `dashboard_server.py --migrate/--reconcile`.
+
+Named exemptions (deliberately unlocked):
+  - generate_report.py writes report files only, no DB rows.
+  - the dashboard's in-request writes: request/unrequest transcription,
+    dismiss/undismiss, promote channel, accept/reject term, and the additive
+    migrate() run when switching to or creating a profile. Each is one short
+    statement (or idempotent DDL) serialised by SQLite's busy timeout. They can
+    change a row a running stage also reads (e.g. un-requesting a video mid-fetch),
+    which is the same last-writer-wins behaviour the dashboard has always had.
+    Blocking them would freeze the UI for the length of a weekly run.
 """
 import fcntl
 import os

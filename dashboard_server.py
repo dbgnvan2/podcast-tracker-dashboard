@@ -256,8 +256,16 @@ def migrate(db=None):
     print("Migration complete.")
 
 def _profile_db_paths():
-    """Every investigation profile's DB path (the shared transcripts dir's owners)."""
-    return [profiles.db_path_for(p["name"]) for p in profiles.list_profiles()]
+    """Every profile DB on disk — the possible owners of the shared transcripts dir.
+
+    Enumerated from the FILESYSTEM (every `db/*.db` plus the legacy seo-geo DB),
+    not from the profile JSONs: list_profiles() silently skips an unparseable
+    profile file, and a DB left by a renamed/deleted profile has no JSON at all,
+    so either would narrow the population reconcile proves absence over
+    (QA gate #3 F2, P31). db_path_for() only ever places a DB in these two spots."""
+    paths = {str(p) for p in Path(profiles.DB_DIR).glob("*.db")}
+    paths.add(str(profiles.LEGACY_DB))
+    return sorted(paths)
 
 
 def reconcile(include_search=False, db=None):
@@ -2855,11 +2863,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.migrate:
-        migrate()
+        # No wait: run.sh migrates on every dashboard launch, and must not hang for
+        # hours behind a weekly run. Skipping is honest and loud (exit 3); the
+        # weekly runner migrates its own DB, and --migrate can be re-run after.
+        ok, who = dblock.acquire(DB_PATH, "dashboard --migrate")
+        if not ok:
+            print(f"Migration skipped: another pipeline writer holds {DB_PATH} ({who}). "
+                  f"Run --migrate again when it finishes.")
+            sys.exit(dblock.EXIT_LOCK_TIMEOUT)
+        try:
+            migrate()
+        finally:
+            dblock.release(DB_PATH)
         sys.exit(0)
 
     if args.reconcile:
-        reconcile(include_search=args.include_search_unavailable)
+        dblock.run_locked(DB_PATH, "dashboard --reconcile",
+                          lambda: reconcile(include_search=args.include_search_unavailable))
         sys.exit(0)
 
     port = int(os.environ.get("PORT", 9091))

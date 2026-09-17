@@ -366,6 +366,32 @@ class TestReconcile(unittest.TestCase):
         self.assertTrue(Path(self.tmp, "theirs.txt").exists(), "another profile's transcript deleted")
         self.assertFalse(Path(self.tmp, "stub.txt").exists(), "a true stub is still removed")
 
+    def test_g3f2_real_owner_enumeration_includes_db_without_profile_json(self):
+        # Gate #3 F2: the owners are the DB files on disk, not the profile JSONs.
+        # A DB whose profile JSON is gone (renamed/deleted/unparseable) still backs
+        # its transcripts. Uses the REAL _profile_db_paths (not the setUp stub).
+        dashboard_server._profile_db_paths = self._orig[2]
+        orig = (profiles.DB_DIR, profiles.LEGACY_DB)
+        h = Path(self.tmp) / "hermes"
+        profiles.DB_DIR = h / "db"
+        profiles.LEGACY_DB = h / "podcast_tracker.db"
+        try:
+            profiles.DB_DIR.mkdir(parents=True)
+            orphan = profiles.DB_DIR / "podcast_gone.db"      # no gone.json anywhere
+            fresh_db(str(orphan))
+            c = sqlite3.connect(orphan)
+            c.execute("INSERT INTO transcripts VALUES ('orphan','f','kept text',2)")
+            c.commit(); c.close()
+            Path(self.tmp, "orphan.txt").write_text("kept text")
+            self.assertEqual(dashboard_server._profile_db_paths(),
+                             sorted([str(orphan), str(profiles.LEGACY_DB)]))
+            dashboard_server.reconcile()
+        finally:
+            profiles.DB_DIR, profiles.LEGACY_DB = orig
+        self.assertTrue(Path(self.tmp, "orphan.txt").exists(),
+                        "a transcript backed by a DB with no profile JSON must survive")
+        self.assertFalse(Path(self.tmp, "stub.txt").exists())
+
     def test_reconcile_deletes_nothing_if_a_profile_db_is_unreadable(self):
         bad = os.path.join(self.tmp, "corrupt.db")
         Path(bad).write_text("this is not a sqlite database")
@@ -2162,6 +2188,7 @@ class TestStageScriptLocks(unittest.TestCase):
         (["analyze_transcripts.py"], "analyze_transcripts"),
         (["generate_digest.py"], "generate_digest"),
         (["ingest_literature.py"], "ingest_literature"),
+        (["dashboard_server.py", "--reconcile"], "dashboard --reconcile"),
     ]
 
     def test_each_writer_script_waits_for_the_lock(self):
@@ -2184,6 +2211,12 @@ class TestStageScriptLocks(unittest.TestCase):
                                capture_output=True, text=True, timeout=60, cwd=str(h))
                     self.assertEqual(r.returncode, 3, f"{name}: {r.stdout[-400:]}{r.stderr[-400:]}")
                     self.assertIn("another writer still holds", r.stdout)
+            # --migrate does not wait (run.sh calls it on every launch) but must
+            # skip loudly rather than migrate alongside another writer (gate #3 F3).
+            r = sp.run([_sys.executable, str(here / "dashboard_server.py"), "--migrate"],
+                       env=env, capture_output=True, text=True, timeout=60, cwd=str(h))
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            self.assertIn("Migration skipped", r.stdout)
         finally:
             holder.kill(); holder.wait()
 
@@ -2287,6 +2320,15 @@ class TestWeeklyRun(unittest.TestCase):
             os.environ.pop("PTD_PROFILE", None)
 
     # ── W1 ───────────────────────────────────────────────────────────────────
+    def test_spec_every_w_criterion_has_a_test(self):
+        # Gate #3 F1: nine W5-W11 tests were deleted by a slicing edit and the suite
+        # stayed green. Each spec ID W1..W11 must keep at least one test.
+        names = [n for n in dir(self) if n.startswith("test_w")]
+        for i in range(1, 12):
+            with self.subTest(spec=f"W{i}"):
+                self.assertTrue(any(n.startswith(f"test_w{i}_") for n in names),
+                                f"no test for W{i}")
+
     def test_w1_no_duplicated_pipeline_logic(self):
         import ast
         src = Path(self.wr.__file__).read_text()
@@ -2588,6 +2630,102 @@ class TestWeeklyRun(unittest.TestCase):
             fetch_transcripts.process_queue, analyze_transcripts.analyze_all = orig
         self.assertEqual(rc, 1)
         self.assertIn("FAILED: drain:analyze", out.getvalue())
+
+    # ── W5 ───────────────────────────────────────────────────────────────────
+    def test_w5_two_runs_no_state_regression(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        import overnight_pipeline
+        after1 = overnight_pipeline.counts(self.db)
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        after2 = overnight_pipeline.counts(self.db)
+        self.assertEqual(after1, after2, "a second run must not regress or duplicate state")
+
+    # ── W6 ───────────────────────────────────────────────────────────────────
+    def test_w6_max_hours_forwarded_to_drain(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "3"])
+        drain_calls = [c for c in self.calls if isinstance(c, tuple) and c[0] == "drain"]
+        self.assertEqual(drain_calls[0][1], 3.0)
+
+    def test_w6_drain_respects_zero_cap(self):
+        # The REAL drain with a 0-hour cap must not enter the loop at all.
+        import overnight_pipeline, fetch_transcripts
+        real_drain = self._orig[(overnight_pipeline, "drain")]  # real drain saved in setUp
+        called = []
+        orig_pq = fetch_transcripts.process_queue
+        fetch_transcripts.process_queue = lambda: called.append("fetch")
+        try:
+            rnds = real_drain(max_hours=0, db=self.db)
+        finally:
+            fetch_transcripts.process_queue = orig_pq
+        self.assertEqual(rnds, 0)
+        self.assertEqual(called, [], "a 0-hour cap must not fetch anything")
+
+    # ── W7 ───────────────────────────────────────────────────────────────────
+    def test_w7_summary_contract_fields_present(self):
+        import io
+        before = {"not_requested": 0}
+        after = {"not_requested": 1, "obtained": 1}
+        disc = {"new": 2, "reupload_dropped": 1, "skiplist_dropped": 0}
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        self.wr.print_summary(cfg, before, after, disc, [], 0, buf)
+        out = buf.getvalue()
+        for token in ("WEEKLY SUMMARY", cfg["db_path"], "status:", "discovered new: 2",
+                      "re-upload dups: 1", "artifacts:", "digest", "report"):
+            self.assertIn(token, out)
+
+    def test_w7_nothing_changed_one_line(self):
+        import io
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        z = {"not_requested": 5}
+        self.wr.print_summary(cfg, z, z, {"new": 0, "reupload_dropped": 0, "skiplist_dropped": 0},
+                              [], 0, buf)
+        self.assertIn("No change this week", buf.getvalue())
+
+    # ── W8 ───────────────────────────────────────────────────────────────────
+    def test_w8_exclusions_reported_as_numbers(self):
+        import io
+        buf = io.StringIO()
+        cfg = profiles.load("wk")
+        self.wr.print_summary(cfg, {}, {}, {"new": 0, "reupload_dropped": 4, "skiplist_dropped": 2},
+                              [], 3, buf)
+        out = buf.getvalue()
+        self.assertIn("re-upload dups: 4", out)
+        self.assertIn("skip-list: 2", out)
+        self.assertIn("capped-out: 3", out)
+
+    # ── W9 ───────────────────────────────────────────────────────────────────
+    def test_w9_dry_run_touches_nothing(self):
+        rc = self.wr.main(["--profile", "wk", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [], "dry-run must run no stage")
+
+    # ── W10 ──────────────────────────────────────────────────────────────────
+    def test_w10_shim_has_no_logic(self):
+        sh = (Path(self.wr.__file__).parent / "weekly.sh").read_text()
+        self.assertIn('cd "$(dirname "$0")"', sh)
+        self.assertIn('exec python3 weekly_run.py "$@"', sh)
+        self.assertNotIn("scripts", sh, "shim must never reference ~/.hermes/scripts")
+
+    # ── W11 ──────────────────────────────────────────────────────────────────
+    def test_w11_writes_only_within_owned_roots(self):
+        self.wr.main(["--profile", "wk", "--max-hours", "1"])
+        self.assertFalse((self.tmp / "scripts").exists(), "must never create a scripts dir")
+        # every path the run writes to is under the temp HERMES root
+        for cfg_key in ("db_path", "digest_dir", "reports_dir"):
+            self.assertTrue(str(profiles.load("wk")[cfg_key]).startswith(str(self.tmp)))
+        # weekly_run hardcodes no path — every write target is profile-derived, so a
+        # temp HERMES fully contains it. Guard against a path-shaped literal creeping
+        # into code (the docstring may mention ~/.hermes in prose; a path literal
+        # would START with ~/.hermes or /Users, or be exactly ".hermes").
+        import ast
+        for node in ast.walk(ast.parse(Path(self.wr.__file__).read_text())):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                v = node.value
+                self.assertFalse(v.startswith("~/.hermes") or v.startswith("/Users")
+                                 or v == ".hermes",
+                                 "no hardcoded path literal in weekly_run")
 
 
 if __name__ == "__main__":
